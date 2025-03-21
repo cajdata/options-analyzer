@@ -11,5 +11,5 @@ A minimal FastAPI + OCR + Web Frontend example to parse and analyze options data
 
 1. Clone the repo:
    ```bash
-   git clone https://your-repo-url
-   cd myoptionsapp
+   git clone https://github.com/cajdata/options-analyzer.git
+   cd options-analyzer
