@@ -1,2 +1,15 @@
-# options-analyzer
-An end-to-end Python web app that uses Tesseract OCR to parse option chain screenshots and analyze key fields (bid, ask, IV, Greeks). Built with FastAPI and a minimal HTML/JS frontend, it demonstrates basic OCR parsing and a toy scoring engine for educational use. Not financial advice.
+# My Options App
+
+A minimal FastAPI + OCR + Web Frontend example to parse and analyze options data from screenshots.
+
+## Prerequisites
+- Python 3.8+ 
+- [Tesseract OCR installed](https://github.com/UB-Mannheim/tesseract/wiki)
+- pip install -r requirements.txt
+
+## How to Run
+
+1. Clone the repo:
+   ```bash
+   git clone https://your-repo-url
+   cd myoptionsapp

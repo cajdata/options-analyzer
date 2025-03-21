@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytesseract
+opencv-python
+pydantic
+numpy
+pandas
+quantlib-python

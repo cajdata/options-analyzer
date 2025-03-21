@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>Options Analyzer</title>
+    <style>
+      body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+      .result { background: #f9f9f9; padding: 10px; margin-top: 20px; }
+      label { display: block; margin-bottom: 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>Upload an Options Screenshot</h1>
+    <label for="screenshot">Choose an image:</label>
+    <input type="file" id="screenshot" accept="image/*" />
+    <button onclick="analyze()">Analyze</button>
+    
+    <div class="result" id="result"></div>
+
+    <script>
+      async function analyze() {
+        const fileInput = document.getElementById('screenshot');
+        if (!fileInput.files.length) {
+          alert("Please select an image file first.");
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+
+        try {
+          const response = await fetch("/analyze", {
+            method: "POST",
+            body: formData
+          });
+          if (!response.ok) {
+            throw new Error("Server error: " + response.status);
+          }
+          const data = await response.json();
+          document.getElementById('result').innerHTML = `
+            <h3>Parsed Data:</h3>
+            <pre>${JSON.stringify(data.parsed_data, null, 2)}</pre>
+            <h3>Analysis Result:</h3>
+            <pre>${JSON.stringify(data.analysis_result, null, 2)}</pre>
+          `;
+        } catch (err) {
+          console.error(err);
+          document.getElementById('result').textContent = "Error: " + err.message;
+        }
+      }
+    </script>
+  </body>
+</html>
