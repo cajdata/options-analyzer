@@ -26,6 +26,9 @@ _RETRIES = 3
 BAR_FINAL = clock(16, 20)
 # A quote stamped before the open belongs to no trading session yet.
 SESSION_OPEN = clock(9, 30)
+# A chain whose newest quote is older than this has not been quoted in any session
+# since. Four days leaves room for a three-day weekend, seen from before the open.
+MAX_QUOTE_AGE_DAYS = 4
 IEX_BARS_NOTE = (
     "Price history comes from the IEX exchange only, because this Alpaca "
     "plan does not include consolidated (SIP) history."
@@ -213,6 +216,11 @@ class AlpacaData:
             if (quote := _option_quote(symbol, root, contract, snap or {}))
         ]
         session = _session_day(q.quote_time for q, _ in parsed if q.quote_time)
+        if session and (self._now().date() - session).days > MAX_QUOTE_AGE_DAYS:
+            # The quotes agree with each other and are all old: a halted or delisted
+            # stock, whose own last trade is just as old. Only the clock can tell.
+            self.notes.append(f"{symbol}: the newest option quote is from {session:%b %d}, so none was used.")
+            return []
         quotes: list[OptionQuote] = []
         for quote, snap in parsed:
             if session and quote.quote_time and quote.quote_time.astimezone(ET).date() < session:

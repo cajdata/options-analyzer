@@ -137,7 +137,8 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   of all) shows option prices that no longer fit the stock.
 - **A quote from an earlier day is left out**, and the scan says how many. When a special
   dividend or a split changes a stock's strikes, the contracts that stopped existing go
-  on reporting their last quote.
+  on reporting their last quote. A stock whose options have not been quoted at all for
+  more than four days (halted or delisted) is left out whole.
 - **Open interest is a day or two old** and is blank for a contract listed since
   Alpaca's last update. Volume is the latest session's.
 - **A buyout breaks the rating.** Once a cash takeover is agreed, the stock sits at the

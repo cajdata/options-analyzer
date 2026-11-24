@@ -18,8 +18,13 @@ ET = ZoneInfo("America/New_York")
 WINDOW = dict(expiry_from=date(2026, 12, 1), expiry_to=date(2027, 1, 31), strike_from=170.0, strike_to=230.0)
 
 
+NOW = datetime(2026, 11, 24, 17, 0, tzinfo=ET)  # the evening the live responses were captured
+
+
 def alpaca(handler, **kwargs) -> AlpacaData:
     client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The clock is pinned, because a chain's quotes are judged against it for age.
+    kwargs.setdefault("now", lambda: NOW)
     return AlpacaData("key-id", "secret", client=client, sleep=lambda _: None, **kwargs)
 
 
@@ -247,6 +252,25 @@ def test_a_quote_before_the_open_does_not_make_the_last_close_old():
     # With no time stamps there is nothing to judge by, so nothing is left out.
     quotes, notes = chain(None, None)
     assert len(quotes) == 2 and notes == []
+
+
+def test_a_chain_nobody_has_quoted_for_days_is_left_out_whole():
+    def chain(day: int, hour: int):
+        friday_close = "2026-11-20T20:59:59.5Z"
+        snaps = {f"AAPL261218C00{200 + n}000": {"latestQuote": {"bp": 5.0, "ap": 5.2, "t": friday_close}} for n in range(3)}
+        answer = lambda request: httpx.Response(200, json={"snapshots": snaps, "next_page_token": None})  # noqa: E731
+        market = alpaca(answer, now=lambda: datetime(2026, 11, day, hour, 0, tzinfo=ET))
+        return market.option_chain("AAPL", **WINDOW), market.notes
+
+    # Every quote is from the same day, so none is old next to the others. Over a
+    # weekend, and before the open after a three-day one, Friday is still the latest session.
+    for day, hour in ((22, 12), (23, 8), (24, 9)):
+        quotes, notes = chain(day, hour)
+        assert len(quotes) == 3 and notes == []
+    # A day later the market has been open since and nothing here was quoted: a halted
+    # or delisted stock, whose own last trade is just as old.
+    quotes, notes = chain(25, 12)
+    assert quotes == [] and notes == ["AAPL: the newest option quote is from Nov 20, so none was used."]
 
 
 def test_live_contract_rows_give_open_interest_as_whole_numbers():
