@@ -535,3 +535,67 @@ def test_cache_survives_threads_writing_the_same_key(tmp_path):
     assert errors == []
     assert cache.entry("shared") is not None
     assert not list(tmp_path.glob("*.tmp"))
+
+
+# -- Found in the follow-up review ------------------------------------------------
+
+
+def test_edgar_tells_a_foreign_filer_from_a_security_with_no_reports(tmp_path):
+    from app.providers.earnings import Unsupported
+
+    def filings(forms):
+        stamps = ["2026-10-15T21:00:00.000Z"] * len(forms)
+        return {"filings": {"recent": {"form": forms, "items": [""] * len(forms), "acceptanceDateTime": stamps}, "files": []}}
+
+    # A foreign company (the real index for TSM is hundreds of 6-Ks and no 8-K at all).
+    with pytest.raises(Unsupported, match="Form 6-K"):
+        edgar(tmp_path, filings(["6-K", "6-K", "20-F", "4"])).history("AAPL")
+    # An ETF files neither, and genuinely has no earnings reports.
+    assert edgar(tmp_path, filings(["497", "NPORT-P", "N-CSR"])).history("AAPL") == []
+    # A company that moved from foreign to US forms is read from its 8-Ks.
+    moved = filings(["8-K", "6-K", "10-K"])
+    moved["filings"]["recent"]["items"] = ["2.02,9.01", "", ""]
+    assert len(edgar(tmp_path, moved).history("AAPL")) == 1
+
+
+def test_a_source_that_cannot_answer_leaves_a_note_and_defers_to_the_next(tmp_path):
+    from app.providers.earnings import Unsupported
+
+    cannot = FakeSource("SEC EDGAR", error=Unsupported("SEC EDGAR cannot date earnings for a company that reports on Form 6-K."))
+    alone = EarningsService(DiskCache(tmp_path / "a"), history_sources=[cannot], today=TODAY)
+    events, note = alone.history("TSM")
+    assert events == [] and "Form 6-K" in note  # reported as unknown, not as "no reports"
+    assert not list((tmp_path / "a").glob("*"))  # and not cached as an empty answer
+
+    other = FakeSource("Alpha Vantage", quarterly(8))
+    both = EarningsService(DiskCache(tmp_path / "b"), history_sources=[cannot, other], today=TODAY)
+    events, note = both.history("TSM")
+    assert len(events) == 8 and note is None
+
+
+def test_threads_queued_behind_a_rate_limited_request_do_not_fire(tmp_path):
+    import threading
+    import time as real_time
+
+    calls, outcomes = [], []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        real_time.sleep(0.05)  # long enough for the other threads to queue up behind this one
+        return httpx.Response(200, json={"Information": "rate limit is 25 requests per day"})
+
+    source = alpha_vantage(handler)
+
+    def ask() -> None:
+        try:
+            source.history("IBM")
+        except RateLimited:
+            outcomes.append("limited")
+
+    threads = [threading.Thread(target=ask) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert outcomes == ["limited"] * 4
+    assert len(calls) == 1  # the three that were waiting saw the block and stood down

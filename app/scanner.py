@@ -80,7 +80,10 @@ class Scanner:
             return self._scan(req)
 
     def _scan(self, req: ScanRequest) -> ScanResult:
-        req = replace(req, symbols=list(dict.fromkeys(s.strip().upper() for s in req.symbols if s.strip())))
+        # Tidy the symbols here so every way in (command line, API) is treated alike.
+        # Share classes are written both ways (BRK-B, BRK.B); the data provider wants the dot.
+        tidy = (s.strip().upper().replace("-", ".") for s in req.symbols)
+        req = replace(req, symbols=list(dict.fromkeys(s for s in tidy if s)))
         today = self._today or datetime.now(ET).date()
         warnings: list[str] = []
         self.market.notes.clear()
@@ -254,8 +257,9 @@ class Scanner:
         history, note = self.earnings.history(symbol)
         upcoming = self.earnings.upcoming(symbol, history)
         moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
-        # A stock that reports, with no date to go on: the lookup failed or nothing
-        # is configured, or the reports on file are too old to estimate from.
+        # A stock that reports, with no date to go on: the lookup failed, nothing is
+        # configured, the only source cannot answer for this company, or the reports
+        # on file are too old to estimate from.
         unknown = note is not None or (bool(history) and upcoming is None)
 
         # The stock's own history: ordinary days with earnings reactions removed,

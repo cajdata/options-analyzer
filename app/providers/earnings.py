@@ -24,6 +24,10 @@ class RateLimited(RuntimeError):
     pass
 
 
+class Unsupported(RuntimeError):
+    """The source cannot answer for this company, which is different from "no reports"."""
+
+
 class HistorySource(Protocol):
     name: str
 
@@ -67,33 +71,43 @@ class AlphaVantageEarnings:
         self._blocked_until = 0.0
 
     def _fetch(self, **params: str) -> httpx.Response:
-        if time.monotonic() < self._blocked_until:
-            raise RateLimited("Alpha Vantage request limit reached")
+        # The block is checked, and set, while holding the lock. Otherwise threads
+        # already queued behind a request that hits the limit would each still fire.
         with self._lock:
+            if time.monotonic() < self._blocked_until:
+                raise RateLimited("Alpha Vantage request limit reached")
             wait = self._min_interval - (time.monotonic() - self._last_call)
             if wait > 0:
                 time.sleep(wait)
             resp = self._client.get(self.URL, params={**params, "apikey": self._key})
             self._last_call = time.monotonic()
-        resp.raise_for_status()
+            resp.raise_for_status()
+            message = self._limit_message(resp)
+            if message:
+                # Back off for a while, then try again. The burst limit clears within
+                # a minute and the daily one overnight; a flag that never cleared
+                # would outlive both in a server left running.
+                self._blocked_until = time.monotonic() + self._cool_down
+                raise RateLimited(message)
         return resp
 
-    def _check(self, payload: dict) -> None:
-        # Limits and key problems come back as HTTP 200 with a message instead of data.
-        message = payload.get("Information") or payload.get("Note")
-        if message:
-            # Back off for a while, then try again. The burst limit clears within a
-            # minute and the daily one overnight; a flag that never cleared would
-            # outlive both in a server left running.
-            self._blocked_until = time.monotonic() + self._cool_down
-            raise RateLimited(str(message))
+    @staticmethod
+    def _limit_message(resp: httpx.Response) -> str | None:
+        """Limits and key problems come back as HTTP 200 with a message instead of data."""
+        if not resp.text.lstrip().startswith("{"):
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        message = payload.get("Information") or payload.get("Note") if isinstance(payload, dict) else None
+        return str(message) if message else None
 
     def calendar(self, today: date) -> dict[str, EarningsEvent]:
         """The next report on or after `today` for every listed symbol."""
         resp = self._fetch(function="EARNINGS_CALENDAR", horizon="3month")
         text = resp.text.lstrip()
-        if text.startswith("{"):
-            self._check(resp.json())
+        if text.startswith("{"):  # JSON where the CSV should be: an error with no calendar in it
             return {}
         out: dict[str, EarningsEvent] = {}
         for row in csv.DictReader(io.StringIO(text)):
@@ -111,7 +125,6 @@ class AlphaVantageEarnings:
 
     def history(self, symbol: str) -> list[EarningsEvent]:
         payload = self._fetch(function="EARNINGS", symbol=symbol).json()
-        self._check(payload)
         events = []
         for row in payload.get("quarterlyEarnings") or []:
             try:
@@ -143,6 +156,8 @@ class EdgarEarnings:
     MAX_OLDER_FILES = 4
     MIN_INTERVAL = 0.12  # the SEC allows ten requests a second across all threads
     RETRIES = 2
+    # Forms a foreign company files in place of the 10-K, 10-Q and 8-K.
+    FOREIGN_FORMS = frozenset({"6-K", "20-F", "40-F"})
 
     def __init__(
         self,
@@ -193,7 +208,13 @@ class EdgarEarnings:
             return []
         data = self._get(f"{self.SUBMISSIONS_URL}CIK{cik:010d}.json")
         filings = data.get("filings") or {}
-        events = self._events(filings.get("recent") or {})
+        recent = filings.get("recent") or {}
+        events = self._events(recent)
+        if not events and self.FOREIGN_FORMS.intersection(recent.get("form") or []):
+            # A foreign company announces results on Form 6-K, which carries no item
+            # codes, so its reports cannot be picked out here. That is not the same
+            # as an ETF, which has no reports at all, and must not look like it.
+            raise Unsupported(f"{self.name} cannot date earnings for a company that reports on Form 6-K.")
         # Companies that file constantly (large banks) push earnings 8-Ks into older files.
         for older in (filings.get("files") or [])[: self.MAX_OLDER_FILES]:
             if len(events) >= want:
@@ -286,6 +307,9 @@ class EarningsService:
                 got = source.history(symbol)
             except RateLimited:
                 note = f"{source.name} request limit reached; try again later."
+                continue
+            except Unsupported as err:
+                note = str(err)
                 continue
             except (httpx.HTTPError, ValueError, KeyError) as err:
                 note = f"{source.name} lookup failed: {type(err).__name__}."

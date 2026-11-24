@@ -526,3 +526,38 @@ def test_brief_effort_can_be_left_out_for_a_model_that_rejects_it(discovery):
     assert "output_config" not in fake.requests[0]
     ai.write_brief(discovery, client=fake, effort="low")
     assert fake.requests[1]["output_config"] == {"effort": "low"}
+
+
+# -- Found in the follow-up review ----------------------------------------------------
+
+
+def test_share_classes_are_normalized_on_every_way_in():
+    # The command line passes symbols straight through, so the scanner must tidy them itself.
+    scanner = demo_scanner()
+    asked = []
+    real = scanner.market.stock_snapshots
+
+    def record(symbols):
+        asked.extend(symbols)
+        return real(symbols)
+
+    scanner.market.stock_snapshots = record
+    result = scanner.scan(ScanRequest(symbols=["brk-b", "BRK.B", " acme "]))
+    assert asked == ["BRK.B", "ACME"]
+    assert "BRK.B: no stock quote found." in result.warnings
+
+
+def test_a_foreign_filer_is_flagged_not_treated_like_an_etf():
+    from app.providers.earnings import Unsupported
+
+    foreign = _scan_with([_Source(Unsupported("SEC EDGAR cannot date earnings for a company that reports on Form 6-K."))])
+    assert all(u.earnings_unknown for u in foreign.underlyings.values())
+    assert any(w.startswith("No earnings date is known for ACME, BOLT") for w in foreign.warnings)
+    assert "Form 6-K" in foreign.underlyings["ACME"].earnings_note
+
+
+def test_a_blank_credential_does_not_turn_the_brief_on(monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+    assert ai.available() is False
