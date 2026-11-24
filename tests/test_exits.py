@@ -235,7 +235,7 @@ def priced_report(var):
     return ImpliedMove(TODAY, None, None, 0.3, "test", event_var=var)
 
 
-@pytest.mark.parametrize("days", [1, 2, 3, 5, 10, 30])
+@pytest.mark.parametrize("days", range(1, 31))
 def test_time_only_takes_value_away_wherever_the_report_falls(days):
     # The report can be felt on any weekday from tomorrow to expiry. With the stock
     # unchanged the option must never gain along the way, and the path must start at
