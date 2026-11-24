@@ -8,10 +8,9 @@ import sys
 from dataclasses import asdict
 
 from app import ai
-from app.config import load_settings
+from app.config import ConfigError, load_settings
 from app.models import ContractAnalysis, ScanResult, UnderlyingContext
-from app.scanner import ConfigError, ScanRequest, build_scanner
-
+from app.scanner import ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
 
@@ -24,14 +23,15 @@ def _pct(value: float | None, signed: bool = False) -> str:
 
 def _earnings(ctx: UnderlyingContext, c: ContractAnalysis) -> str:
     if ctx.days_to_earnings is None:
-        return "-"
-    text = f"in {ctx.days_to_earnings}d" + ("" if ctx.next_earnings.confirmed else " (est.)")
+        return "unknown" if ctx.earnings_unknown else "-"
+    text = "today" if ctx.days_to_earnings == 0 else f"in {ctx.days_to_earnings}d"
+    text += "" if ctx.next_earnings.confirmed else " (est.)"
     return text + (", spans" if c.spans_earnings else "")
 
 
 def print_scan(result: ScanResult) -> None:
     feed = "SYNTHETIC DEMO DATA" if result.mode == "demo" else f"Alpaca, {result.options_feed} option quotes"
-    budget = f"   Budget: ${result.budget:,.0f} per contract" if result.budget else ""
+    budget = f"   Budget: ${result.budget:,.0f} per contract" if result.budget is not None else ""
     print(f"\nLens: {result.lens} premium   Data: {feed}{budget}\n")
     if not result.ideas:
         print("No contracts passed the filters.")
@@ -76,8 +76,18 @@ def print_scan(result: ScanResult) -> None:
         for warning in result.warnings:
             print(f"  - {warning}")
     print("\nOutlay is the cash to open one contract: the ask x 100 to buy, or the collateral to sell.")
-    print("R:R is average win over average loss, and the rating compares the price with the stock's")
-    print("own history. Ranked by fixed, visible rules. Not a forecast and not advice.")
+    print("R:R is average win over average loss, priced at the ask to buy or the bid to sell, and the")
+    print("rating compares that price with the stock's own history. Ranked by fixed, visible rules.")
+    print("Not a forecast and not advice.")
+
+
+def _print_brief(brief: ai.BriefResult) -> None:
+    print(f"\nAI brief ({brief.model or 'no model call'})\n{brief.summary}")
+    for pick in brief.picks:
+        print(f"\n* {pick['contract']}: {pick['headline']}")
+        print(f"  Why: {pick['rationale']}")
+        print(f"  Risks: {pick['risks']}")
+        print(f"  Check first: {pick['check_first']}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument("--top", type=int, default=20)
     scan.add_argument("--budget", type=float, help="most cash to put into one contract, in dollars")
     scan.add_argument("--brief", action="store_true", help="add an AI write-up (uses the Claude API)")
-    scan.add_argument("--json", action="store_true", help="print the full result as JSON")
+    scan.add_argument("--json", action="store_true", help="print the full result as one JSON document")
     scan.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
 
     serve = sub.add_parser("serve", help="start the local dashboard")
@@ -101,7 +111,19 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
 
     args = parser.parse_args(argv)
-    settings = load_settings()
+    if args.command == "scan":
+        if args.top < 1:
+            parser.error("--top must be at least 1")
+        if args.dte_min < 0 or args.dte_max < args.dte_min:
+            parser.error("--dte-min must be 0 or more, and no greater than --dte-max")
+        if args.budget is not None and args.budget <= 0:
+            parser.error("--budget must be more than 0")
+
+    try:
+        settings = load_settings()
+    except ConfigError as err:
+        print(err, file=sys.stderr)
+        return 2
 
     if args.command == "serve":
         import uvicorn
@@ -118,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         print(err, file=sys.stderr)
         return 2
     request = ScanRequest(
-        symbols=[s.upper() for s in args.symbols],
+        symbols=args.symbols,
         lens=args.lens,
         kind=args.kind,
         dte_min=args.dte_min,
@@ -127,24 +149,28 @@ def main(argv: list[str] | None = None) -> int:
         budget=args.budget,
     )
     result = scanner.scan(request)
-    if args.json:
-        print(json.dumps(asdict(result), default=str, indent=2))
-    else:
-        print_scan(result)
 
+    brief, brief_error = None, None
     if args.brief:
         try:
-            brief = ai.write_brief(result, model=settings.ai_model)
+            brief = ai.write_brief(
+                result, model=settings.ai_model, api_key=settings.anthropic_key, effort=settings.ai_effort
+            )
         except ai.BriefError as err:
-            print(f"\nAI brief unavailable: {err}", file=sys.stderr)
-            return 1
-        print(f"\nAI brief ({brief.model or 'no model call'})\n{brief.summary}")
-        for pick in brief.picks:
-            print(f"\n* {pick['contract']}: {pick['headline']}")
-            print(f"  Why: {pick['rationale']}")
-            print(f"  Risks: {pick['risks']}")
-            print(f"  Check first: {pick['check_first']}")
-    return 0
+            brief_error = str(err)
+            print(f"AI brief unavailable: {err}", file=sys.stderr)
+
+    if args.json:
+        # One document, so the output can be piped straight into a JSON parser.
+        document = asdict(result)
+        if args.brief:
+            document["brief"] = asdict(brief) if brief else None
+        print(json.dumps(document, default=str, indent=2))
+    else:
+        print_scan(result)
+        if brief:
+            _print_brief(brief)
+    return 1 if brief_error else 0
 
 
 if __name__ == "__main__":

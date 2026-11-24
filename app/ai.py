@@ -7,6 +7,7 @@ can find, normally ANTHROPIC_API_KEY in .env.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +20,7 @@ DEFAULT_MODEL = "claude-opus-5-5"
 FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_PICKS = 5
+_CREDENTIAL_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE")
 
 SYSTEM = """\
 You write the brief for a personal options screener. The reader trades their own \
@@ -36,6 +38,8 @@ Each contract also carries risk_reward_if_history_repeats: its payoff at expiry 
 if the stock is as volatile as its own past (recent volatility outside earnings, \
 plus past earnings moves for any report the contract spans), with no view on \
 direction. Read it as a comparison of the price with history, not a forecast. \
+Where an underlying has earnings_date_unknown set, those figures cannot account \
+for a report that may fall inside the contract's life; say so. \
 Options usually cost more than history suggests, which is what sellers are paid \
 for carrying the risk of a large move, so weigh a seller's favorable rating \
 against the losses listed beside it. A payoff_shape of "long shot" means the \
@@ -84,12 +88,17 @@ class BriefResult:
     model: str = ""
 
 
-def available() -> bool:
+def available(api_key: str | None = None) -> bool:
+    """True when the package is installed and there are credentials to call it with.
+
+    Leaving ANTHROPIC_API_KEY blank turns the brief off. The SDK's other
+    credential sources (an auth token or a named profile) also count.
+    """
     try:
         import anthropic  # noqa: F401
     except ImportError:
         return False
-    return True
+    return bool(api_key or any(os.environ.get(name) for name in _CREDENTIAL_VARS))
 
 
 def _r(value: float | None, digits: int = 4) -> float | None:
@@ -177,6 +186,8 @@ def _underlying(u: UnderlyingContext) -> dict[str, Any]:
         }
     if u.earnings_note:
         out["earnings_data_note"] = u.earnings_note
+    if u.earnings_unknown:
+        out["earnings_date_unknown"] = True
     return out
 
 
@@ -186,6 +197,7 @@ def scan_payload(result: ScanResult) -> dict[str, Any]:
     return {
         "lens": result.lens,
         "budget_per_contract_usd": result.budget,
+        "risk_reward_priced_at": "the ask for a buyer, the bid for a seller, in today's dollars",
         "data": "synthetic demo data, not real markets" if result.mode == "demo" else "live market data",
         "options_quote_feed": result.options_feed,
         "generated_at": result.generated_at.isoformat(timespec="seconds"),
@@ -195,7 +207,18 @@ def scan_payload(result: ScanResult) -> dict[str, Any]:
     }
 
 
-def write_brief(result: ScanResult, model: str | None = None, client: Any = None) -> BriefResult:
+def write_brief(
+    result: ScanResult,
+    model: str | None = None,
+    client: Any = None,
+    api_key: str | None = None,
+    effort: str | None = "high",
+) -> BriefResult:
+    """Ask Claude to write up the scan.
+
+    `effort` is left out of the request when None, for an older model set through
+    AI_MODEL that does not accept the setting.
+    """
     if not result.ideas:
         return BriefResult(summary="The scan returned no contracts, so there is nothing to write up.")
     try:
@@ -207,13 +230,15 @@ def write_brief(result: ScanResult, model: str | None = None, client: Any = None
     request: dict[str, Any] = dict(
         model=model,
         max_tokens=16000,
-        output_config={"effort": "high"},
         system=SYSTEM,
         messages=[{"role": "user", "content": json.dumps(scan_payload(result))}],
         output_format=Brief,
     )
+    if effort:
+        request["output_config"] = {"effort": effort}
     try:
-        client = client or anthropic.Anthropic()
+        if client is None:
+            client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
         if model in FALLBACK_MODELS:
             # If a safety classifier declines the request, the API retries it on another model.
             response = client.beta.messages.parse(betas=[FALLBACK_BETA], fallbacks="default", **request)

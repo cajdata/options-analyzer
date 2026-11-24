@@ -68,7 +68,7 @@ class DemoMarket:
             for n in range(1, 14)
         ]
 
-    def calendar(self) -> dict[str, EarningsEvent]:
+    def calendar(self, today: date | None = None) -> dict[str, EarningsEvent]:
         # Like a real calendar, only near-term dates are listed; the rest get estimated.
         events = {symbol: self.next_event(symbol) for symbol in SPECS}
         return {s: e for s, e in events.items() if (e.day - self.today).days <= 45}

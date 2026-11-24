@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import statistics
+import math
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -13,10 +14,12 @@ from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
 from app.analysis import risk, scoring
 from app.cache import DiskCache, NullCache
-from app.config import Settings
+from app.config import ConfigError, Settings
 from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, UnderlyingContext
 from app.providers import MarketData
 from app.providers.earnings import AlphaVantageEarnings, EarningsService, EdgarEarnings
+
+__all__ = ["ConfigError", "ScanRequest", "Scanner", "build_scanner"]
 
 ET = ZoneInfo("America/New_York")
 HISTORY_DAYS = 1200  # a little over three years: twelve earnings reports
@@ -26,10 +29,11 @@ MIN_PRICE = 5.0  # discovery skips stocks below this
 # about 4% of the share price, and out-of-the-money ones down to about 40% of that.
 ATM_MONTH_COST = 0.04
 BUDGET_REACH = 2.5
-
-
-class ConfigError(RuntimeError):
-    pass
+# How far from the stock price to look for strikes: at least `strike_window`, and
+# wider for volatile stocks and long expiries, up to half the price either way.
+WINDOW_SIGMAS = 1.5
+MAX_STRIKE_WINDOW = 0.50
+DEFAULT_VOL = 0.40  # assumed when a stock has too little price history to measure
 
 
 @dataclass
@@ -39,7 +43,7 @@ class ScanRequest:
     kind: str = "both"  # "call", "put" or "both"
     dte_min: int = 7
     dte_max: int = 60
-    strike_window: float = 0.15  # strikes within this share of the stock price
+    strike_window: float = 0.15  # least share of the stock price to search on each side
     max_symbols: int = 20
     top_n: int = 20
     # Most cash to put into one contract: the ask x 100 for a buyer, the collateral
@@ -64,12 +68,22 @@ class Scanner:
         self.settings = settings
         self.universe = universe or []  # symbols a discovery scan always considers
         self._today = today
+        self._lock = threading.Lock()
 
     def scan(self, req: ScanRequest) -> ScanResult:
         if req.lens not in scoring.LENSES:
             raise ValueError(f"unknown lens {req.lens!r}")
+        # One scan at a time. The data provider and its notes are shared, so two
+        # scans running together would mix up each other's notes and compete for
+        # the provider's request limit.
+        with self._lock:
+            return self._scan(req)
+
+    def _scan(self, req: ScanRequest) -> ScanResult:
+        req = replace(req, symbols=list(dict.fromkeys(s.strip().upper() for s in req.symbols if s.strip())))
         today = self._today or datetime.now(ET).date()
         warnings: list[str] = []
+        self.market.notes.clear()
 
         reasons = self._universe(req, warnings)
         quotes = self.market.stock_snapshots(list(reasons))
@@ -102,6 +116,13 @@ class Scanner:
                 if ctx.contracts_scanned == 0:
                     warnings.append(f"{ctx.symbol}: no two-sided option quotes in range.")
 
+        unknown = sorted(symbol for symbol, ctx in underlyings.items() if ctx.earnings_unknown)
+        if unknown and not self.earnings.sources:
+            warnings.append("No earnings data source is configured, so no rating accounts for an upcoming report.")
+        elif unknown:
+            warnings.append(
+                f"No earnings date is known for {', '.join(unknown)}, so ratings there do not account for a report."
+            )
         if self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
         warnings.extend(dict.fromkeys(self.market.notes))
@@ -161,8 +182,11 @@ class Scanner:
             if quote is None or quote.price < MIN_PRICE:
                 continue
             if req.budget is not None and req.lens == "sell":
-                if quote.price * (1 - req.strike_window) * scoring.SHARES > req.budget:
-                    continue  # even the lowest strike in range needs more collateral than the budget
+                # Least collateral any contract in range could need: 100 shares for a
+                # covered call, or the lowest strike the scan could reach for a put.
+                least = quote.price if req.kind == "call" else quote.price * (1 - MAX_STRIKE_WINDOW)
+                if least * scoring.SHARES > req.budget:
+                    continue
             points = 100.0 if "watchlist" in why else 0.0
             points += sum(1.0 for label in why if label != "watchlist")
             if req.budget is not None and req.lens == "buy":
@@ -172,7 +196,8 @@ class Scanner:
             listed = calendar.get(symbol)
             if listed and 0 <= (listed.day - today).days <= 21:
                 points += 3.0
-                why.append(f"earnings in {(listed.day - today).days}d")
+                days = (listed.day - today).days
+                why.append("earnings today" if days == 0 else f"earnings in {days}d")
             change = quote.change_pct or 0.0
             points += min(abs(change) / 0.02, 3.0)
             if abs(change) >= 0.03:
@@ -182,23 +207,41 @@ class Scanner:
 
     # -- One symbol ---------------------------------------------------------
 
+    @staticmethod
+    def _strike_window(req: ScanRequest, bars: list[Bar]) -> float:
+        """Share of the stock price to search on each side of it.
+
+        A fixed 15% is too narrow for volatile stocks and long expiries. The
+        strikes a seller wants (0.15 to 0.35 delta) sit about one standard
+        deviation out, which can be 30% of the price or more. So the window grows
+        with the stock's volatility and the longest expiry in the scan.
+        """
+        vol = metrics.realized_vol(bars, 60) or metrics.realized_vol(bars, 20) or DEFAULT_VOL
+        reach = WINDOW_SIGMAS * vol * math.sqrt(req.dte_max / 365.0)
+        return max(req.strike_window, min(MAX_STRIKE_WINDOW, reach))
+
     def _analyze(
         self, symbol: str, quote: StockQuote, bars: list[Bar], reasons: list[str], req: ScanRequest, today: date
     ) -> tuple[UnderlyingContext, list[ContractAnalysis], float | None]:
         spot = quote.price
+        reach = self._strike_window(req, bars)
         window = dict(
             expiry_from=today + timedelta(days=req.dte_min),
             expiry_to=today + timedelta(days=req.dte_max),
-            strike_from=spot * (1 - req.strike_window),
-            strike_to=spot * (1 + req.strike_window),
+            strike_from=spot * (1 - reach),
+            strike_to=spot * (1 + reach),
         )
         chain = self.market.option_chain(symbol, **window)
         if any(q.open_interest is None for q in chain):
             try:
                 interest = self.market.open_interest(symbol, **window)
-            except Exception:
+            except Exception as err:
                 interest = {}
-                self.market.notes.append("Open interest was unavailable, so liquidity scores rely on spreads alone.")
+                note = "Open interest was unavailable, so liquidity scores rely on spreads alone."
+                if getattr(err, "status", None) in (401, 403):
+                    # Market data accepts paper and live keys alike; this request does not.
+                    note += " The trading API rejected the keys: check that ALPACA_PAPER matches the keys you use."
+                self.market.notes.append(note)
             for q in chain:
                 if q.open_interest is None:
                     q.open_interest = interest.get(q.symbol)
@@ -207,18 +250,19 @@ class Scanner:
         analyzed = [a for q in chain if (a := metrics.analyze_contract(q, spot, today, rate))]
         atm = metrics.atm_by_expiry(analyzed, spot)
         metrics.apply_expected_moves(analyzed, atm, spot, today, rate)
-        realized_20 = metrics.realized_vol(bars, 20)
 
         history, note = self.earnings.history(symbol)
         upcoming = self.earnings.upcoming(symbol, history)
         moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
+        # A stock that reports, with no date to go on: the lookup failed or nothing
+        # is configured, or the reports on file are too old to estimate from.
+        unknown = note is not None or (bool(history) and upcoming is None)
 
         # The stock's own history: ordinary days with earnings reactions removed,
         # and the typical size of a report-day move.
         earnings_days = earnings_math.reaction_days(history, bars)
         ordinary = metrics.realized_vol(bars, 60, earnings_days) or metrics.realized_vol(bars, 20, earnings_days)
-        enough = len(moves) >= risk.MIN_REPORTS
-        event_var = statistics.fmean(m.move_pct**2 for m in moves) if enough else None
+        event_var = risk.event_variance(moves, ordinary)
 
         implied = earnings_math.implied_move(spot, atm, upcoming, ordinary, today) if upcoming and atm else None
         for c in analyzed:
@@ -230,7 +274,7 @@ class Scanner:
             symbol=symbol,
             price=spot,
             change_pct=quote.change_pct,
-            realized_vol_20d=realized_20,
+            realized_vol_20d=metrics.realized_vol(bars, 20),
             realized_vol_60d=metrics.realized_vol(bars, 60),
             atm_iv=atm[near_month].iv if near_month else None,
             reasons=reasons,
@@ -240,6 +284,7 @@ class Scanner:
             earnings_stats=earnings_math.summarize(moves),
             implied_move=implied,
             earnings_note=note,
+            earnings_unknown=unknown,
             contracts_scanned=len(analyzed),
         )
 

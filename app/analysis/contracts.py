@@ -11,6 +11,11 @@ from app import pricing
 from app.models import Bar, ContractAnalysis, OptionQuote
 
 
+# Volatility is annualized over 252 trading days, so one trading day carries this
+# share of a year's variance. An earnings report replaces one such day.
+TRADING_DAY = 1.0 / 252.0
+
+
 def years_to_expiry(expiry: date, today: date) -> float:
     # Half a day on expiry day itself keeps the formulas finite.
     return max((expiry - today).days, 0.5) / 365.0
@@ -21,10 +26,19 @@ def analyze_contract(q: OptionQuote, spot: float, today: date, rate: float) -> C
     if not q.bid or not q.ask or q.bid <= 0 or q.ask < q.bid:
         return None
     dte = (q.expiry - today).days
-    if dte < 0 or spot <= 0:
+    if dte < 0 or spot <= 0 or q.strike <= 0:
         return None
     t = years_to_expiry(q.expiry, today)
     mid = (q.bid + q.ask) / 2.0
+    is_call = q.kind == "call"
+    # An option is always worth at least what exercising it now would pay. A quote
+    # below that is stale against the stock price (common on a delayed feed), and
+    # it would otherwise look like free money. This holds whether or not the feed
+    # supplies its own volatility figure.
+    intrinsic = max(spot - q.strike, 0.0) if is_call else max(q.strike - spot, 0.0)
+    breakeven = q.strike + mid if is_call else q.strike - mid
+    if mid < intrinsic or breakeven <= 0:
+        return None
 
     if q.iv and q.iv > 0:
         iv, iv_source = q.iv, "provider"
@@ -39,8 +53,6 @@ def analyze_contract(q: OptionQuote, spot: float, today: date, rate: float) -> C
         g = pricing.greeks(q.kind, spot, q.strike, t, rate, iv)
         delta, gamma, theta, vega, greeks_source = g.delta, g.gamma, g.theta, g.vega, "computed"
 
-    is_call = q.kind == "call"
-    breakeven = q.strike + mid if is_call else q.strike - mid
     above_breakeven = pricing.prob_above(spot, breakeven, t, rate, iv)
     above_strike = pricing.prob_above(spot, q.strike, t, rate, iv)
     # Selling a put ties up the strike in cash; a covered call ties up the shares.
@@ -72,7 +84,9 @@ def analyze_contract(q: OptionQuote, spot: float, today: date, rate: float) -> C
         breakeven_vs_expected=None,
         pop_long=above_breakeven if is_call else 1.0 - above_breakeven,
         prob_itm=above_strike if is_call else 1.0 - above_strike,
-        theta_pct_per_day=abs(theta) / mid,
+        # Decay is value lost per day. A deep in-the-money put can gain with time
+        # instead (positive theta), which is not decay.
+        theta_pct_per_day=max(-theta, 0.0) / mid,
         annualized_yield=mid / collateral * 365.0 / max(dte, 1),
     )
 
@@ -109,7 +123,8 @@ def apply_expected_moves(
     The comparison measures the breakeven from the forward price (spot grown at
     the risk-free rate), which is where option prices are centered. Measuring
     from spot would make every put look closer to its breakeven than the
-    matching call.
+    matching call. Only a move the stock still has to make counts: a breakeven
+    already on the favorable side of the forward is a distance of zero.
     """
     for c in contracts:
         point = atm.get(c.expiry)
@@ -120,7 +135,8 @@ def apply_expected_moves(
         if expected > 0:
             forward = spot * math.exp(rate * t)
             c.expected_move_pct = expected
-            c.breakeven_vs_expected = abs(c.breakeven / forward - 1.0) / expected
+            needed = c.breakeven / forward - 1.0 if c.kind == "call" else 1.0 - c.breakeven / forward
+            c.breakeven_vs_expected = max(needed, 0.0) / expected
 
 
 def realized_vol(bars: list[Bar], window: int, exclude: frozenset[date] | set[date] = frozenset()) -> float | None:

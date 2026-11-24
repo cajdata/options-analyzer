@@ -7,10 +7,12 @@ import statistics
 from bisect import bisect_left, bisect_right
 from datetime import date, timedelta
 
-from app.analysis.contracts import AtmPoint, years_to_expiry
+from app.analysis.contracts import TRADING_DAY, AtmPoint, years_to_expiry
 from app.models import Bar, EarningsEvent, EarningsStats, ImpliedMove, Reaction
 
 _MAX_GAP = timedelta(days=6)  # skip an event if the price history has a hole around it
+# An expiry further than this past a report may contain the following report too.
+NEXT_REPORT_DAYS = 75
 
 
 def _window(event: EarningsEvent, days: list[date]) -> tuple[int, int] | None:
@@ -42,8 +44,16 @@ def reactions(events: list[EarningsEvent], bars: list[Bar]) -> list[Reaction]:
         window = _window(event, days)
         if window is None:
             continue
-        move = bars[window[1]].close / bars[window[0]].close - 1.0
-        out.append(Reaction(day=event.day, timing=event.timing, move_pct=move, surprise_pct=event.surprise_pct))
+        before, after = window
+        out.append(
+            Reaction(
+                day=event.day,
+                timing=event.timing,
+                move_pct=bars[after].close / bars[before].close - 1.0,
+                surprise_pct=event.surprise_pct,
+                sessions=after - before,
+            )
+        )
     return sorted(out, key=lambda r: r.day, reverse=True)
 
 
@@ -89,15 +99,26 @@ def estimate_next(history: list[EarningsEvent], today: date) -> EarningsEvent | 
 
 
 def spans(expiry: date, event: EarningsEvent) -> bool:
-    """True if a contract expiring on `expiry` is still open when the stock reacts."""
-    return expiry >= event.day if event.timing == "pre" else expiry > event.day
+    """True if a contract expiring on `expiry` may still be open when the stock reacts.
+
+    A report after the close moves the stock the next day, so a contract expiring
+    on the report day misses it. When the timing is unknown the report day
+    counts, because the report may come before the open; flagging a report that
+    turns out to miss the contract is the safer mistake.
+    """
+    return expiry > event.day if event.timing == "post" else expiry >= event.day
+
+
+def _ambiguous(expiry: date, event: EarningsEvent) -> bool:
+    """An expiry on the report day when nobody knows whether the report comes first."""
+    return event.timing == "unknown" and expiry == event.day
 
 
 def implied_move(
     spot: float,
     atm: dict[date, AtmPoint],
     event: EarningsEvent,
-    realized: float | None,
+    ordinary: float | None,
     today: date,
 ) -> ImpliedMove | None:
     """Size of the earnings move the options are pricing.
@@ -111,39 +132,45 @@ def implied_move(
     Ordinary volatility comes from, in order of preference: the last
     expiration before the report; the forward volatility between the first two
     expirations after it (both contain the report, so their difference does
-    not); recent realized volatility. Realized volatility usually runs below
-    implied, so that last resort tends to overstate the report's share.
+    not), as long as the second comes before the following report; the stock's
+    recent realized volatility outside earnings (`ordinary`). Realized
+    volatility usually runs below implied, so that last resort tends to
+    overstate the report's share.
+
+    An expiry on the report day with the timing unknown may or may not contain
+    the report, so it is used on neither side.
     """
-    after = sorted(e for e in atm if spans(e, event))
+    after = sorted(e for e in atm if spans(e, event) and not _ambiguous(e, event))
     if not after:
         return None
     expiry = after[0]
     point = atm[expiry]
-    if point.straddle is None:
-        return None
+    straddle_pct = None if point.straddle is None else point.straddle / spot
 
     t = years_to_expiry(expiry, today)
     total_var = point.iv * point.iv * t
     baseline, source = None, "none"
 
     before = sorted(e for e in atm if not spans(e, event) and (e - today).days >= 3)
+    later = [e for e in after[1:] if (e - event.day).days < NEXT_REPORT_DAYS]
     if before:
         baseline, source = atm[before[-1]].iv, "the last expiry before the report"
-    elif len(after) > 1:
-        t_next = years_to_expiry(after[1], today)
-        forward_var = (atm[after[1]].iv ** 2 * t_next - total_var) / (t_next - t)
+    elif later:
+        t_next = years_to_expiry(later[0], today)
+        forward_var = (atm[later[0]].iv ** 2 * t_next - total_var) / (t_next - t)
         if forward_var > 0:
             baseline, source = math.sqrt(forward_var), "the next expiry after it"
-    if baseline is None and realized:
-        baseline, source = realized, "recent realized volatility"
+    if baseline is None and ordinary:
+        baseline, source = ordinary, "recent realized volatility"
     if baseline is None:
-        return ImpliedMove(expiry, point.straddle / spot, None, 0.0, source)
+        return ImpliedMove(expiry, straddle_pct, None, 0.0, source)
 
-    event_var = total_var - baseline * baseline * max(t - 1.0 / 365.0, 0.0)
+    # The report takes the place of one ordinary trading day.
+    event_var = total_var - baseline * baseline * max(t - TRADING_DAY, 0.0)
     event_move = math.sqrt(event_var) * math.sqrt(2.0 / math.pi) if event_var > 0 else 0.0
     return ImpliedMove(
         expiry=expiry,
-        straddle_pct=point.straddle / spot,
+        straddle_pct=straddle_pct,
         event_move_pct=event_move,
         baseline_vol=baseline,
         baseline_source=source,

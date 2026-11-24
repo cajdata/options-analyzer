@@ -76,7 +76,8 @@ def _vol_value(c: ContractAnalysis, cfg: dict) -> float:
 
     `history_vol` blends ordinary realized volatility with past earnings moves
     for any report the contract spans, so one comparison covers both cases. The
-    risk/reward rating is built on the same number, so the two cannot disagree.
+    risk/reward rating starts from the same number and then charges for the
+    bid-ask spread, so it can be a shade less favorable than this component.
     """
     if c.history_vol:
         return ramp(c.iv / c.history_vol, *cfg["iv_vs_history"])
@@ -116,6 +117,8 @@ def rank(contracts: list[ContractAnalysis], per_side: int, top_n: int) -> list[C
     """Best contracts overall, with at most `per_side` calls and `per_side` puts per stock."""
     taken: dict[tuple[str, str], int] = {}
     out: list[ContractAnalysis] = []
+    if top_n <= 0:
+        return out
     for c in sorted(contracts, key=lambda c: c.score or 0.0, reverse=True):
         side = (c.underlying, c.kind)
         if taken.get(side, 0) >= per_side:

@@ -6,7 +6,7 @@ Endpoints and field names follow https://docs.alpaca.markets/reference.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as clock, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,12 @@ ET = ZoneInfo("America/New_York")
 
 MAX_CHAIN_PAGES = 15  # 1,000 contracts a page
 _RETRIES = 3
+# Today's daily bar is final a little after the 4 p.m. close.
+BAR_FINAL = clock(16, 20)
+IEX_BARS_NOTE = (
+    "Price history comes from the IEX exchange only, because this Alpaca "
+    "plan does not include consolidated (SIP) history."
+)
 
 
 class AlpacaError(RuntimeError):
@@ -52,7 +58,9 @@ class AlpacaData:
         paper: bool = True,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], datetime] = lambda: datetime.now(ET),
     ) -> None:
+        self._now = now  # New York time; replaceable so tests do not depend on the clock
         self.options_feed = options_feed
         self.stock_feed = stock_feed
         self.notes: list[str] = []
@@ -66,7 +74,13 @@ class AlpacaData:
 
     def _get(self, url: str, params: dict[str, Any]) -> Any:
         for attempt in range(_RETRIES + 1):
-            resp = self._client.get(url, params=params, headers=self._headers)
+            try:
+                resp = self._client.get(url, params=params, headers=self._headers)
+            except httpx.TransportError as err:  # timeouts and dropped connections
+                if attempt < _RETRIES:
+                    self._sleep(2.0 * (attempt + 1))
+                    continue
+                raise AlpacaError(0, f"could not reach Alpaca ({type(err).__name__})") from err
             busy = resp.status_code == 429 or resp.status_code >= 500
             if busy and attempt < _RETRIES:
                 try:
@@ -121,12 +135,20 @@ class AlpacaData:
         for symbol, snap in data.items():
             if not isinstance(snap, dict):
                 continue
+            previous = _num(snap.get("prevDailyBar"), "c")
             price = _num(snap.get("latestTrade"), "p") or _num(snap.get("dailyBar"), "c")
+            if not price and previous:
+                # Before the open, a thinly traded feed may have no trade yet today.
+                price = previous
+                self.notes.append(
+                    f"Some stocks have not traded yet today on the {self.stock_feed} feed; "
+                    "their price is the previous close."
+                )
             if price:
-                out[symbol] = StockQuote(symbol, price, _num(snap.get("prevDailyBar"), "c"))
+                out[symbol] = StockQuote(symbol, price, previous)
 
     def daily_bars(self, symbols: list[str], start: date) -> dict[str, list[Bar]]:
-        """Adjusted daily closes, oldest first, excluding today's unfinished bar."""
+        """Adjusted daily closes, oldest first. Today's bar is included once it is final."""
         if not symbols:
             return {}
         # Accounts without a real-time subscription cannot query the latest 15 minutes.
@@ -147,19 +169,20 @@ class AlpacaData:
             if self._bars_feed != "sip" or err.status not in (403, 422):
                 raise
             self._bars_feed = params["feed"] = "iex"
-            self.notes.append(
-                "Price history comes from the IEX exchange only, because this Alpaca "
-                "plan does not include consolidated (SIP) history."
-            )
             pages, _ = self._paged(f"{DATA_URL}/v2/stocks/bars", params, max_pages=60)
+        if self._bars_feed == "iex":
+            # Said on every scan, not only the one that discovered it.
+            self.notes.append(IEX_BARS_NOTE)
 
-        today = datetime.now(ET).date()
+        now = self._now()
+        today = now.date()
+        final = now.time() >= BAR_FINAL
         out: dict[str, list[Bar]] = {symbol: [] for symbol in symbols}
         for page in pages:
             for symbol, rows in (page.get("bars") or {}).items():
                 for row in rows:
                     day = date.fromisoformat(row["t"][:10])
-                    if day < today:
+                    if day < today or (day == today and final):
                         out.setdefault(symbol, []).append(Bar(day, float(row["c"]), float(row.get("v", 0))))
         return out
 
