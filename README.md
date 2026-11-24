@@ -112,8 +112,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 - **Risk and reward assumes history repeats** and takes no view on direction. It is a
   comparison of price with past behavior, and past volatility is a rough guide at best.
 - **A rating cannot see a report it has no date for.** When no earnings date is known for
-  a stock (no source set, a failed lookup, or a foreign company that files no 8-K), the
-  scan says so, because options look expensive right before a report for good reason.
+  a stock, the scan says so, because options look expensive right before a report for good
+  reason. That covers no source being set, a failed lookup, and a foreign company that
+  reports on Form 6-K when SEC EDGAR is the only source (EDGAR dates US filers only; add
+  an Alpha Vantage key to cover the rest).
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
 - **The AI brief knows only the scan.** It has no news and no view of your account. It

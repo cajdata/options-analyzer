@@ -98,7 +98,7 @@ def available(api_key: str | None = None) -> bool:
         import anthropic  # noqa: F401
     except ImportError:
         return False
-    return bool(api_key or any(os.environ.get(name) for name in _CREDENTIAL_VARS))
+    return bool(api_key or any((os.environ.get(name) or "").strip() for name in _CREDENTIAL_VARS))
 
 
 def _r(value: float | None, digits: int = 4) -> float | None:
