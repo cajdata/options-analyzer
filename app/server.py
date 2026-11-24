@@ -14,10 +14,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app import ai
-from app.analysis import scoring
+from app.analysis import exits, scoring
 from app.config import ROOT, ConfigError, Settings, load_settings
 from app.models import ScanResult
-from app.scanner import Scanner, ScanRequest, build_scanner
+from app.scanner import PRESETS, Scanner, ScanRequest, build_scanner
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,9 @@ class ScanBody(BaseModel):
     dte_max: int = Field(60, ge=1, le=730)
     top_n: int = Field(20, ge=1, le=100)
     budget: float | None = Field(None, gt=0, le=10_000_000)
+    delta_min: float | None = Field(None, ge=0, le=1)
+    delta_max: float | None = Field(None, ge=0, le=1)
+    avoid_earnings: bool = False
 
     @field_validator("symbols")
     @classmethod
@@ -73,6 +76,8 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             "setup_error": setup_error,
             "watchlist": list(settings.watchlist),
             "lenses": {name: cfg["weights"] for name, cfg in scoring.LENSES.items()},
+            "presets": PRESETS,
+            "exit_rules": {"profit_target": exits.PROFIT_TARGET, "time_stop_dte": exits.TIME_STOP_DTE},
         }
 
     @app.post("/api/scan")
@@ -81,6 +86,8 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             raise HTTPException(503, setup_error)
         if body.dte_max < body.dte_min:
             raise HTTPException(422, "dte_max must not be below dte_min")
+        if body.delta_min is not None and body.delta_max is not None and body.delta_max < body.delta_min:
+            raise HTTPException(422, "delta_max must not be below delta_min")
         request = ScanRequest(
             symbols=body.symbols,
             lens=body.lens,
@@ -89,6 +96,9 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             dte_max=body.dte_max,
             top_n=body.top_n,
             budget=body.budget,
+            delta_min=body.delta_min,
+            delta_max=body.delta_max,
+            avoid_earnings=body.avoid_earnings,
         )
         try:
             result = scanner.scan(request)

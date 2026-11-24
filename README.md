@@ -42,6 +42,7 @@ earnings dates are made up.
 .venv\Scripts\python.exe -m app scan AAPL NVDA            # specific symbols
 .venv\Scripts\python.exe -m app scan --lens sell --type put --dte-min 20 --dte-max 45
 .venv\Scripts\python.exe -m app scan --budget 100         # only contracts that cost $100 or less
+.venv\Scripts\python.exe -m app scan --preset sell-premium --exits   # premium-selling setup, with exit plans
 .venv\Scripts\python.exe -m app scan --brief              # add the AI write-up
 ```
 
@@ -93,6 +94,27 @@ they are in today's dollars, so a fairly priced option shows zero at any expiry.
 than history suggests, which is what sellers are paid for carrying the risk of a large
 move, so a seller's favorable rating always sits next to those loss figures.
 
+**Draws an exit plan.** A scan scores a contract as held to expiry; the exit plan shows
+what happens before then. It reprices the contract on later dates with the stock
+unchanged, which isolates what time does to it:
+
+- **Time decay.** What the option is worth in one, two and three weeks, and what closing
+  it then would gain or lose. Closing early crosses the bid-ask spread a second time, so
+  these use the bid for a holder and the ask for someone buying back.
+- **The step across earnings.** A report adds a lump of volatility that vanishes the day
+  it lands, so the price drops that day even if the stock does nothing. The plan shows
+  the drop, and the stock move that would undo it.
+- **A seller's rules of thumb.** The price to buy back at to keep half the premium, when
+  decay alone gets there, and the date 21 days before expiry that sellers treat as a time
+  stop.
+
+A date on that path is where time alone takes the price. It is not the chance of getting
+there, and the rules are for managing risk, not signals.
+
+**Offers a premium-selling preset.** One click, or `--preset sell-premium`, sets the sell
+lens to 30 to 45 days, 0.16 to 0.30 delta, and skips contracts still open over an
+earnings report. Those filters are also available on their own.
+
 **Ranks through a lens.** `buy` ranks long calls and puts; `sell` ranks cash-secured
 puts and covered calls. The score is a weighted sum of five components (liquidity,
 breakeven or probability, how volatility is priced, decay or yield, delta). "How
@@ -116,6 +138,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   reason. That covers no source being set, a failed lookup, and a foreign company that
   reports on Form 6-K when SEC EDGAR is the only source (EDGAR dates US filers only; add
   an Alpha Vantage key to cover the rest).
+- **The exit plan assumes the stock stands still** and that volatility behaves as the
+  options currently price it. It does not model dividends, so it cannot see the early
+  assignment risk a short call carries just before a stock goes ex-dividend, and it does
+  not know market holidays.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
 - **The AI brief knows only the scan.** It has no news and no view of your account. It
@@ -129,8 +155,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 
 ## Roadmap
 
-1. **Done:** read-only scanner with earnings context, discovery and AI brief.
+1. **Done:** read-only scanner with earnings context, discovery, AI brief, exit plans and
+   a premium-selling preset.
 2. News layer: classify headlines and filings by event type, and study what followed
    similar events.
-3. Paper trading on Alpaca with a journal that records which signals worked.
+3. A positions page that checks what you hold against the exit rules, then paper trading
+   on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.

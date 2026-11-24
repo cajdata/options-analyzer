@@ -109,6 +109,21 @@ def spans(expiry: date, event: EarningsEvent) -> bool:
     return expiry > event.day if event.timing == "post" else expiry >= event.day
 
 
+def reaction_day(event: EarningsEvent) -> date:
+    """The first session whose close reflects the report.
+
+    A report before the open is felt that day. One after the close, or of
+    unknown timing, is taken as felt the next weekday, so the day is never
+    placed too early. Market holidays are not accounted for.
+    """
+    if event.timing == "pre":
+        return event.day
+    day = event.day + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
 def _ambiguous(expiry: date, event: EarningsEvent) -> bool:
     """An expiry on the report day when nobody knows whether the report comes first."""
     return event.timing == "unknown" and expiry == event.day
@@ -174,4 +189,5 @@ def implied_move(
         event_move_pct=event_move,
         baseline_vol=baseline,
         baseline_source=source,
+        event_var=max(event_var, 0.0),
     )

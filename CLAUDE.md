@@ -29,7 +29,7 @@ One scan flows in a straight line:
 
 1. **Providers** (`app/providers/`) fetch data. `MarketData` is the protocol; `AlpacaData` is the real one and `DemoMarket` the synthetic one. `EarningsService` combines earnings sources (SEC EDGAR, Alpha Vantage), caches them on disk, and estimates a missing date.
 2. **`Scanner`** (`app/scanner.py`) picks symbols (given ones, or discovery from the watchlist, screeners and `data/universe.txt`), then analyzes each on a small thread pool.
-3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols.
+3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols. `exits.build` then draws an exit plan for each ranked contract.
 4. **Surfaces** read the resulting `ScanResult`: `app/server.py` (FastAPI plus `public/index.html`), `app/__main__.py` (command line), `app/ai.py` (optional Claude write-up).
 
 Things that are not obvious from any one file:
@@ -39,6 +39,8 @@ Things that are not obvious from any one file:
 - **Provider caveats travel as notes.** A provider appends to `market.notes`; the scanner drains them into `ScanResult.warnings`, which every surface displays. Use this for anything the person should know (a feed fallback, missing open interest).
 - **Time is injected.** `Scanner(today=)`, `EarningsService(today=, clock=)`, `AlpacaData(now=, sleep=)` and `EdgarEarnings(sleep=)` exist so tests never depend on the wall clock. Tests pin `TODAY = date(2026, 11, 24)`.
 - **Tunable numbers live in two places.** Score weights and thresholds are in `scoring.LENSES`; rating thresholds are constants at the top of `risk.py`.
+- **Shared data types live in `app/models.py`**, including the exit-plan dataclasses, so they can be imported anywhere without a cycle. `exits.py` holds only the logic. Exit plans are kept in `ScanResult.exit_plans`, keyed by contract symbol, and not on `ContractAnalysis`.
+- **Presets are data.** `scanner.PRESETS` maps a name to `ScanRequest` fields. The API serves it, the dashboard builds its buttons from it, and the command line reads it, so a preset is defined once.
 - **The dashboard builds DOM with the `el()` helper.** Never use `innerHTML` with scan data.
 
 ## Invariants
@@ -51,6 +53,7 @@ These came out of two rounds of outside code review. Each has a test; do not reg
 - **"No reports" and "cannot tell" are different.** A company that files 6-K, 20-F or 40-F raises `Unsupported` in `EdgarEarnings`, which sets `earnings_unknown`. Never let it look like an ETF, which has no reports at all.
 - **The strike window scales with volatility** (`Scanner._strike_window`). A fixed 15% cuts off the deltas the sell lens targets on volatile stocks.
 - **One server instance runs for days.** `EarningsService.today` is read each time, never stored at startup. The calendar and the Alpha Vantage block expire and retry; that block is checked and set while holding its lock. `Scanner._lock` allows one scan at a time. `DiskCache.set` is atomic and never fatal. `EdgarEarnings` is paced (`MIN_INTERVAL`). `/` is served with `Cache-Control: no-cache`.
+- **An exit plan is a standing-still path, and says so.** `exits.build` reprices a contract on later dates with the stock unchanged. The path starts at the quoted mid and is never below exercise value. Closing early uses the bid for a holder and the ask to buy back, so the spread is counted twice. An earnings report's variance leaves on `earnings.reaction_day`. A date on the path must never be shown as the chance of getting there, and the profit target and time stop (`exits.PROFIT_TARGET`, `exits.TIME_STOP_DTE`) are presented as rules of thumb.
 - **Symbols are tidied in `Scanner._scan`** (trim, upper-case, `BRK-B` to `BRK.B`, de-duplicate), so every way in behaves the same.
 
 ## Working agreement
@@ -67,14 +70,15 @@ Nothing has run against live data. No Alpaca keys have been available, so `Alpac
 
 ## Next step (proposed, not approved)
 
-Exit timing: an exit plan on every scan result and a premium-selling preset (30 to 45 days, 0.16 to 0.30 delta, skip contracts spanning earnings), then a positions page that checks holdings against exit rules (50% of maximum profit, 21 days to expiry). Ask before building it.
+A positions page: the person enters what they hold, and the app checks each position against the exit rules (profit target reached, time stop reached, earnings in a few days, stock through the strike). Ask before building it.
 
 If it is built:
 
-- Keep it in its own module (`app/analysis/exits.py`) with its own dataclasses, not more fields on `ContractAnalysis`.
-- Expose the at-the-money volatility term structure, the ex-earnings volatility and the event variance on `UnderlyingContext`. `Scanner._analyze` computes all three and discards them today.
-- Count the bid-ask spread twice on an early exit.
-- Never present the chance of profit at expiry as the chance of reaching a target before expiry.
-- Allow for early assignment around an ex-dividend date on short options. The pricing currently assumes no dividends.
+- It needs a small persistent store outside `.cache/` for entries (contract, side, quantity, entry price and date). The server keeps only the last ten scans in memory.
+- Refresh held contracts with Alpaca's snapshot-by-symbols endpoint instead of pulling whole chains.
+- Reuse `exits.build` for the forward path; do not write a second repricing model.
+- The chance of reaching a target before expiry is path-dependent. If it is ever shown, it needs its own model (first-passage or simulation), never the chance of profit at expiry.
+- Early assignment around an ex-dividend date matters for short options and needs a dividend data source. The pricing currently assumes no dividends.
+- With free delayed quotes, signals are end-of-day quality, not intraday.
 
-The README roadmap numbers the news layer as phase 2 and paper trading as phase 3. Exit timing has no number there yet.
+The README roadmap lists this with paper trading as item 3, after the news layer.

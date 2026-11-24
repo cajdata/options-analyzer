@@ -31,6 +31,9 @@
   input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
   input[type=number] { width: 72px; }
   #budget { width: 120px; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); padding-bottom: 8px; }
+  .check input { width: auto; margin: 0; }
+  .hint { max-width: 1440px; margin: 8px auto 0; padding: 0 16px; color: var(--muted); font-size: 13px; }
   #symbols { width: 260px; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
@@ -105,10 +108,17 @@
   <label title="Buying: the ask price times 100. Selling: the collateral, meaning the strike in cash for a put or 100 shares for a call.">Budget per contract ($)
     <input id="budget" type="number" min="1" step="1" placeholder="No limit">
   </label>
+  <label title="Delta ignoring its sign: roughly the chance the option finishes in the money.">Delta from
+    <input id="delta_min" type="number" min="0" max="1" step="0.01" placeholder="any">
+  </label>
+  <label>to <input id="delta_max" type="number" min="0" max="1" step="0.01" placeholder="any"></label>
+  <label class="check"><input id="avoid_earnings" type="checkbox"> Skip contracts open over earnings</label>
+  <span id="presets"></span>
   <button class="primary" id="scan" type="submit">Scan</button>
   <span id="busy" class="sub" role="status"></span>
 </form>
 
+<p class="hint" id="hint" role="status"></p>
 <div class="notice" id="notice"></div>
 
 <main>
@@ -152,7 +162,7 @@ function signedPct(v, digits = 1) {
   if (v === null || v === undefined) return "–";
   const text = (v * 100).toFixed(digits);
   if (Number(text) === 0) return (0).toFixed(digits) + "%";
-  return (v > 0 ? "+" : "") + text + "%";
+  return (v > 0 ? "+" : "") + text.replace("-", "−") + "%";  // the same minus sign dollars() uses
 }
 const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
 const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
@@ -289,6 +299,54 @@ function riskBlock(idea, ctx) {
   ];
 }
 
+function exitBlock(idea, ctx) {
+  const plan = scan.exit_plans[idea.symbol];
+  if (!plan) return [];
+  const rules = status.exit_rules;
+  const seller = plan.lens === "sell";
+  const where = Math.abs(plan.strike_distance_pct) < 0.0005 ? "at the stock price"
+    : pct(Math.abs(plan.strike_distance_pct)) + (plan.strike_distance_pct < 0 ? " below the stock" : " above the stock");
+  const rows = [];
+  if (seller) {
+    rows.push(["Buy back to keep " + pct(rules.profit_target, 0), money(plan.target_price) + " or less"]);
+    rows.push(["Decay alone gets there", plan.target_day ? "about " + dayMonth(plan.target_day) : "not before expiry"]);
+  } else if (plan.half_life_day) {
+    rows.push(["Half the time value is gone by", dayMonth(plan.half_life_day)]);
+  }
+  rows.push(["Time stop (" + rules.time_stop_dte + " days left)", plan.time_stop_day ? dayMonth(plan.time_stop_day) : "already inside it"]);
+  rows.push(["Strike is", where]);
+
+  const parts = [
+    el("h3", {}, "Exit plan"),
+    facts(rows),
+    el("p", { class: "sub" }, "If the stock stands still, closing at the " + (seller ? "ask" : "bid") + ":"),
+    el("table", { class: "history" },
+      el("thead", {}, el("tr", {}, el("th", {}, "When"), el("th", {}, "Close at"), el("th", {}, "Result"))),
+      el("tbody", {}, plan.checkpoints.map((k) => el("tr", {},
+        el("td", {}, k.label + " · " + dayMonth(k.day)),
+        el("td", {}, money(k.close_price)),
+        el("td", { class: tone(Math.round(k.pnl)) }, dollars(k.pnl, true) + " (" + signedPct(k.pnl_pct, 0) + ")"))))),
+  ];
+  const report = plan.earnings;
+  if (report) {
+    const move = report.move_to_breakeven_pct;
+    let back;
+    if (move === null) back = "No plausible move in the stock the next day gets back to the entry price.";
+    else if (seller) back = Math.abs(move) < 0.0005
+      ? "Buying back the next day would already cost what was collected."
+      : "Buying back the next day costs less than was collected unless the stock moves more than " + signedPct(move) + ".";
+    else back = "To be back at the entry price the next day, the stock has to move " + signedPct(move) + ".";
+    const past = ctx.earnings_stats ? " Past reports averaged a " + pct(ctx.earnings_stats.mean_abs) + " move." : "";
+    parts.push(el("p", { class: "sub" }, "Across earnings (" + dayMonth(report.report_day) + "), the option goes from "
+      + money(report.value_before) + " to " + money(report.value_after) + " (" + signedPct(report.crush_pct, 0)
+      + ") with the stock unchanged. " + back + past));
+  }
+  plan.notes.forEach((note) => parts.push(el("p", { class: "sub" }, note)));
+  parts.push(el("p", { class: "sub" }, "Each date is where time alone takes the price with the stock unchanged. It is not the chance of getting there. The "
+    + pct(rules.profit_target, 0) + " target and " + rules.time_stop_dte + "-day time stop are rules of thumb that option sellers use to manage risk, not signals."));
+  return parts;
+}
+
 function compareBar(label, value, max) {
   const width = max > 0 && value !== null ? Math.min(100, (value / max) * 100) : 0;
   return el("div", { class: "compare" }, el("span", { class: "sub" }, label),
@@ -320,6 +378,7 @@ function select(idea) {
       ["Theta · vega", num(idea.theta, 3) + " · " + num(idea.vega, 3)],
     ].filter(Boolean)),
     riskBlock(idea, ctx),
+    exitBlock(idea, ctx),
     el("h3", {}, "Score " + num(idea.score, 1) + " of 100"),
     Object.entries(idea.components).map(([name, value]) => el("div", { class: "component" },
       el("span", {}, COMPONENTS[name] || name),
@@ -409,6 +468,9 @@ $("controls").addEventListener("submit", async (event) => {
       dte_min: Number($("dte_min").value),
       dte_max: Number($("dte_max").value),
       budget: $("budget").value ? Number($("budget").value) : null,
+      delta_min: $("delta_min").value ? Number($("delta_min").value) : null,
+      delta_max: $("delta_max").value ? Number($("delta_max").value) : null,
+      avoid_earnings: $("avoid_earnings").checked,
     });
     showNotices(scan.warnings);
     renderResults();
@@ -435,6 +497,19 @@ $("controls").addEventListener("submit", async (event) => {
   mode.classList.toggle("demo", status.mode !== "live");
   $("sources").textContent = status.earnings_sources.length ? "Earnings data: " + status.earnings_sources.join(", ") : "";
   $("scan").disabled = Boolean(status.setup_error);
+  // One button per preset. A preset fills in the controls; nothing runs until Scan is pressed.
+  $("presets").replaceChildren(...Object.values(status.presets).map((preset) => el("button", {
+    type: "button", title: preset.about,
+    onclick: () => {
+      for (const [name, value] of Object.entries(preset.settings)) {
+        const field = $(name);
+        if (!field) continue;
+        if (field.type === "checkbox") field.checked = Boolean(value);
+        else field.value = value;
+      }
+      $("hint").textContent = preset.label + " preset applied. " + preset.about + " Press Scan.";
+    },
+  }, preset.label + " preset")));
   showNotices();
 })();
 </script>

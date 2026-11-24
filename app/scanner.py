@@ -12,14 +12,14 @@ from zoneinfo import ZoneInfo
 
 from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
-from app.analysis import risk, scoring
+from app.analysis import exits, risk, scoring
 from app.cache import DiskCache, NullCache
 from app.config import ConfigError, Settings
-from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, UnderlyingContext
+from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, TermPoint, UnderlyingContext
 from app.providers import MarketData
 from app.providers.earnings import AlphaVantageEarnings, EarningsService, EdgarEarnings
 
-__all__ = ["ConfigError", "ScanRequest", "Scanner", "build_scanner"]
+__all__ = ["ConfigError", "PRESETS", "ScanRequest", "Scanner", "build_scanner"]
 
 ET = ZoneInfo("America/New_York")
 HISTORY_DAYS = 1200  # a little over three years: twelve earnings reports
@@ -34,6 +34,25 @@ BUDGET_REACH = 2.5
 WINDOW_SIGMAS = 1.5
 MAX_STRIKE_WINDOW = 0.50
 DEFAULT_VOL = 0.40  # assumed when a stock has too little price history to measure
+
+# Named starting points for a scan. Each is a set of ScanRequest fields.
+PRESETS: dict[str, dict] = {
+    "sell-premium": {
+        "label": "Premium selling",
+        "about": (
+            "The setup most option sellers start from: 30 to 45 days to expiry, a strike "
+            "at 0.16 to 0.30 delta, and nothing that is still open over an earnings report."
+        ),
+        "settings": {
+            "lens": "sell",
+            "dte_min": 30,
+            "dte_max": 45,
+            "delta_min": 0.16,
+            "delta_max": 0.30,
+            "avoid_earnings": True,
+        },
+    },
+}
 
 
 @dataclass
@@ -52,6 +71,10 @@ class ScanRequest:
     # Calls and puts kept per stock. None: one of each when discovering (a varied
     # list), five of each when specific symbols were asked for (depth).
     per_side: int | None = None
+    # Keep only contracts whose delta, ignoring its sign, is inside this range.
+    delta_min: float | None = None
+    delta_max: float | None = None
+    avoid_earnings: bool = False  # drop contracts still open over the next report
 
 
 class Scanner:
@@ -138,6 +161,9 @@ class Scanner:
                 note += f" The cheapest contract that passed the other filters needs ${cheapest[0]:,.0f} ({cheapest[1]})."
             warnings.append(note)
 
+        rate = self.settings.risk_free_rate
+        plans = {c.symbol: exits.build(c, underlyings[c.underlying], req.lens, rate, today) for c in ideas}
+
         return ScanResult(
             id=uuid.uuid4().hex[:12],
             generated_at=datetime.now(timezone.utc),
@@ -148,6 +174,7 @@ class Scanner:
             underlyings=underlyings,
             warnings=warnings,
             budget=req.budget,
+            exit_plans={symbol: plan for symbol, plan in plans.items() if plan},
         )
 
     # -- Choosing symbols ---------------------------------------------------
@@ -290,9 +317,24 @@ class Scanner:
             earnings_note=note,
             earnings_unknown=unknown,
             contracts_scanned=len(analyzed),
+            term_structure=[
+                TermPoint(expiry, (expiry - today).days, atm[expiry].iv, bool(upcoming and earnings_math.spans(expiry, upcoming)))
+                for expiry in sorted(atm)
+            ],
+            ordinary_vol=ordinary,
+            event_var=event_var,
         )
 
-        wanted = [c for c in analyzed if scoring.tradable(c) and req.kind in ("both", c.kind)]
+        low = req.delta_min if req.delta_min is not None else 0.0
+        high = req.delta_max if req.delta_max is not None else 1.0
+        wanted = [
+            c
+            for c in analyzed
+            if scoring.tradable(c)
+            and req.kind in ("both", c.kind)
+            and low <= abs(c.delta) <= high
+            and not (req.avoid_earnings and c.spans_earnings)
+        ]
         for c in wanted:
             c.outlay = scoring.outlay(c, req.lens, spot)
         least = min((c.outlay for c in wanted), default=None)

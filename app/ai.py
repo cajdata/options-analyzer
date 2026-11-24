@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.models import ContractAnalysis, ScanResult, UnderlyingContext
+from app.models import ContractAnalysis, ExitPlan, ScanResult, UnderlyingContext
 
 DEFAULT_MODEL = "claude-opus-5-5"
 # Models that can hand a declined request to another model inside the same call.
@@ -46,6 +46,13 @@ against the losses listed beside it. A payoff_shape of "long shot" means the \
 position profits less than one time in five, and "tail risk" means it profits \
 more than four times in five with an occasional much larger loss; say so \
 plainly whenever you write up either kind.
+
+A contract may also carry an exit_plan: what time alone does to its price with \
+the stock unchanged, closing at the bid for a holder or the ask for a seller. It \
+shows time decay, and the drop in price across an earnings report. Its dates are \
+points on that standing-still path and never the chance of getting there, so do \
+not describe them as likely. The profit target and time stop in it are rules of \
+thumb that option sellers use to manage risk.
 
 Choose up to five contracts from the scan that make the most coherent case under \
 that lens. A setup where several independent numbers agree is stronger than one \
@@ -149,6 +156,38 @@ def _contract(c: ContractAnalysis) -> dict[str, Any]:
     return out
 
 
+def _exit_plan(plan: ExitPlan) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "if_the_stock_stands_still": [
+            {
+                "when": k.label,
+                "date": k.day.isoformat(),
+                "close_at": _r(k.close_price, 2),
+                "result_usd": round(k.pnl),
+                "result_pct_of_premium": _r(k.pnl_pct, 3),
+            }
+            for k in plan.checkpoints
+        ],
+        "strike_vs_stock_pct": _r(plan.strike_distance_pct),
+        "time_stop_date": plan.time_stop_day.isoformat() if plan.time_stop_day else None,
+    }
+    if plan.lens == "sell":
+        out["profit_target_buy_back_at_or_below"] = _r(plan.target_price, 2)
+        out["decay_alone_reaches_target_on"] = plan.target_day.isoformat() if plan.target_day else "not before expiry"
+    elif plan.half_life_day:
+        out["half_the_time_value_gone_by"] = plan.half_life_day.isoformat()
+    if plan.earnings:
+        e = plan.earnings
+        out["across_the_earnings_report"] = {
+            "first_session_reflecting_it": e.report_day.isoformat(),
+            "price_change_with_stock_unchanged_pct": _r(e.crush_pct, 3),
+            "stock_move_to_be_back_at_entry_pct": _r(e.move_to_breakeven_pct),
+        }
+    if plan.notes:
+        out["notes"] = plan.notes
+    return out
+
+
 def _underlying(u: UnderlyingContext) -> dict[str, Any]:
     out: dict[str, Any] = {
         "price": u.price,
@@ -202,7 +241,10 @@ def scan_payload(result: ScanResult) -> dict[str, Any]:
         "options_quote_feed": result.options_feed,
         "generated_at": result.generated_at.isoformat(timespec="seconds"),
         "warnings": result.warnings,
-        "ranked_contracts": [_contract(c) for c in result.ideas],
+        "ranked_contracts": [
+            _contract(c) | ({"exit_plan": _exit_plan(result.exit_plans[c.symbol])} if c.symbol in result.exit_plans else {})
+            for c in result.ideas
+        ],
         "underlyings": {s: _underlying(u) for s, u in result.underlyings.items() if s in symbols},
     }
 
