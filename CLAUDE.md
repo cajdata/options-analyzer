@@ -21,7 +21,8 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
-- `.claude/launch.json` defines `options-analyzer-demo`, the demo dashboard on port 8765, for the preview tools. The server does not reload: restart it after changing Python code.
+- `.claude/launch.json` defines two dashboards for the preview tools: `options-analyzer-demo` on port 8765 (synthetic data) and `options-analyzer-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
+- With `ANTHROPIC_API_KEY` set, the live dashboard shows a "Write brief" button and `scan --brief` works. Each use is a billed call: ask before making one.
 
 ## Architecture
 
@@ -60,6 +61,28 @@ These came out of two rounds of outside code review. Each has a test; do not reg
 - **`earnings_unknown` means no date at all.** A date from the calendar is a date, even when the history lookup behind it failed.
 - **Symbols are tidied in `Scanner._scan`** (trim, upper-case, `BRK-B` to `BRK.B`, de-duplicate), so every way in behaves the same.
 
+These came out of the first run against live data (2026-11-24). Each has a test built from a captured response (`tests/fixtures/alpaca_live.json`).
+
+- **A quote from an earlier day is not a quote.** Alpaca's snapshot holds the last quote it saw for a contract. When a special dividend or a split changes a stock's strikes, the contracts that stopped existing go on answering with their final quote, a day old or a year old, and they are missing from the active contract list. `AlpacaData.option_chain` leaves out any quote from an earlier day than the newest quote in its chain (`alpaca._session_day`) and adds a note saying how many. The newest quote sets the day, never the clock, so a weekend scan keeps Friday's quotes; a quote stamped before the 9:30 open does not move the day on.
+- **A chain nobody has quoted for days is left out whole.** The rule above compares quotes with each other, so it cannot see a chain whose quotes are all equally old (a halted or delisted stock, whose own last trade is just as old). Only here does the clock decide: if the newest quote is more than `alpaca.MAX_QUOTE_AGE_DAYS` (four, room for a three-day weekend) before `AlpacaData._now()`, none is used and a note says so. Tests that build a chain pin that clock.
+- **Volume is the latest session's.** A snapshot's daily bar is from the last day the contract traded, which is often not today. Volume from an earlier day's bar is reported as 0.
+- **A stock with nothing to price costs nothing more.** `Scanner._analyze` returns as soon as no quote in the chain can be priced, before the open-interest and earnings lookups. The day's movers include warrants and tiny companies with no options, and an earnings lookup for one can spend an Alpha Vantage request. Such a stock is named in the "no two-sided option quotes" note and in no note about ratings.
+
+## What live data looks like
+
+Measured on 2026-11-24 after the close, with paper keys on the free plan. Use these when judging whether a result is a bug.
+
+- **Greeks and implied volatility arrive for most contracts, not all.** The indicative feed sent them for 80% to 97% of a chain. It sends none for a contract with no bid, and none for many deep in-the-money ones. `contracts.analyze_contract` then solves its own, in the same units (theta per day, vega per volatility point).
+- **Open interest lags and has gaps.** It comes from the paper trading host's contract list, as text, and was dated 2026-11-20, two trading days before the scan. A contract listed since then has none: 13% to 41% of a chain. A known zero never appears. `scoring._liquidity` scores a contract with no figure on its spread alone.
+- **Dropped quotes are far from the money.** After the close, 1% to 12% of a chain was dropped: no bid (far out of the money), a midpoint below exercise value (deep in the money: delta 0.76 or more, above 0.9 for nearly all, where the bid sits well under exercise value and the ask just above it), and a handful with no volatility that solves. None was a contract either lens ranks.
+- **After the close the stock keeps trading and the option quotes do not.** The scan price is the last trade on IEX, which after 4 p.m. is an after-hours trade, while every option quote is from the close. ORCL was 1.0% below its close and 44 of its puts had their whole quote under exercise value. On an earnings night that gap is the whole move, and out-of-the-money quotes are just as out of date with no check to catch them. Alpaca's own implied volatility and Greeks move with it: 45 minutes apart, with the option quote unchanged and NVDA 1.2% lower after hours, a put's implied volatility went from 58.8% to 56.5% and a call's from 64.5% to 67.0%. So when a stock falls after the close its puts look cheaper and its calls dearer than they were. Not handled yet: the scan neither uses the close nor says the stock has moved since. Two facts for whoever fixes it: the IEX snapshot's `dailyBar.c` stayed at the 4 p.m. price while `latestTrade` moved on (checked until 5:20 p.m.), and option quotes did not all stop at 4:00 (SPY's ran to 4:15, and some AAPL and NVDA quotes were stamped as late as 4:14), so no single stock price fits a whole chain. Switching to the close is not enough on its own, because Alpaca's implied volatility and Greeks would still belong to the later price.
+- **Consolidated price history is allowed** on the free plan when the request ends at least 15 minutes ago, which `daily_bars` already does. The IEX fallback did not trigger.
+- **The screeners are allowed** on the free plan. The movers list includes warrants and tiny companies with no options, so a discovery scan loses a few of its 20 slots to them. Each costs one chain request and is named in one note.
+- **The stock price is only as fresh as the last IEX trade.** A stock that rarely trades there can be weeks out of date (a warrant on the movers list last traded five weeks earlier). An IEX daily close differs a little from the official one, and `change_pct` is not adjusted for a dividend or a split.
+- **Alpha Vantage's calendar is short and slow.** It listed 669 companies for three months and had no date yet for the large companies' January reports, so most upcoming dates are still estimates. One history request in ten hung for the full 30-second timeout. A first discovery scan took 48 seconds, 38 of them waiting on Alpha Vantage; with earnings history cached it takes about 3.
+- **Rate limits were never close.** Each Alpaca host allows 200 requests a minute. A discovery scan made 68 requests in all.
+- **A buyout breaks the rating.** Once a cash takeover is agreed the stock sits at the deal price and its options price almost no movement (INSM: 6% implied against a volatile history). Every option then looks cheap next to history and the rating says "favorable". The scan does not detect this.
+
 ## Working agreement
 
 - Branch off `main` for each change. Commit, push, open a pull request, merge, and delete the branch only when asked for that step. Merge with a merge commit.
@@ -68,9 +91,22 @@ These came out of two rounds of outside code review. Each has a test; do not reg
 - Keep dependencies minimal, and the dashboard as one vanilla-JS file.
 - When an outside review arrives, reproduce its claims against the code before acting on them.
 
-## Not yet verified
+## Verified live, and not yet
 
-Nothing has run against live data. No Alpaca keys have been available, so `AlpacaData` is tested only against response shapes from Alpaca's API reference. Also untested live: the AI brief call, and the SEC ticker-to-CIK file (it needs a contact `User-Agent`). Whether Alpaca's free plan allows the screener endpoints and consolidated price history is unconfirmed; the code falls back and reports a note.
+The first live run was on 2026-11-24, after the 4 p.m. close, with paper keys on Alpaca's free plan. Every endpoint `AlpacaData` uses answered and matched its parser: stock snapshots, daily bars, option chain snapshots (with paging), the option contract list for open interest, most-actives and movers. Also confirmed: the SEC ticker-to-CIK file with a real contact `User-Agent`, SEC earnings history, a foreign filer (TSM) flagged as "earnings date unknown" when SEC EDGAR is the only source, an ETF (SPY) not flagged, `BRK-B` on every endpoint, Alpha Vantage's calendar and history, the command line, the preset and the live dashboard.
+
+The AI brief was called once, through `ai.write_brief` with the app's own settings (`claude-opus-5-5`, effort high, the fallback beta). It answered in 57 seconds with a parsed brief of four picks, all contracts from the scan, and it carried the feed and estimated-date caveats. A 20-contract discovery scan sent 26,119 tokens and got 5,492 back: 21 cents. With the 16,000-token cap on the answer, the most one brief can cost is about 43 cents.
+
+Not yet verified:
+
+- **Anything during market hours.** How many quotes the exercise-value check drops while the stock is moving, how old the indicative quotes are during the session, and how soon after the open every contract has a quote from that day (until it does, the earlier-day rule leaves it out). Each stock that loses contracts that way adds its own note; if a scan soon after the open shows many, fold them into one as was done for stocks with no quotes.
+- **Before the open.** Whether the feed sends quotes ahead of 9:30. `alpaca._session_day` ignores them when choosing the day, on the assumption that it can.
+- **The morning of a split or special dividend, before the open.** The strikes have changed overnight but the newest quotes are still the day before's, so the contracts that stopped existing are not yet older than anything and are not caught. On 2026-11-24 they were exactly the contracts missing from the active contract list (64 of 64 for COST, 14 of 14 for TQQQ), which `open_interest` already fetches, so that list is the likely remedy. Not done, because it is unknown when Alpaca updates the list and whether a contract listed during the day appears in it at once.
+- **The numbers against a broker.** No contract has been compared with Robinhood's quote, Greeks or open interest.
+- **The `--brief` flag and the dashboard's brief button themselves.** The one live call went through the function they both use, not through either of them.
+- **Thinly traded stocks.** The age of the last IEX trade is not checked, so a stock that rarely trades on IEX may be priced from an old trade.
+- **Python 3.11 on live shapes.** Alpaca's nanosecond time stamps parse on 3.13; the captured-response tests have not yet run on 3.11 (CI will).
+- **Live keys and the paid OPRA feed.**
 
 ## Next step (proposed, not approved)
 

@@ -131,7 +131,20 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 - **Free Alpaca option quotes are "indicative"**: quotes are modified and trades are
   15 minutes delayed. Screen with them, then check the live quote at your broker.
   Real-time quotes need Alpaca's paid plan (`ALPACA_OPTIONS_FEED=opra`).
-- **Free stock quotes come from the IEX exchange only**, a small share of volume.
+- **Free stock quotes come from the IEX exchange only**, a small share of volume. After
+  4 p.m. the price shown is an after-hours trade, while every option quote is from the
+  close, so an evening scan of a stock that moved after hours (an earnings night, most
+  of all) shows option prices that no longer fit the stock.
+- **A quote from an earlier day is left out**, and the scan says how many. When a special
+  dividend or a split changes a stock's strikes, the contracts that stopped existing go
+  on reporting their last quote. A stock whose options have not been quoted at all for
+  more than four days (halted or delisted) is left out whole.
+- **Open interest is a day or two old** and is blank for a contract listed since
+  Alpaca's last update. Volume is the latest session's.
+- **A buyout breaks the rating.** Once a cash takeover is agreed, the stock sits at the
+  deal price and its options price almost no movement. Next to a volatile history every
+  option then looks cheap and the rating says "favorable". Be wary of a stock that jumped
+  and whose implied volatility is far below its realized volatility.
 - **Pricing math is Black-Scholes** with no dividends and a flat rate (`RISK_FREE_RATE`).
   US equity options are American, so deep in-the-money puts and calls just before a
   dividend are approximate.

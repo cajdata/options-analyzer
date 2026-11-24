@@ -1,7 +1,7 @@
-"""Provider parsing, checked against response shapes from the services' own docs and samples."""
+"""Provider parsing, checked against the services' documented shapes and against responses captured live."""
 
 import json
-from datetime import date, datetime, time as clock, timedelta
+from datetime import date, datetime, time as clock, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,8 +18,13 @@ ET = ZoneInfo("America/New_York")
 WINDOW = dict(expiry_from=date(2026, 12, 1), expiry_to=date(2027, 1, 31), strike_from=170.0, strike_to=230.0)
 
 
+NOW = datetime(2026, 11, 24, 17, 0, tzinfo=ET)  # the evening the live responses were captured
+
+
 def alpaca(handler, **kwargs) -> AlpacaData:
     client = httpx.Client(transport=httpx.MockTransport(handler))
+    # The clock is pinned, because a chain's quotes are judged against it for age.
+    kwargs.setdefault("now", lambda: NOW)
     return AlpacaData("key-id", "secret", client=client, sleep=lambda _: None, **kwargs)
 
 
@@ -167,6 +172,139 @@ def test_rate_limits_are_retried_and_other_errors_raise():
 def test_movers_combines_gainers_and_losers():
     body = {"gainers": [{"symbol": "UP", "percent_change": 12.0}], "losers": [{"symbol": "DOWN", "percent_change": -9.0}]}
     assert alpaca(lambda request: httpx.Response(200, json=body)).movers(5) == ["UP", "DOWN"]
+
+
+# -- Alpaca, against responses captured live (the fixture is trimmed) -------------
+
+LIVE = json.loads((FIXTURES / "alpaca_live.json").read_text(encoding="utf-8"))
+COST_WINDOW = dict(expiry_from=date(2026, 12, 1), expiry_to=date(2026, 12, 31), strike_from=900.0, strike_to=1250.0)
+
+
+def live(seen: list | None = None, **kwargs) -> AlpacaData:
+    """Alpaca answering every request with the response captured for that path."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        return httpx.Response(200, json=LIVE[request.url.path])
+
+    return alpaca(handler, **kwargs)
+
+
+def test_a_live_option_chain_parses_down_to_its_nanosecond_stamps():
+    chain = {q.symbol: q for q in live().option_chain("COST", **COST_WINDOW)}
+    call = chain["COST261204C01085000"]
+    assert (call.kind, call.strike, call.expiry) == ("call", 1085.0, date(2026, 12, 4))
+    assert (call.bid, call.ask, call.last, call.volume) == (17.55, 23.95, 22.4, 17)
+    assert (call.iv, call.delta, call.gamma, call.theta, call.vega) == (0.2421, 0.566, 0.009, -0.924, 0.71)
+    # Alpaca stamps to the nanosecond. The part finer than a microsecond is dropped.
+    assert call.quote_time == datetime(2026, 11, 24, 20, 59, 59, 429737, tzinfo=timezone.utc)
+    # A contract nobody bids for comes with no greeks or volatility, and one that
+    # has never traded comes with no trade and no bars.
+    no_bid, untraded = chain["COST261204C01165000"], chain["COST261204C01052500"]
+    assert (no_bid.bid, no_bid.ask, no_bid.iv, no_bid.delta) == (0.0, 1.87, None, None)
+    assert (untraded.bid, untraded.delta, untraded.last, untraded.volume) == (40.76, 0.7944, None, None)
+
+
+def test_quotes_from_an_earlier_day_are_left_out_and_the_scan_says_so():
+    market = live()
+    chain = market.option_chain("COST", **COST_WINDOW)
+    # A special dividend changed the strikes that morning. Two contracts that had
+    # stopped existing still answered with the previous close, one of them near the
+    # money. Set beside the new stock price, a quote like that can look like a bargain.
+    assert [q.symbol for q in chain] == [
+        "COST261204C01085000",
+        "COST261204C01165000",
+        "COST261204C00930000",
+        "COST261204C01052500",
+    ]
+    assert market.notes == ["COST: 2 contracts were left out because the latest quote is from an earlier day."]
+
+
+def test_volume_counts_only_trades_from_the_latest_session():
+    chain = {q.symbol: q for q in live().option_chain("COST", **COST_WINDOW)}
+    assert chain["COST261204C01085000"].volume == 17  # traded that day
+    assert chain["COST261204C00930000"].volume == 0  # its daily bar is the last day it traded, four days before
+    assert chain["COST261204C01052500"].volume is None  # has never traded
+
+
+def test_a_quote_before_the_open_does_not_make_the_last_close_old():
+    def chain(*stamps):
+        snaps = {
+            f"AAPL261218C00{200 + n}000": {"latestQuote": {"bp": 5.0, "ap": 5.2, "t": stamp}}
+            for n, stamp in enumerate(stamps)
+        }
+        market = alpaca(lambda request: httpx.Response(200, json={"snapshots": snaps, "next_page_token": None}))
+        return [q.symbol for q in market.option_chain("AAPL", **WINDOW)], market.notes
+
+    # In New York these are 15:59 on the 23rd, then 08:05 and 09:31 on the 24th.
+    close, early, opened = "2026-11-23T20:59:59.5Z", "2026-11-24T13:05:00Z", "2026-11-24T14:31:00Z"
+
+    # Before the open, the session that counts is still the day before.
+    quotes, notes = chain(close, close, early)
+    assert len(quotes) == 3 and notes == []
+    # Once trading has started, a contract still showing the last close has not been quoted today.
+    quotes, notes = chain(close, close, early, opened)
+    assert quotes == ["AAPL261218C00202000", "AAPL261218C00203000"]
+    assert notes == ["AAPL: 2 contracts were left out because the latest quote is from an earlier day."]
+    quotes, notes = chain(close, opened)
+    assert notes == ["AAPL: 1 contract was left out because the latest quote is from an earlier day."]
+    # With no time stamps there is nothing to judge by, so nothing is left out.
+    quotes, notes = chain(None, None)
+    assert len(quotes) == 2 and notes == []
+
+
+def test_a_chain_nobody_has_quoted_for_days_is_left_out_whole():
+    def chain(day: int, hour: int):
+        friday_close = "2026-11-20T20:59:59.5Z"
+        snaps = {f"AAPL261218C00{200 + n}000": {"latestQuote": {"bp": 5.0, "ap": 5.2, "t": friday_close}} for n in range(3)}
+        answer = lambda request: httpx.Response(200, json={"snapshots": snaps, "next_page_token": None})  # noqa: E731
+        market = alpaca(answer, now=lambda: datetime(2026, 11, day, hour, 0, tzinfo=ET))
+        return market.option_chain("AAPL", **WINDOW), market.notes
+
+    # Every quote is from the same day, so none is old next to the others. Over a
+    # weekend, and before the open after a three-day one, Friday is still the latest session.
+    for day, hour in ((22, 12), (23, 8), (24, 9)):
+        quotes, notes = chain(day, hour)
+        assert len(quotes) == 3 and notes == []
+    # A day later the market has been open since and nothing here was quoted: a halted
+    # or delisted stock, whose own last trade is just as old.
+    quotes, notes = chain(25, 12)
+    assert quotes == [] and notes == ["AAPL: the newest option quote is from Nov 20, so none was used."]
+
+
+def test_live_contract_rows_give_open_interest_as_whole_numbers():
+    # The figure arrives as text. A contract listed since Alpaca's last update has none.
+    assert live().open_interest("COST", **COST_WINDOW) == {
+        "COST261204C01085000": 91,
+        "COST261204C01165000": 61,
+        "COST261204C00930000": 6,
+    }
+
+
+def test_live_stock_snapshot_and_price_history():
+    seen = []
+    noon = lambda: datetime(2026, 11, 24, 12, 0, tzinfo=ET)  # noqa: E731
+    market = live(seen, now=noon)
+    quote = market.stock_snapshots(["COST"])["COST"]
+    assert (quote.price, quote.prev_close) == (1091.44, 1097.8)
+
+    bars = market.daily_bars(["COST"], date(2023, 8, 12))["COST"]
+    # A bar is stamped at midnight in New York: 04:00 or 05:00 UTC by season. The
+    # fourth bar is the 24th itself, unfinished at noon.
+    assert [(b.day, b.close) for b in bars] == [
+        (date(2023, 8, 14), 523.08),
+        (date(2026, 7, 1), 896.65),
+        (date(2026, 11, 23), 1067.91),
+    ]
+    # The free plan answered the request for consolidated history, so no IEX caveat.
+    assert seen[-1].url.params["feed"] == "sip" and market.notes == []
+
+
+def test_live_screener_lists():
+    market = live()
+    assert market.most_actives(20) == ["SOXL", "NVDA"]
+    assert market.movers(20) == ["JAGX", "BENF", "FGIWW", "EVRL"]
 
 
 # -- Alpha Vantage (fixtures are trimmed real responses) -----------------------

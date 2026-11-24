@@ -126,6 +126,16 @@ def test_a_failing_symbol_does_not_sink_the_scan():
     assert "BOLT" not in result.underlyings and result.ideas
 
 
+def test_stocks_with_no_option_quotes_are_named_in_one_note():
+    scanner = demo_scanner()
+    real = scanner.market.option_chain
+    scanner.market.option_chain = lambda symbol, **window: [] if symbol in ("ACME", "BOLT") else real(symbol, **window)
+    result = scanner.scan(ScanRequest(symbols=["BOLT", "ACME", "FLUX"]))
+    # A live discovery scan turns up several of these at once (warrants, tiny companies).
+    assert "No two-sided option quotes in range for ACME, BOLT." in result.warnings
+    assert {c.underlying for c in result.ideas} == {"FLUX"}
+
+
 def test_live_mode_needs_alpaca_keys():
     with pytest.raises(ConfigError, match="--demo"):
         build_scanner(Settings())
@@ -421,6 +431,43 @@ def test_ratings_say_when_no_earnings_date_is_known():
     none_on_file = _scan_with([_Source([])])
     assert not any(u.earnings_unknown for u in none_on_file.underlyings.values())
     assert not any("earnings" in w.lower() for w in none_on_file.warnings)
+
+
+def test_a_stock_with_nothing_to_price_is_not_looked_up_any_further():
+    asked, interest = [], []
+
+    class Counting(_Source):
+        def history(self, symbol):
+            asked.append(symbol)
+            return super().history(symbol)
+
+    # The lookup fails, which would put a stock in the "no earnings date is known" note.
+    earnings = EarningsService(NullCache(), history_sources=[Counting(httpx.ConnectError("down"))], today=TODAY)
+    scanner = Scanner(DemoMarket(TODAY), earnings, Settings(), universe=list(SPECS), today=TODAY)
+    real = scanner.market.option_chain
+
+    def chain(symbol, **window):
+        quotes = [] if symbol == "BOLT" else real(symbol, **window)  # BOLT: no options at all
+        for q in quotes:
+            q.open_interest = None  # as a live feed sends it, so the scanner has to ask
+            if symbol == "FLUX":
+                q.bid = 0.0  # FLUX: contracts, but nobody bids for any of them
+        return quotes
+
+    def open_interest(symbol, **window):
+        interest.append(symbol)
+        return {}
+
+    scanner.market.option_chain, scanner.market.open_interest = chain, open_interest
+    result = scanner.scan(ScanRequest(symbols=["ACME", "BOLT", "FLUX"]))
+
+    # A live discovery scan picks up warrants and tiny companies like these. Nothing is
+    # shown for them, so they must not cost an earnings lookup (Alpha Vantage allows
+    # about 25 a day) or an open-interest request, nor be named in a note about ratings.
+    assert asked == ["ACME"] and interest == ["ACME"]
+    assert "No two-sided option quotes in range for BOLT, FLUX." in result.warnings
+    assert "No earnings date is known for ACME, so ratings there do not account for a report." in result.warnings
+    assert {c.underlying for c in result.ideas} == {"ACME"} and all(c.open_interest is None for c in result.ideas)
 
 
 def test_a_provider_caveat_is_reported_on_every_scan():

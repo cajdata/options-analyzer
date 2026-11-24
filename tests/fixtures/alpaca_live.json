@@ -1,0 +1,92 @@
+{
+  "about": "Responses captured live on 2026-11-24 after the close, with paper keys on the free plan (iex stock feed, indicative option feed), trimmed to a few rows. Each key is the request path. COST paid a special dividend that day, so its strikes had changed: the two option snapshots quoted on 2026-11-23 are contracts that no longer existed, and they are absent from the contract list.",
+  "/v2/stocks/snapshots": {
+    "COST": {
+      "dailyBar": {"c": 1091.44, "h": 1094.535, "l": 1068.44, "n": 3684, "o": 1069.845, "t": "2026-11-24T05:00:00Z", "v": 80565, "vw": 1090.640365},
+      "latestQuote": {"ap": 1128.75, "as": 40, "ax": "V", "bp": 1039.42, "bs": 40, "bx": "V", "c": ["R"], "t": "2026-11-24T21:00:00.00737313Z", "z": "C"},
+      "latestTrade": {"c": ["@"], "i": 3677, "p": 1091.44, "s": 100, "t": "2026-11-24T20:59:54.021689535Z", "x": "V", "z": "C"},
+      "minuteBar": {"c": 1091.44, "h": 1091.91, "l": 1091.31, "n": 138, "o": 1091.31, "t": "2026-11-24T20:59:00Z", "v": 4241, "vw": 1091.624955},
+      "prevDailyBar": {"c": 1097.8, "h": 1101.46, "l": 1085.205, "n": 3536, "o": 1091.795, "t": "2026-11-23T05:00:00Z", "v": 95560, "vw": 1095.224246}
+    }
+  },
+  "/v2/stocks/bars": {
+    "bars": {
+      "COST": [
+        {"c": 523.08, "h": 528.9, "l": 522.12, "n": 40351, "o": 526.16, "t": "2023-08-14T04:00:00Z", "v": 1247674, "vw": 524.24},
+        {"c": 896.65, "h": 911.93, "l": 892.66, "n": 132949, "o": 911.93, "t": "2026-07-01T04:00:00Z", "v": 2928095, "vw": 897.8},
+        {"c": 1067.91, "h": 1071.4, "l": 1055.39, "n": 128648, "o": 1060.35, "t": "2026-11-23T05:00:00Z", "v": 3187368, "vw": 1065.77},
+        {"c": 1091.71, "h": 1094.75, "l": 1067.92, "n": 110264, "o": 1071.38, "t": "2026-11-24T05:00:00Z", "v": 2462309, "vw": 1089.971268}
+      ]
+    },
+    "next_page_token": null
+  },
+  "/v1beta1/options/snapshots/COST": {
+    "next_page_token": null,
+    "snapshots": {
+      "COST261204C01085000": {
+        "dailyBar": {"c": 22.4, "h": 22.99, "l": 12, "n": 8, "o": 12, "t": "2026-11-24T05:00:00Z", "v": 17, "vw": 20.574706},
+        "greeks": {"delta": 0.566, "gamma": 0.009, "rho": 0.1634, "theta": -0.924, "vega": 0.71},
+        "impliedVolatility": 0.2421,
+        "latestQuote": {"ap": 23.95, "as": 95, "ax": "E", "bp": 17.55, "bs": 118, "bx": "E", "c": " ", "t": "2026-11-24T20:59:59.429737791Z"},
+        "latestTrade": {"c": "I", "p": 22.4, "s": 5, "t": "2026-11-24T17:18:12.689442949Z", "x": "H"},
+        "minuteBar": {"c": 22.4, "h": 22.4, "l": 22.4, "n": 1, "o": 22.4, "t": "2026-11-24T17:18:00Z", "v": 5, "vw": 22.4},
+        "prevDailyBar": {"c": 40.77, "h": 40.8, "l": 37.95, "n": 4, "o": 40.77, "t": "2026-11-20T05:00:00Z", "v": 6, "vw": 40.31}
+      },
+      "COST261204C01165000": {
+        "dailyBar": {"c": 2.03, "h": 2.43, "l": 0.01, "n": 37, "o": 2.43, "t": "2026-11-24T05:00:00Z", "v": 40, "vw": 1.52775},
+        "latestQuote": {"ap": 1.87, "as": 115, "ax": "B", "bp": 0, "bs": 0, "bx": "?", "c": " ", "t": "2026-11-24T20:59:59.14085656Z"},
+        "latestTrade": {"c": "f", "p": 2.03, "s": 1, "t": "2026-11-24T17:04:38.621749683Z", "x": "B"}
+      },
+      "COST261204C00930000": {
+        "dailyBar": {"c": 176.82, "h": 176.82, "l": 176.82, "n": 1, "o": 176.82, "t": "2026-11-20T05:00:00Z", "v": 1, "vw": 176.82},
+        "greeks": {"delta": 0.964, "gamma": 0.0008, "rho": 0.2434, "theta": -0.4892, "vega": 0.1427},
+        "impliedVolatility": 0.5513,
+        "latestQuote": {"ap": 164.62, "as": 10, "ax": "N", "bp": 160.73, "bs": 9, "bx": "N", "c": "A", "t": "2026-11-24T20:59:58.811655323Z"},
+        "latestTrade": {"c": "f", "p": 174.15, "s": 1, "t": "2026-11-20T20:44:15.432964704Z", "x": "I"}
+      },
+      "COST261204C01052500": {
+        "greeks": {"delta": 0.7944, "gamma": 0.0058, "rho": 0.225, "theta": -0.7928, "vega": 0.5136},
+        "impliedVolatility": 0.2742,
+        "latestQuote": {"ap": 48.61, "as": 68, "ax": "E", "bp": 40.76, "bs": 91, "bx": "E", "c": "A", "t": "2026-11-24T20:59:59.161291648Z"}
+      },
+      "COST261204C01082500": {
+        "dailyBar": {"c": 25.85, "h": 25.85, "l": 25.85, "n": 1, "o": 25.85, "t": "2026-11-23T05:00:00Z", "v": 1, "vw": 25.85},
+        "greeks": {"delta": 0.5714, "gamma": 0.0068, "rho": 0.163, "theta": -1.2056, "vega": 0.7084},
+        "impliedVolatility": 0.3222,
+        "latestQuote": {"ap": 30.86, "as": 78, "ax": "W", "bp": 24.75, "bs": 114, "bx": "D", "c": " ", "t": "2026-11-23T20:59:59.413657174Z"},
+        "latestTrade": {"c": "I", "p": 25.85, "s": 1, "t": "2026-11-23T14:30:03.459528722Z", "x": "H"}
+      },
+      "COST261204P01205000": {
+        "latestQuote": {"ap": 109.29, "as": 10, "ax": "A", "bp": 101.12, "bs": 33, "bx": "E", "c": "A", "t": "2026-11-23T20:59:59.440942391Z"}
+      }
+    }
+  },
+  "/v2/options/contracts": {
+    "option_contracts": [
+      {"symbol": "COST261204C01085000", "name": "COST Dec 04 2026 1085 Call", "status": "active", "tradable": true, "expiration_date": "2026-12-04", "root_symbol": "COST", "underlying_symbol": "COST", "type": "call", "style": "american", "strike_price": "1085", "multiplier": "100", "size": "100", "open_interest": "91", "open_interest_date": "2026-11-20", "close_price": "40.77", "close_price_date": "2026-11-20"},
+      {"symbol": "COST261204C01165000", "name": "COST Dec 04 2026 1165 Call", "status": "active", "tradable": true, "expiration_date": "2026-12-04", "root_symbol": "COST", "underlying_symbol": "COST", "type": "call", "style": "american", "strike_price": "1165", "multiplier": "100", "size": "100", "open_interest": "61", "open_interest_date": "2026-11-20", "close_price": "1.27", "close_price_date": "2026-11-23"},
+      {"symbol": "COST261204C00930000", "name": "COST Dec 04 2026 930 Call", "status": "active", "tradable": true, "expiration_date": "2026-12-04", "root_symbol": "COST", "underlying_symbol": "COST", "type": "call", "style": "american", "strike_price": "930", "multiplier": "100", "size": "100", "open_interest": "6", "open_interest_date": "2026-11-20", "close_price": "176.82", "close_price_date": "2026-11-20"},
+      {"symbol": "COST261204C01052500", "name": "COST Dec 04 2026 1052.5 Call", "status": "active", "tradable": true, "expiration_date": "2026-12-04", "root_symbol": "COST", "underlying_symbol": "COST", "type": "call", "style": "american", "strike_price": "1052.5", "multiplier": "100", "size": "100", "open_interest": null, "open_interest_date": null, "close_price": null, "close_price_date": null}
+    ],
+    "next_page_token": null
+  },
+  "/v1beta1/screener/stocks/most-actives": {
+    "last_updated": "2026-11-24T21:23:00.065969366Z",
+    "most_actives": [
+      {"symbol": "SOXL", "trade_count": 3016058, "volume": 396991923},
+      {"symbol": "NVDA", "trade_count": 4385781, "volume": 380483904}
+    ]
+  },
+  "/v1beta1/screener/stocks/movers": {
+    "gainers": [
+      {"change": 6.683, "percent_change": 109.24, "price": 12.8, "symbol": "JAGX"},
+      {"change": 0.4598, "percent_change": 101.01, "price": 0.915, "symbol": "BENF"}
+    ],
+    "last_updated": "2026-11-24T21:23:00.061563805Z",
+    "losers": [
+      {"change": -0.0105, "percent_change": -58.33, "price": 0.0075, "symbol": "FGIWW"},
+      {"change": -1.74, "percent_change": -58.19, "price": 1.25, "symbol": "EVRL"}
+    ],
+    "market_type": "stocks"
+  }
+}

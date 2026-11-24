@@ -151,6 +151,7 @@ class Scanner:
         scored: list[ContractAnalysis] = []
         cheapest: tuple[float, str] | None = None  # least outlay seen, before the budget was applied
         left_out: dict[str, list[str]] = {"unknown": [], "all open": []}
+        no_quotes: list[str] = []
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(analyze, selected):
                 if isinstance(outcome, str):
@@ -164,8 +165,12 @@ class Scanner:
                 if outcome.left_out:
                     left_out[outcome.left_out].append(ctx.symbol)
                 if ctx.contracts_scanned == 0:
-                    warnings.append(f"{ctx.symbol}: no two-sided option quotes in range.")
+                    no_quotes.append(ctx.symbol)
 
+        if no_quotes:
+            # One note for all of them. The day's top movers include warrants and tiny
+            # companies with no options at all, so a discovery scan can have several.
+            warnings.append(f"No two-sided option quotes in range for {_names(no_quotes)}.")
         warnings.extend(self._earnings_warnings(req, underlyings, left_out))
         if self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
@@ -321,7 +326,25 @@ class Scanner:
             strike_to=spot * (1 + reach),
         )
         chain = self.market.option_chain(symbol, **window)
-        if any(q.open_interest is None for q in chain):
+        rate = self.settings.risk_free_rate
+        analyzed = [a for q in chain if (a := metrics.analyze_contract(q, spot, today, rate))]
+        if not analyzed:
+            # Nothing can be priced, so nothing will be shown for this stock. Stop here,
+            # before the open-interest and earnings lookups. The day's movers include
+            # warrants and tiny companies with no options, and an earnings lookup for
+            # one can cost one of the few requests Alpha Vantage allows in a day.
+            ctx = UnderlyingContext(
+                symbol=symbol,
+                price=spot,
+                change_pct=quote.change_pct,
+                realized_vol_20d=metrics.realized_vol(bars, 20),
+                realized_vol_60d=metrics.realized_vol(bars, 60),
+                atm_iv=None,
+                reasons=reasons,
+            )
+            return _Found(ctx, [], None)
+
+        if any(c.open_interest is None for c in analyzed):
             try:
                 interest = self.market.open_interest(symbol, **window)
             except Exception as err:
@@ -331,12 +354,10 @@ class Scanner:
                     # Market data accepts paper and live keys alike; this request does not.
                     note += " The trading API rejected the keys: check that ALPACA_PAPER matches the keys you use."
                 self.market.notes.append(note)
-            for q in chain:
-                if q.open_interest is None:
-                    q.open_interest = interest.get(q.symbol)
+            for c in analyzed:
+                if c.open_interest is None:
+                    c.open_interest = interest.get(c.symbol)
 
-        rate = self.settings.risk_free_rate
-        analyzed = [a for q in chain if (a := metrics.analyze_contract(q, spot, today, rate))]
         atm = metrics.atm_by_expiry(analyzed, spot)
         metrics.apply_expected_moves(analyzed, atm, spot, today, rate)
 
