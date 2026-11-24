@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +48,22 @@ class DiskCache:
         return found[0]
 
     def set(self, key: str, value: Any) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        payload = {"stored_at": datetime.now(timezone.utc).isoformat(), "value": value}
-        self._path(key).write_text(json.dumps(payload), encoding="utf-8")
+        """Store `value`. A cache that cannot be written is skipped, never fatal.
+
+        Scans write from several threads. The value goes to a temporary file that
+        is then swapped into place, so a reader never sees half a file.
+        """
+        payload = json.dumps({"stored_at": datetime.now(timezone.utc).isoformat(), "value": value})
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            handle, temporary = tempfile.mkstemp(dir=self.root, suffix=".tmp")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as file:
+                    file.write(payload)
+                os.replace(temporary, self._path(key))
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+                raise
+        except OSError:
+            return

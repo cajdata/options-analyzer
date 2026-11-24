@@ -1,7 +1,7 @@
 """Provider parsing, checked against response shapes from the services' own docs and samples."""
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as clock, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -126,14 +126,24 @@ def test_daily_bars_fall_back_to_iex_and_drop_todays_unfinished_bar():
         ]
         return httpx.Response(200, json={"bars": {"AAPL": bars}, "next_page_token": None})
 
-    market = alpaca(handler)
+    midday = lambda: datetime.combine(today, clock(12, 0), ET)  # noqa: E731
+    market = alpaca(handler, now=midday)
     bars = market.daily_bars(["AAPL"], date(2026, 1, 1))["AAPL"]
     assert feeds == ["sip", "iex"]
     assert [(b.day, b.close) for b in bars] == [(date(2026, 1, 5), 100.5), (date(2026, 1, 6), 101.25)]
     assert len(market.notes) == 1 and "IEX" in market.notes[0]
 
+    # The fallback is remembered, and the caveat is repeated on every later scan,
+    # not only the one that discovered it.
+    market.notes.clear()
     market.daily_bars(["AAPL"], date(2026, 1, 1))
-    assert feeds == ["sip", "iex", "iex"]  # the fallback is remembered
+    assert feeds == ["sip", "iex", "iex"]
+    assert len(market.notes) == 1 and "IEX" in market.notes[0]
+
+    # Once the session is over, today's bar is final and belongs in the history.
+    evening = lambda: datetime.combine(today, clock(17, 0), ET)  # noqa: E731
+    closed = alpaca(handler, now=evening).daily_bars(["AAPL"], date(2026, 1, 1))["AAPL"]
+    assert [b.close for b in closed] == [100.5, 101.25, 999.0]
 
 
 def test_rate_limits_are_retried_and_other_errors_raise():
@@ -162,8 +172,9 @@ def test_movers_combines_gainers_and_losers():
 # -- Alpha Vantage (fixtures are trimmed real responses) -----------------------
 
 
-def alpha_vantage(handler) -> AlphaVantageEarnings:
-    return AlphaVantageEarnings("demo", client=httpx.Client(transport=httpx.MockTransport(handler)), min_interval=0)
+def alpha_vantage(handler, **kwargs) -> AlphaVantageEarnings:
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return AlphaVantageEarnings("demo", client=client, min_interval=0, **kwargs)
 
 
 def test_alpha_vantage_calendar():
@@ -174,7 +185,7 @@ def test_alpha_vantage_calendar():
         assert request.url.params["apikey"] == "demo"
         return httpx.Response(200, text=text)
 
-    calendar = alpha_vantage(handler).calendar()
+    calendar = alpha_vantage(handler).calendar(date(2026, 11, 24))
     assert calendar["ADI"] == EarningsEvent(date(2026, 11, 24), "pre", source="Alpha Vantage")
     assert calendar["ADSK"].timing == "post"
     assert calendar["AFJK"].timing == "unknown"  # the calendar leaves the time blank
@@ -216,7 +227,7 @@ def edgar(tmp_path, submissions: dict, seen: list | None = None) -> EdgarEarning
         return httpx.Response(200, json=submissions)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    return EdgarEarnings("Test Person test@example.com", DiskCache(tmp_path), client=client)
+    return EdgarEarnings("Test Person test@example.com", DiskCache(tmp_path), client=client, sleep=lambda _: None)
 
 
 def test_edgar_history_from_a_real_filing_index(tmp_path):
@@ -274,7 +285,7 @@ class FakeSource:
             raise self.error
         return self.events
 
-    def calendar(self):
+    def calendar(self, today=None):
         self.calls += 1
         if self.error:
             raise self.error
@@ -341,3 +352,186 @@ def test_calendar_failure_is_reported_not_raised(tmp_path):
     service = EarningsService(DiskCache(tmp_path), calendar_source=broken, today=TODAY)
     assert service.calendar() == {}
     assert "estimates" in service.calendar_note
+
+
+# -- Found in review: a server left running ------------------------------------
+
+
+def test_the_service_follows_the_date_instead_of_freezing_it(tmp_path):
+    listed = EarningsEvent(date(2026, 12, 3), "post", source="cal")
+    calendar = FakeSource("cal", calendar={"AAPL": listed})
+    service = EarningsService(DiskCache(tmp_path), calendar_source=calendar, today=TODAY)
+    history = quarterly(6)
+    assert service.upcoming("AAPL", history) == listed
+    # The day after the report, a server that never restarted must stop announcing it.
+    service._fixed_today = date(2026, 12, 4)
+    assert service.upcoming("AAPL", history).day == date(2027, 1, 28)
+    # With no date fixed, the service reads the clock every time it is asked.
+    assert EarningsService(DiskCache(tmp_path)).today == datetime.now(ET).date()
+
+
+def test_a_failed_calendar_download_is_retried_and_the_note_clears(tmp_path):
+    now = [0.0]
+    source = FakeSource("Alpha Vantage", error=RateLimited("limit"), calendar={"AAPL": EarningsEvent(date(2026, 12, 3))})
+    service = EarningsService(DiskCache(tmp_path), calendar_source=source, today=TODAY, clock=lambda: now[0])
+    assert service.calendar() == {} and service.calendar_note
+    assert service.calendar() == {} and source.calls == 1  # not hammered while it is failing
+    source.error = None
+    now[0] += 16 * 60  # a quarter of an hour later the download works
+    assert "AAPL" in service.calendar() and service.calendar_note is None
+    assert source.calls == 2
+
+
+def test_alpha_vantage_tries_again_after_its_cool_down():
+    payload = json.loads((FIXTURES / "av_earnings_ibm.json").read_text(encoding="utf-8"))
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        body = {"Note": "burst limit reached"} if len(calls) == 1 else payload
+        return httpx.Response(200, json=body)
+
+    source = alpha_vantage(handler, cool_down=0.0)
+    with pytest.raises(RateLimited):
+        source.history("IBM")
+    assert len(source.history("IBM")) == 6  # the limit cleared and so did the block
+    assert len(calls) == 2
+
+
+def test_a_stock_with_no_reports_is_not_looked_up_again_each_day(tmp_path):
+    etf = FakeSource("SEC EDGAR", [])
+    for _ in range(2):
+        events, note = EarningsService(DiskCache(tmp_path), history_sources=[etf], today=TODAY).history("SPY")
+        assert events == [] and note is None
+    path = next(tmp_path.glob("earnings_history_SPY*"))
+    raw = json.loads(path.read_text())
+    raw["stored_at"] = (datetime.now(ET) - timedelta(days=2)).isoformat()
+    path.write_text(json.dumps(raw))
+    EarningsService(DiskCache(tmp_path), history_sources=[etf], today=TODAY).history("SPY")
+    assert etf.calls == 1  # a scarce request is not spent on the same ETF every day
+
+
+def test_adding_a_source_does_not_reuse_answers_from_the_old_set(tmp_path):
+    thin = FakeSource("SEC EDGAR", [])
+    EarningsService(DiskCache(tmp_path), history_sources=[thin], today=TODAY).history("SHOP")
+    full = FakeSource("Alpha Vantage", quarterly(8))
+    events, _ = EarningsService(DiskCache(tmp_path), history_sources=[thin, full], today=TODAY).history("SHOP")
+    assert len(events) == 8
+
+
+# -- Found in review: hardening --------------------------------------------------
+
+
+def test_alpha_vantage_calendar_skips_past_dates_and_malformed_rows():
+    text = (
+        "symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\n"
+        "AAA,Alpha,2026-11-20,2026-09-30,1.0,USD,pre-market\n"  # already past
+        "AAA,Alpha,2027-02-19,2026-12-31,1.1,USD,post-market\n"
+        "BBB\n"  # a short row: no date field at all
+        "CCC,Gamma,not-a-date,,,USD,\n"
+    )
+    calendar = alpha_vantage(lambda request: httpx.Response(200, text=text)).calendar(date(2026, 11, 24))
+    assert set(calendar) == {"AAA"}
+    assert (calendar["AAA"].day, calendar["AAA"].timing) == (date(2027, 2, 19), "post")
+
+
+def test_alpha_vantage_history_is_sorted_newest_first():
+    rows = [
+        {"reportedDate": "2026-01-20", "reportTime": "post-market"},
+        {"reportedDate": "2026-10-21", "reportTime": "post-market"},
+        {"reportedDate": None},
+        {"reportedDate": "2026-07-22"},
+    ]
+    source = alpha_vantage(lambda request: httpx.Response(200, json={"quarterlyEarnings": rows}))
+    assert [e.day for e in source.history("IBM")] == [date(2026, 10, 21), date(2026, 7, 22), date(2026, 1, 20)]
+
+
+def test_edgar_backs_off_and_retries_when_told_to_slow_down(tmp_path):
+    submissions = json.loads((FIXTURES / "edgar_aapl.json").read_text(encoding="utf-8"))
+    statuses, waits = iter([429, 503, 200]), []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/files/company_tickers.json":
+            return httpx.Response(200, json={"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}})
+        status = next(statuses)
+        return httpx.Response(status, json=submissions if status == 200 else {})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = EdgarEarnings("Test Person test@example.com", DiskCache(tmp_path), client=client, sleep=waits.append)
+    assert len(source.history("AAPL")) == 12
+    assert [w for w in waits if w >= 1] == [2.0, 4.0]  # two back-offs, then through
+
+
+def test_edgar_reads_item_codes_in_any_shape(tmp_path):
+    stamps = ["2026-10-15T21:00:00.000Z", "2026-07-16T21:00:00.000Z", "2026-04-16T21:00:00.000Z",
+              "2026-01-15T21:00:00.000Z", "2025-10-15T21:00:00.000Z"]
+    table = {"form": ["8-K"] * 5, "items": ["2.02, 9.01", ["2.02", "9.01"], None, "", "9.01"], "acceptanceDateTime": stamps}
+    events = edgar(tmp_path, {"filings": {"recent": table, "files": []}}).history("AAPL")
+    assert [e.day for e in events] == [date(2026, 10, 15), date(2026, 7, 16)]
+
+
+def test_dropped_connections_are_retried():
+    calls = []
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(200, json={"most_actives": [{"symbol": "NVDA"}]})
+
+    assert alpaca(flaky).most_actives(5) == ["NVDA"]
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(AlpacaError, match="could not reach Alpaca"):
+        alpaca(dead).most_actives(5)
+
+
+def test_a_stock_with_no_trade_yet_today_uses_the_previous_close():
+    snaps = {
+        "THIN": {"latestTrade": None, "dailyBar": None, "prevDailyBar": {"c": 41.5}},
+        "GONE": {"latestTrade": None, "dailyBar": None, "prevDailyBar": None},
+    }
+    market = alpaca(lambda request: httpx.Response(200, json=snaps))
+    quotes = market.stock_snapshots(["THIN", "GONE"])
+    assert list(quotes) == ["THIN"]
+    assert (quotes["THIN"].price, quotes["THIN"].change_pct) == (41.5, 0.0)
+    assert "previous close" in market.notes[0]
+
+
+def test_cache_writes_are_whole_and_never_fatal(tmp_path):
+    cache = DiskCache(tmp_path / "cache")
+    cache.set("a/b", {"x": 1})
+    assert cache.get("a/b", timedelta(minutes=1)) == {"x": 1}
+    assert [p.suffix for p in (tmp_path / "cache").iterdir()] == [".json"]  # no temporary file left behind
+
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("x")
+    broken = DiskCache(blocker / "cache")
+    broken.set("key", 1)  # cannot be written: skipped, not raised
+    assert broken.entry("key") is None
+
+
+def test_cache_survives_threads_writing_the_same_key(tmp_path):
+    import threading
+
+    cache, errors = DiskCache(tmp_path), []
+
+    def hammer(n: int) -> None:
+        try:
+            for i in range(40):
+                cache.set("shared", {"writer": n, "i": i})
+                found = cache.entry("shared")
+                assert found is None or set(found[0]) == {"writer", "i"}  # never half a file
+        except Exception as err:  # pragma: no cover - the failure this guards against
+            errors.append(err)
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert cache.entry("shared") is not None
+    assert not list(tmp_path.glob("*.tmp"))

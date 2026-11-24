@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class ConfigError(RuntimeError):
+    """A setting is missing or invalid. The message is written for the user."""
+
+
 def _env(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name, "").strip()
@@ -34,6 +38,7 @@ class Settings:
     sec_user_agent: str | None = None
     anthropic_key: str | None = None
     ai_model: str | None = None
+    ai_effort: str | None = "high"  # None leaves the setting out, for models that reject it
     watchlist: tuple[str, ...] = ()
     risk_free_rate: float = 0.04
     cache_dir: Path = ROOT / ".cache"
@@ -52,18 +57,31 @@ class Settings:
         return [s for s in symbols if s]
 
 
+def _rate() -> float:
+    text = _env("RISK_FREE_RATE") or "0.04"
+    try:
+        rate = float(text)
+    except ValueError:
+        raise ConfigError(f"RISK_FREE_RATE must be a number such as 0.04, not {text!r}.") from None
+    if not -0.05 <= rate <= 0.25:
+        raise ConfigError(f"RISK_FREE_RATE is an annual rate as a decimal (0.04 means 4%), not {text!r}.")
+    return rate
+
+
 def load_settings() -> Settings:
     load_dotenv(ROOT / ".env")
+    effort = (_env("AI_EFFORT") or "high").lower()
     return Settings(
         alpaca_key=_env("ALPACA_API_KEY", "APCA_API_KEY_ID"),
         alpaca_secret=_env("ALPACA_SECRET_KEY", "APCA_API_SECRET_KEY"),
         alpaca_paper=(_env("ALPACA_PAPER") or "true").lower() not in ("0", "false", "no"),
-        options_feed=_env("ALPACA_OPTIONS_FEED") or "indicative",
-        stock_feed=_env("ALPACA_STOCK_FEED") or "iex",
+        options_feed=(_env("ALPACA_OPTIONS_FEED") or "indicative").lower(),
+        stock_feed=(_env("ALPACA_STOCK_FEED") or "iex").lower(),
         alphavantage_key=_env("ALPHAVANTAGE_API_KEY"),
         sec_user_agent=_env("SEC_USER_AGENT"),
         anthropic_key=_env("ANTHROPIC_API_KEY"),
         ai_model=_env("AI_MODEL"),
+        ai_effort=None if effort in ("none", "off") else effort,
         watchlist=tuple(_symbols(_env("WATCHLIST"))),
-        risk_free_rate=float(_env("RISK_FREE_RATE") or 0.04),
+        risk_free_rate=_rate(),
     )

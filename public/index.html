@@ -51,7 +51,7 @@
   tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
   tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .sub { color: var(--muted); font-size: 12px; }
-  .score { display: inline-grid; grid-template-columns: 34px 40px; gap: 6px; align-items: center; }
+  .score { display: inline-grid; grid-template-columns: 34px 26px; gap: 6px; align-items: center; }
   .track { height: 6px; border-radius: 3px; background: var(--bar); overflow: hidden; }
   .fill { height: 100%; background: var(--accent); }
   .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); margin-right: 4px; color: var(--muted); }
@@ -147,12 +147,25 @@ function el(tag, attrs, ...children) {
   return node;
 }
 const pct = (v, digits = 1) => v === null || v === undefined ? "–" : (v * 100).toFixed(digits) + "%";
-const signedPct = (v, digits = 1) => v === null || v === undefined ? "–" : (v > 0 ? "+" : "") + (v * 100).toFixed(digits) + "%";
+// Signs are decided after rounding, so a value that rounds to zero never shows as "+0" or "-0".
+function signedPct(v, digits = 1) {
+  if (v === null || v === undefined) return "–";
+  const text = (v * 100).toFixed(digits);
+  if (Number(text) === 0) return (0).toFixed(digits) + "%";
+  return (v > 0 ? "+" : "") + text + "%";
+}
 const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
 const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
 const whole = (v) => v === null || v === undefined ? "–" : v.toLocaleString();
-const dollars = (v) => v === null || v === undefined ? "–" : (v < 0 ? "−$" : "$") + Math.abs(Math.round(v)).toLocaleString();
+function dollars(v, signed = false) {
+  if (v === null || v === undefined) return "–";
+  const rounded = Math.round(v);
+  const sign = rounded < 0 ? "−" : signed && rounded > 0 ? "+" : "";
+  return sign + "$" + Math.abs(rounded).toLocaleString();
+}
+const inDays = (n) => n === 0 ? "today" : "in " + n + "d";
 const shortDate = (iso) => new Date(iso + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+const dayMonth = (iso) => new Date(iso + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" });
 const tone = (v) => v > 0 ? "up" : v < 0 ? "down" : "";
 
 const COMPONENTS = {
@@ -193,7 +206,7 @@ function showNotices(extra) {
 
 function earningsChips(ctx, idea) {
   if (ctx.days_to_earnings === null || ctx.days_to_earnings === undefined) return [];
-  const label = "earnings in " + ctx.days_to_earnings + "d" + (ctx.next_earnings.confirmed ? "" : " (est.)");
+  const label = "earnings " + inDays(ctx.days_to_earnings) + (ctx.next_earnings.confirmed ? "" : " (est.)");
   return [el("span", { class: "chip" + (idea.spans_earnings ? " hot" : "") }, label + (idea.spans_earnings ? " · spans" : ""))];
 }
 
@@ -214,7 +227,7 @@ function renderResults() {
     const row = el("tr", { tabindex: "0", onclick: () => select(idea), onkeydown: (e) => { if (e.key === "Enter") select(idea); } },
       el("td", {}, String(i + 1)),
       el("td", {}, el("strong", {}, idea.underlying), " ",
-        el("span", { class: "sub" }, shortDate(idea.expiry).replace(/, \d{4}$/, "") + " · " + idea.strike + " " + idea.kind + " · " + idea.dte + "d")),
+        el("span", { class: "sub" }, dayMonth(idea.expiry) + " · " + idea.strike + " " + idea.kind + " · " + idea.dte + "d")),
       el("td", {}, el("span", { class: "score" }, num(idea.score, 1), el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + idea.score + "%;display:block" })))),
       el("td", {}, money(idea.mid), el("div", { class: "sub" }, dollars(idea.outlay) + (scan.lens === "buy" ? " cost" : " held"))),
       el("td", {}, pct(idea.spread_pct)),
@@ -228,7 +241,9 @@ function renderResults() {
           el("div", { class: "sub rating " + idea.risk_reward.rating }, idea.risk_reward.rating),
           idea.risk_reward.shape ? el("div", {}, el("span", { class: "chip hot" }, idea.risk_reward.shape)) : null]
         : "–"),
-      el("td", {}, earningsChips(ctx, idea), ctx.reasons.filter((r) => !r.startsWith("earnings in")).map((r) => el("span", { class: "chip" }, r))),
+      el("td", {}, earningsChips(ctx, idea),
+        ctx.earnings_unknown ? el("span", { class: "chip hot" }, "earnings date unknown") : null,
+        ctx.reasons.filter((r) => !r.startsWith("earnings ")).map((r) => el("span", { class: "chip" }, r))),
     );
     row.dataset.symbol = idea.symbol;
     return row;
@@ -240,7 +255,7 @@ function facts(pairs) {
   return el("dl", {}, pairs.flatMap(([term, value]) => [el("dt", {}, term), el("dd", {}, value)]));
 }
 
-function riskBlock(idea) {
+function riskBlock(idea, ctx) {
   const rr = idea.risk_reward;
   if (!rr) {
     return [el("h3", {}, "Risk and reward"),
@@ -262,12 +277,15 @@ function riskBlock(idea) {
       ["Chance of profit", pct(rr.win_prob, 0)],
       ["Average win / loss per contract", dollars(rr.avg_win) + " / " + dollars(rr.avg_loss)],
       ["Reward : risk", num(rr.ratio, 1) + " : 1"],
-      ["Expected value (share of premium)", (rr.expected_value > 0 ? "+" : "") + dollars(rr.expected_value) + " (" + signedPct(rr.edge_pct, 0) + ")"],
+      ["Expected value (share of premium)", dollars(rr.expected_value, true) + " (" + signedPct(rr.edge_pct, 0) + ")"],
       ["Most you can lose", rr.max_loss === null ? "No cap on the option alone" : dollars(rr.max_loss)],
       ["Loss after a 2 s.d. move against you", dollars(rr.bad_case_loss)],
     ]),
-    el("p", { class: "sub" }, "Assumes the stock is as volatile as its own history (" + pct(rr.history_vol)
-      + " over this contract's life, against " + pct(idea.iv) + " implied) with no view on direction." + caveat),
+    el("p", { class: "sub" }, "Assumes you " + (scan.lens === "buy" ? "pay the ask" : "receive the bid")
+      + " and the stock is as volatile as its own history (" + pct(rr.history_vol)
+      + " over this contract's life, against " + pct(idea.iv) + " implied) with no view on direction."
+      + (ctx.earnings_unknown ? " No earnings date is known for this stock, so a report inside the contract's life is not accounted for." : "")
+      + caveat),
   ];
 }
 
@@ -301,7 +319,7 @@ function select(idea) {
       ["Delta · gamma", num(idea.delta) + " · " + num(idea.gamma, 3) + " (" + idea.greeks_source + ")"],
       ["Theta · vega", num(idea.theta, 3) + " · " + num(idea.vega, 3)],
     ].filter(Boolean)),
-    riskBlock(idea),
+    riskBlock(idea, ctx),
     el("h3", {}, "Score " + num(idea.score, 1) + " of 100"),
     Object.entries(idea.components).map(([name, value]) => el("div", { class: "component" },
       el("span", {}, COMPONENTS[name] || name),
@@ -319,7 +337,7 @@ function select(idea) {
     const e = ctx.next_earnings;
     parts.push(facts([
       ["Next report", shortDate(e.day) + ", " + (TIMING[e.timing] || e.timing)],
-      ["Days away", String(ctx.days_to_earnings) + (e.confirmed ? "" : " (estimated date)")],
+      ["When", inDays(ctx.days_to_earnings) + (e.confirmed ? "" : " (estimated date)")],
       ["This contract", idea.spans_earnings ? "still open at the report" : "expires before the report"],
     ]));
   } else {
@@ -329,7 +347,7 @@ function select(idea) {
   if (stats) {
     const impliedMove = implied ? implied.event_move_pct : null;
     const max = Math.max(stats.max_abs, impliedMove || 0);
-    parts.push(el("p", { class: "sub" }, "One-day move on the last " + stats.count + " reports: " + stats.up + " up, " + stats.down + " down."));
+    parts.push(el("p", { class: "sub" }, "Move across each of the last " + stats.count + " reports: " + stats.up + " up, " + stats.down + " down."));
     parts.push(compareBar("Average", stats.mean_abs, max), compareBar("Largest", stats.max_abs, max));
     if (impliedMove !== null && impliedMove !== undefined) {
       parts.push(compareBar("Options price in", impliedMove, max));

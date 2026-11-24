@@ -6,8 +6,10 @@ import re
 from datetime import date
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app import ai
 from app.cache import NullCache
@@ -15,7 +17,7 @@ from app.config import Settings
 from app.providers.demo import SPECS, DemoMarket
 from app.providers.earnings import EarningsService
 from app.scanner import ConfigError, Scanner, ScanRequest, build_scanner
-from app.server import create_app
+from app.server import ScanBody, create_app
 
 TODAY = date(2026, 11, 24)
 
@@ -63,7 +65,7 @@ def test_earnings_context(discovery):
     def built_in(symbol):
         spec = SPECS[symbol]
         jump, ordinary = spec["jump"] * spec["pricing"], spec["vol"] * 1.08
-        return math.sqrt(jump**2 + ordinary**2 / 365) * math.sqrt(2 / math.pi)
+        return math.sqrt(jump**2 + ordinary**2 / 252) * math.sqrt(2 / math.pi)
 
     assert acme.implied_move.event_move_pct == pytest.approx(built_in("ACME"), rel=0.02)
     assert acme.implied_move.baseline_source == "the next expiry after it"
@@ -266,10 +268,10 @@ def test_every_idea_is_rated_and_the_rating_agrees_with_the_volatility_score(dis
         rr = c.risk_reward
         assert rr is not None and rr.rating in {"favorable", "balanced", "unfavorable"}
         assert 0 < rr.win_prob < 1 and rr.avg_win > 0 and rr.avg_loss > 0
-        assert rr.max_loss == pytest.approx(c.mid * 100)  # a buyer can lose the premium and no more
+        assert rr.max_loss == pytest.approx(c.outlay)  # a buyer can lose what the contract cost, no more
         assert rr.history_vol == c.history_vol
-        cheap = c.iv < c.history_vol
-        assert (rr.edge_pct > 0) == cheap  # priced below history means positive expected value for a buyer
+        if rr.edge_pct > 0:  # worth more than the ask only if the options are priced below history
+            assert c.iv < c.history_vol
 
 
 def test_rating_reflects_how_each_report_is_priced():
@@ -360,3 +362,167 @@ def test_budget_reaches_the_api_the_brief_and_the_command_line(client, capsys):
     assert main(["scan", "--demo", "--budget", "100", "--top", "5"]) == 0
     out = capsys.readouterr().out
     assert "Budget: $100 per contract" in out and "Outlay" in out and "long shot" in out
+
+
+# -- Found in review ----------------------------------------------------------------
+
+
+def test_duplicate_and_untidy_symbols_are_scanned_once():
+    result = demo_scanner().scan(ScanRequest(symbols=["ACME", " acme ", "ACME"], top_n=50))
+    contracts = [c.symbol for c in result.ideas]
+    assert contracts and len(contracts) == len(set(contracts))
+
+
+def test_strike_window_widens_for_a_volatile_stock():
+    request = ScanRequest(symbols=["BOLT", "ORBT"], lens="sell", kind="put", dte_min=45, dte_max=60, top_n=500, per_side=500)
+    result = demo_scanner().scan(request)
+
+    def lowest_strike(symbol):
+        return min(c.strike for c in result.ideas if c.underlying == symbol) / result.underlyings[symbol].price
+
+    assert lowest_strike("BOLT") < 0.75  # 55% volatility: the search reaches well past 15% below the price
+    assert lowest_strike("ORBT") > 0.84  # 18% volatility: the 15% minimum is plenty
+    bolt = [abs(c.delta) for c in result.ideas if c.underlying == "BOLT"]
+    assert min(bolt) < 0.15  # the whole 0.15 to 0.35 delta band a seller looks for is in reach
+
+
+class _Source:
+    """A stand-in earnings source that answers, fails, or has nothing."""
+
+    name = "SEC EDGAR"
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    def history(self, symbol):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+def _scan_with(sources, symbols=("ACME", "BOLT")):
+    earnings = EarningsService(NullCache(), history_sources=sources, today=TODAY)
+    scanner = Scanner(DemoMarket(TODAY), earnings, Settings(), universe=list(SPECS), today=TODAY)
+    return scanner.scan(ScanRequest(symbols=list(symbols)))
+
+
+def test_ratings_say_when_no_earnings_date_is_known():
+    # ACME reports in nine days. If the lookup fails, a rating cannot see that coming.
+    failed = _scan_with([_Source(httpx.ConnectError("down"))])
+    assert all(u.earnings_unknown for u in failed.underlyings.values())
+    assert any(w.startswith("No earnings date is known for ACME, BOLT") for w in failed.warnings)
+    assert failed.ideas and all(c.risk_reward for c in failed.ideas)  # still rated, with the caveat attached
+    assert ai.scan_payload(failed)["underlyings"]["ACME"]["earnings_date_unknown"] is True
+
+    unconfigured = _scan_with([])
+    assert "No earnings data source is configured, so no rating accounts for an upcoming report." in unconfigured.warnings
+
+    # A security with no reports on file at all (an ETF) is a different case and is not flagged.
+    none_on_file = _scan_with([_Source([])])
+    assert not any(u.earnings_unknown for u in none_on_file.underlyings.values())
+    assert not any("earnings" in w.lower() for w in none_on_file.warnings)
+
+
+def test_a_provider_caveat_is_reported_on_every_scan():
+    scanner = demo_scanner()
+    real = scanner.market.daily_bars
+
+    def with_caveat(symbols, start):
+        scanner.market.notes.append("price history caveat")
+        return real(symbols, start)
+
+    scanner.market.daily_bars = with_caveat
+    for _ in range(2):
+        assert scanner.scan(ScanRequest(symbols=["ACME"])).warnings.count("price history caveat") == 1
+
+
+def test_an_open_interest_rejection_points_at_the_paper_setting():
+    scanner = demo_scanner()
+    real = scanner.market.option_chain
+
+    def without_interest(symbol, **window):
+        chain = real(symbol, **window)
+        for q in chain:
+            q.open_interest = None
+        return chain
+
+    def rejected(symbol, **window):
+        err = RuntimeError("unauthorized")
+        err.status = 401
+        raise err
+
+    scanner.market.option_chain, scanner.market.open_interest = without_interest, rejected
+    result = scanner.scan(ScanRequest(symbols=["ACME"]))
+    note = next(w for w in result.warnings if w.startswith("Open interest was unavailable"))
+    assert "ALPACA_PAPER" in note and result.ideas
+
+
+@pytest.mark.parametrize(
+    "flags", [["--top", "0"], ["--budget", "0"], ["--budget", "-5"], ["--dte-min", "40", "--dte-max", "10"], ["--dte-min", "-1"]]
+)
+def test_cli_rejects_impossible_options(flags, capsys):
+    from app.__main__ import main
+
+    with pytest.raises(SystemExit) as stop:
+        main(["scan", "--demo", *flags])
+    assert stop.value.code == 2
+    capsys.readouterr()
+
+
+def test_cli_json_with_a_brief_is_one_valid_document(capsys, monkeypatch):
+    from app import __main__ as cli
+
+    written = ai.BriefResult(summary="Two setups.", picks=[], model="test-model")
+    monkeypatch.setattr(cli.ai, "write_brief", lambda result, **options: written)
+    assert cli.main(["scan", "ACME", "--demo", "--top", "2", "--json", "--brief"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert len(document["ideas"]) == 2 and document["brief"]["summary"] == "Two setups."
+
+    def no_key(result, **options):
+        raise ai.BriefError("no key")
+
+    monkeypatch.setattr(cli.ai, "write_brief", no_key)
+    assert cli.main(["scan", "ACME", "--demo", "--top", "2", "--json", "--brief"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["brief"] is None and "no key" in captured.err
+
+
+def test_settings_are_cleaned_up_and_bad_ones_reported(capsys, monkeypatch):
+    from app.__main__ import main
+    from app.config import ConfigError, load_settings
+
+    monkeypatch.setenv("ALPACA_OPTIONS_FEED", "OPRA")
+    monkeypatch.setenv("AI_EFFORT", "None")
+    settings = load_settings()
+    assert settings.options_feed == "opra" and settings.ai_effort is None
+
+    for bad in ("four percent", "4"):  # not a number, and 400% where 4% was meant
+        monkeypatch.setenv("RISK_FREE_RATE", bad)
+        with pytest.raises(ConfigError, match="RISK_FREE_RATE"):
+            load_settings()
+    assert main(["scan", "--demo"]) == 2
+    assert "RISK_FREE_RATE" in capsys.readouterr().err
+
+
+def test_api_accepts_share_classes_and_rejects_non_tickers():
+    assert ScanBody(symbols=["brk-b", "BRK.B", " f "]).symbols == ["BRK.B", "F"]
+    for bad in ("..A", "TOOLONGX", "A.BCDE", "A B", "A/B"):
+        with pytest.raises(ValidationError):
+            ScanBody(symbols=[bad])
+
+
+def test_brief_is_off_without_credentials(monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    assert ai.available() is False  # the button stays hidden, as .env.example promises
+    assert ai.available("sk-test") is True
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    assert ai.available() is True
+
+
+def test_brief_effort_can_be_left_out_for_a_model_that_rejects_it(discovery):
+    fake = FakeClaude(ai.Brief(summary="s", picks=[]))
+    ai.write_brief(discovery, client=fake, effort=None)
+    assert "output_config" not in fake.requests[0]
+    ai.write_brief(discovery, client=fake, effort="low")
+    assert fake.requests[1]["output_config"] == {"effort": "low"}

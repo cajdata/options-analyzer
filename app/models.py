@@ -65,6 +65,7 @@ class Reaction:
     timing: str
     move_pct: float
     surprise_pct: float | None = None
+    sessions: int = 1  # trading days the move spans: 2 when the report's timing was unknown
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,7 @@ class ImpliedMove:
     """What the options price in for the next earnings report."""
 
     expiry: date
-    straddle_pct: float  # at-the-money straddle to `expiry`, as a share of spot
+    straddle_pct: float | None  # at-the-money straddle to `expiry`, as a share of spot
     event_move_pct: float | None  # one-day move attributed to the report itself
     baseline_vol: float
     baseline_source: str  # where ordinary volatility was taken from, as a phrase
@@ -165,6 +166,10 @@ class UnderlyingContext:
     earnings_stats: EarningsStats | None = None
     implied_move: ImpliedMove | None = None
     earnings_note: str | None = None
+    # True when the stock may report inside a contract's life but no date is known
+    # (no data source, a failed lookup, or a history too old to estimate from), so
+    # ratings for it cannot account for a report.
+    earnings_unknown: bool = False
     contracts_scanned: int = 0
 
 

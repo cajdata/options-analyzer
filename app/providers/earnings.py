@@ -7,7 +7,7 @@ import io
 import threading
 import time
 from datetime import date, datetime, time as clock, timedelta
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -17,7 +17,7 @@ from app.cache import DiskCache
 from app.models import EarningsEvent
 
 ET = ZoneInfo("America/New_York")
-MARKET_OPEN, MARKET_CLOSE = clock(9, 30), clock(16, 0)
+MARKET_CLOSE = clock(16, 0)
 
 
 class RateLimited(RuntimeError):
@@ -33,7 +33,7 @@ class HistorySource(Protocol):
 class CalendarSource(Protocol):
     name: str
 
-    def calendar(self) -> dict[str, EarningsEvent]: ...
+    def calendar(self, today: date) -> dict[str, EarningsEvent]: ...
 
 
 def _float(text: Any) -> float | None:
@@ -48,18 +48,26 @@ class AlphaVantageEarnings:
 
     name = "Alpha Vantage"
     URL = "https://www.alphavantage.co/query"
+    COOL_DOWN = 15 * 60.0  # seconds to stay quiet after the service says a limit was hit
     _TIMING = {"pre-market": "pre", "post-market": "post"}
 
-    def __init__(self, key: str, client: httpx.Client | None = None, min_interval: float = 1.2) -> None:
+    def __init__(
+        self,
+        key: str,
+        client: httpx.Client | None = None,
+        min_interval: float = 1.2,
+        cool_down: float = COOL_DOWN,
+    ) -> None:
         self._key = key
         self._client = client or httpx.Client(timeout=30.0)
         self._lock = threading.Lock()
         self._min_interval = min_interval
+        self._cool_down = cool_down
         self._last_call = 0.0
-        self._exhausted = False
+        self._blocked_until = 0.0
 
     def _fetch(self, **params: str) -> httpx.Response:
-        if self._exhausted:
+        if time.monotonic() < self._blocked_until:
             raise RateLimited("Alpha Vantage request limit reached")
         with self._lock:
             wait = self._min_interval - (time.monotonic() - self._last_call)
@@ -74,10 +82,14 @@ class AlphaVantageEarnings:
         # Limits and key problems come back as HTTP 200 with a message instead of data.
         message = payload.get("Information") or payload.get("Note")
         if message:
-            self._exhausted = True
+            # Back off for a while, then try again. The burst limit clears within a
+            # minute and the daily one overnight; a flag that never cleared would
+            # outlive both in a server left running.
+            self._blocked_until = time.monotonic() + self._cool_down
             raise RateLimited(str(message))
 
-    def calendar(self) -> dict[str, EarningsEvent]:
+    def calendar(self, today: date) -> dict[str, EarningsEvent]:
+        """The next report on or after `today` for every listed symbol."""
         resp = self._fetch(function="EARNINGS_CALENDAR", horizon="3month")
         text = resp.text.lstrip()
         if text.startswith("{"):
@@ -87,10 +99,12 @@ class AlphaVantageEarnings:
         for row in csv.DictReader(io.StringIO(text)):
             try:
                 day = date.fromisoformat(row["reportDate"])
-            except (KeyError, ValueError):
+            except (KeyError, TypeError, ValueError):  # a short row leaves the field as None
                 continue
             symbol = (row.get("symbol") or "").upper()
-            if symbol and (symbol not in out or day < out[symbol].day):
+            if day < today or not symbol:
+                continue
+            if symbol not in out or day < out[symbol].day:
                 timing = self._TIMING.get(row.get("timeOfTheDay") or "", "unknown")
                 out[symbol] = EarningsEvent(day=day, timing=timing, confirmed=True, source=self.name)
         return out
@@ -102,7 +116,7 @@ class AlphaVantageEarnings:
         for row in payload.get("quarterlyEarnings") or []:
             try:
                 day = date.fromisoformat(row["reportedDate"])
-            except (KeyError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 continue
             events.append(
                 EarningsEvent(
@@ -112,7 +126,7 @@ class AlphaVantageEarnings:
                     source=self.name,
                 )
             )
-        return events
+        return sorted(events, key=lambda e: e.day, reverse=True)
 
 
 class EdgarEarnings:
@@ -127,18 +141,40 @@ class EdgarEarnings:
     TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
     SUBMISSIONS_URL = "https://data.sec.gov/submissions/"
     MAX_OLDER_FILES = 4
+    MIN_INTERVAL = 0.12  # the SEC allows ten requests a second across all threads
+    RETRIES = 2
 
-    def __init__(self, user_agent: str, cache: DiskCache, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        user_agent: str,
+        cache: DiskCache,
+        client: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._headers = {"User-Agent": user_agent}
         self._cache = cache
         self._client = client or httpx.Client(timeout=30.0)
+        self._sleep = sleep
         self._lock = threading.Lock()
+        self._pace = threading.Lock()
+        self._last_call = 0.0
         self._ciks: dict[str, int] | None = None
 
     def _get(self, url: str) -> Any:
-        resp = self._client.get(url, headers=self._headers)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(self.RETRIES + 1):
+            with self._pace:  # space requests out, whichever thread makes them
+                wait = self.MIN_INTERVAL - (time.monotonic() - self._last_call)
+                if wait > 0:
+                    self._sleep(wait)
+                self._last_call = time.monotonic()
+            resp = self._client.get(url, headers=self._headers)
+            busy = resp.status_code == 429 or resp.status_code >= 500
+            if busy and attempt < self.RETRIES:
+                self._sleep(2.0 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise AssertionError("unreachable")
 
     def _cik(self, symbol: str) -> int | None:
         with self._lock:
@@ -170,10 +206,12 @@ class EdgarEarnings:
         forms, items, accepted = table.get("form") or [], table.get("items") or [], table.get("acceptanceDateTime") or []
         out = []
         for form, item, stamp in zip(forms, items, accepted):
-            if form != "8-K" or "2.02" not in item.split(","):
+            # Items arrive as "2.02,9.01". Tolerate a list, padding or a missing value.
+            codes = item if isinstance(item, list) else str(item or "").split(",")
+            if form != "8-K" or "2.02" not in {str(code).strip() for code in codes}:
                 continue
             try:
-                when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(ET)
+                when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(ET)
             except ValueError:
                 continue
             # A release during market hours moves the stock the same day, like a pre-market one.
@@ -183,11 +221,18 @@ class EdgarEarnings:
 
 
 class EarningsService:
-    """Combines the configured sources, caches results and estimates missing dates."""
+    """Combines the configured sources, caches results and estimates missing dates.
+
+    One instance lives as long as the server does, so nothing here may assume the
+    date, the calendar or a failure stays the same from one scan to the next.
+    """
 
     HISTORY_TTL = timedelta(days=30)
-    EMPTY_TTL = timedelta(days=1)
-    CALENDAR_TTL = timedelta(hours=12)
+    # Every source answered and none has a report on file: an ETF, most likely.
+    EMPTY_TTL = timedelta(days=30)
+    CALENDAR_TTL = timedelta(hours=12)  # how long a downloaded calendar is trusted
+    CALENDAR_RECHECK = timedelta(minutes=30)  # how long the copy in memory is reused
+    CALENDAR_RETRY = timedelta(minutes=15)  # how soon to try again after a failed download
     ENOUGH = 8  # reports a source must return before the next source is not consulted
 
     def __init__(
@@ -197,14 +242,25 @@ class EarningsService:
         history_sources: list[HistorySource] | None = None,
         calendar_source: CalendarSource | None = None,
         today: date | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._cache = cache
         self._history_sources = history_sources or []
         self._calendar_source = calendar_source
-        self._today = today or datetime.now(ET).date()
+        self._fixed_today = today
+        self._clock = clock
         self._calendar: dict[str, EarningsEvent] | None = None
+        self._calendar_at = 0.0
+        self._calendar_ok = False
         self._lock = threading.Lock()
         self.calendar_note: str | None = None
+        # A different set of sources can answer differently, so it gets its own entries.
+        self._tag = "-".join(s.name.split()[0].lower() for s in self._history_sources)
+
+    @property
+    def today(self) -> date:
+        """The trading date now, unless one was fixed for a test or the demo."""
+        return self._fixed_today or datetime.now(ET).date()
 
     @property
     def sources(self) -> list[str]:
@@ -217,7 +273,7 @@ class EarningsService:
         """Past reports, newest first, plus a note when something went wrong."""
         if not self._history_sources:
             return [], "No earnings data source is configured."
-        key = f"earnings_history_{symbol}"
+        key = f"earnings_history_{symbol}_{self._tag}"
         found = self._cache.entry(key)
         if found is not None:
             events = [_event(e) for e in found[0]]
@@ -229,7 +285,7 @@ class EarningsService:
             try:
                 got = source.history(symbol)
             except RateLimited:
-                note = f"{source.name} request limit reached; try again tomorrow."
+                note = f"{source.name} request limit reached; try again later."
                 continue
             except (httpx.HTTPError, ValueError, KeyError) as err:
                 note = f"{source.name} lookup failed: {type(err).__name__}."
@@ -250,36 +306,45 @@ class EarningsService:
         if age > self.HISTORY_TTL:
             return True
         # A new report has probably come out since the newest one on file.
-        return events[0].day + timedelta(days=75) < self._today and age > timedelta(days=1)
+        return events[0].day + timedelta(days=75) < self.today and age > timedelta(days=1)
 
     def calendar(self) -> dict[str, EarningsEvent]:
         with self._lock:
             if self._calendar is not None:
-                return self._calendar
-            self._calendar = {}
-            if self._calendar_source is None:
-                return self._calendar
-            found = self._cache.entry("earnings_calendar")
-            if found is not None and found[1] <= self.CALENDAR_TTL:
-                self._calendar = {s: _event(e) for s, e in found[0].items()}
-                return self._calendar
-            try:
-                self._calendar = self._calendar_source.calendar()
-                self._cache.set("earnings_calendar", {s: _plain(e) for s, e in self._calendar.items()})
-            except (RateLimited, httpx.HTTPError, ValueError) as err:
-                self.calendar_note = (
-                    f"{self._calendar_source.name} earnings calendar unavailable "
-                    f"({type(err).__name__}); upcoming dates are estimates."
-                )
-                if found is not None:
-                    self._calendar = {s: _event(e) for s, e in found[0].items()}
+                keep = self.CALENDAR_RECHECK if self._calendar_ok else self.CALENDAR_RETRY
+                if self._clock() - self._calendar_at < keep.total_seconds():
+                    return self._calendar
+            self._calendar, self._calendar_ok = self._load_calendar()
+            self._calendar_at = self._clock()
             return self._calendar
 
+    def _load_calendar(self) -> tuple[dict[str, EarningsEvent], bool]:
+        """The calendar and whether it is current. Sets or clears `calendar_note`."""
+        if self._calendar_source is None:
+            return {}, True
+        found = self._cache.entry("earnings_calendar")
+        if found is not None and found[1] <= self.CALENDAR_TTL:
+            self.calendar_note = None
+            return {s: _event(e) for s, e in found[0].items()}, True
+        try:
+            fresh = self._calendar_source.calendar(self.today)
+        except (RateLimited, httpx.HTTPError, ValueError) as err:
+            self.calendar_note = (
+                f"{self._calendar_source.name} earnings calendar unavailable "
+                f"({type(err).__name__}); upcoming dates are estimates."
+            )
+            stale = {s: _event(e) for s, e in found[0].items()} if found is not None else {}
+            return stale, False
+        self._cache.set("earnings_calendar", {s: _plain(e) for s, e in fresh.items()})
+        self.calendar_note = None
+        return fresh, True
+
     def upcoming(self, symbol: str, history: list[EarningsEvent]) -> EarningsEvent | None:
+        today = self.today
         listed = self.calendar().get(symbol)
-        if listed and listed.day >= self._today:
+        if listed and listed.day >= today:
             return listed
-        return estimate_next(history, self._today)
+        return estimate_next(history, today)
 
 
 def _plain(e: EarningsEvent) -> dict:

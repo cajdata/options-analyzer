@@ -26,8 +26,9 @@ earnings dates are made up.
 3. Set at least one earnings source in `.env`:
    - `SEC_USER_AGENT` (your name and email, which the SEC asks automated clients to send):
      past earnings dates from 8-K filings, free, no daily limit.
-   - `ALPHAVANTAGE_API_KEY` (free key, about 25 requests a day): confirmed upcoming dates
-     and EPS surprises.
+   - `ALPHAVANTAGE_API_KEY` (free key, about 25 requests a day): confirmed upcoming dates.
+     Its history, which includes EPS surprises, is used only where EDGAR is not set or has
+     too few reports, to stay inside the daily limit.
 4. Optional: `ANTHROPIC_API_KEY` turns on the AI brief.
 
 ```powershell
@@ -86,7 +87,9 @@ bigger payoff always comes with lower odds. To say something more, the app price
 contract against the stock's own history instead: recent volatility with earnings days
 removed, plus past report-day moves for any report the contract spans. From that it
 shows the chance of profit, average win and loss, expected value, the most you can lose
-and the loss after a two-standard-deviation move against you. Options usually cost more
+and the loss after a two-standard-deviation move against you. These assume you pay the
+ask to buy or receive the bid to sell, so a wide spread counts against a contract, and
+they are in today's dollars, so a fairly priced option shows zero at any expiry. Options usually cost more
 than history suggests, which is what sellers are paid for carrying the risk of a large
 move, so a seller's favorable rating always sits next to those loss figures.
 
@@ -108,6 +111,9 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   dividend are approximate.
 - **Risk and reward assumes history repeats** and takes no view on direction. It is a
   comparison of price with past behavior, and past volatility is a rough guide at best.
+- **A rating cannot see a report it has no date for.** When no earnings date is known for
+  a stock (no source set, a failed lookup, or a foreign company that files no 8-K), the
+  scan says so, because options look expensive right before a report for good reason.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
 - **The AI brief knows only the scan.** It has no news and no view of your account. It

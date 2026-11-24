@@ -155,6 +155,9 @@ def test_spans_counts_the_reaction_day():
     assert em.spans(WED, EarningsEvent(WED, "pre"))
     assert not em.spans(WED, EarningsEvent(WED, "post"))  # expires before the after-hours report
     assert em.spans(WED + timedelta(days=1), EarningsEvent(WED, "post"))
+    # Timing unknown: the report may come before the open, so the report day counts.
+    assert em.spans(WED, EarningsEvent(WED, "unknown"))
+    assert not em.spans(WED - timedelta(days=1), EarningsEvent(WED, "unknown"))
 
 
 def test_implied_move_recovers_the_event_priced_into_the_chain():
@@ -162,12 +165,12 @@ def test_implied_move_recovers_the_event_priced_into_the_chain():
     before, after = TODAY + timedelta(days=5), TODAY + timedelta(days=12)
     ordinary, event_std = 0.30, 0.06
     t = 12 / 365
-    iv_after = math.sqrt((ordinary**2 * (t - 1 / 365) + event_std**2) / t)
+    iv_after = math.sqrt((ordinary**2 * (t - metrics.TRADING_DAY) + event_std**2) / t)
     atm = {
         before: metrics.AtmPoint(100.0, ordinary, 3.0),
         after: metrics.AtmPoint(100.0, iv_after, 8.0),
     }
-    implied = em.implied_move(100.0, atm, event, realized=0.99, today=TODAY)
+    implied = em.implied_move(100.0, atm, event, ordinary=0.99, today=TODAY)
     assert implied.expiry == after
     assert implied.baseline_source == "the last expiry before the report"
     assert implied.straddle_pct == pytest.approx(0.08)
@@ -176,20 +179,20 @@ def test_implied_move_recovers_the_event_priced_into_the_chain():
     # Without an expiry before the report, two expiries after it pin down ordinary volatility.
     later = TODAY + timedelta(days=19)
     t_later = 19 / 365
-    iv_later = math.sqrt((ordinary**2 * (t_later - 1 / 365) + event_std**2) / t_later)
+    iv_later = math.sqrt((ordinary**2 * (t_later - metrics.TRADING_DAY) + event_std**2) / t_later)
     chain = {after: atm[after], later: metrics.AtmPoint(100.0, iv_later, 9.0)}
-    forward = em.implied_move(100.0, chain, event, realized=0.99, today=TODAY)
+    forward = em.implied_move(100.0, chain, event, ordinary=0.99, today=TODAY)
     assert forward.baseline_source == "the next expiry after it"
     assert forward.baseline_vol == pytest.approx(ordinary)
     assert forward.event_move_pct == pytest.approx(event_std * math.sqrt(2 / math.pi))
 
     # With a single expiry after the report, realized volatility is the last resort.
-    fallback = em.implied_move(100.0, {after: atm[after]}, event, realized=ordinary, today=TODAY)
+    fallback = em.implied_move(100.0, {after: atm[after]}, event, ordinary=ordinary, today=TODAY)
     assert fallback.baseline_source == "recent realized volatility"
     assert fallback.event_move_pct == pytest.approx(event_std * math.sqrt(2 / math.pi))
-    assert em.implied_move(100.0, {after: atm[after]}, event, realized=None, today=TODAY).event_move_pct is None
+    assert em.implied_move(100.0, {after: atm[after]}, event, ordinary=None, today=TODAY).event_move_pct is None
 
-    assert em.implied_move(100.0, {before: atm[before]}, event, realized=ordinary, today=TODAY) is None
+    assert em.implied_move(100.0, {before: atm[before]}, event, ordinary=ordinary, today=TODAY) is None
 
 
 # -- Scoring ------------------------------------------------------------------
@@ -249,3 +252,87 @@ def test_rank_keeps_the_best_call_and_put_per_stock():
     top = scoring.rank(pool, per_side=1, top_n=3)
     assert [(c.underlying, c.kind, c.score) for c in top] == [("AAA", "call", 90), ("BBB", "call", 88), ("AAA", "put", 70)]
     assert len(scoring.rank(pool, per_side=5, top_n=10)) == 5
+
+
+# -- Found in review ----------------------------------------------------------
+
+
+def test_quote_below_exercise_value_is_dropped_even_when_the_feed_supplies_a_volatility():
+    # An $80 call is worth at least $20 with the stock at $100. A $10 quote is stale,
+    # and it used to slip through whenever the feed attached its own volatility figure.
+    stale = quote("call", 80.0, bid=10.0, ask=10.2, iv=0.30)
+    assert metrics.analyze_contract(stale, 100.0, TODAY, RATE) is None
+    sound = quote("call", 80.0, bid=20.4, ask=20.6, iv=0.30)
+    assert metrics.analyze_contract(sound, 100.0, TODAY, RATE) is not None
+    stale_put = quote("put", 120.0, bid=15.0, ask=15.2, iv=0.30)
+    assert metrics.analyze_contract(stale_put, 100.0, TODAY, RATE) is None
+
+
+def test_nonsense_quotes_are_dropped_instead_of_crashing_later():
+    priced_above_strike = quote("put", 5.0, bid=5.0, ask=5.2, iv=0.30)  # breakeven below zero
+    assert metrics.analyze_contract(priced_above_strike, 4.0, TODAY, RATE) is None
+    assert metrics.analyze_contract(quote("call", 0.0, iv=0.30), 100.0, TODAY, RATE) is None
+
+
+def test_breakeven_already_past_the_forward_counts_as_no_distance():
+    fair = pricing.price("call", 100.0, 85.0, 60 / 365, RATE, 0.20)
+    call = metrics.analyze_contract(quote("call", 85.0, days=60, bid=fair - 0.01, ask=fair + 0.01, iv=0.20), 100.0, TODAY, RATE)
+    metrics.apply_expected_moves([call], metrics.atm_by_expiry([call], 100.0), 100.0, TODAY, RATE)
+    assert call.breakeven < 100.0 * math.exp(RATE * 60 / 365)  # the stock is expected to clear it
+    assert call.breakeven_vs_expected == 0.0  # not a distance still to travel
+
+
+def test_positive_theta_is_not_counted_as_decay():
+    gains_with_time = quote("put", 140.0, bid=40.0, ask=40.2, iv=0.30, delta=-0.98, gamma=0.001, theta=0.004, vega=0.01)
+    assert metrics.analyze_contract(gains_with_time, 100.0, TODAY, RATE).theta_pct_per_day == 0.0
+    loses_with_time = quote(iv=0.30, delta=0.5, gamma=0.04, theta=-0.062, vega=0.11)
+    assert metrics.analyze_contract(loses_with_time, 100.0, TODAY, RATE).theta_pct_per_day == pytest.approx(0.062 / 3.1)
+
+
+def test_reaction_records_how_many_sessions_it_spans():
+    sessions = {timing: em.reactions([EarningsEvent(WED, timing)], WEEK)[0].sessions for timing in ("pre", "post", "unknown")}
+    assert sessions == {"pre": 1, "post": 1, "unknown": 2}
+
+
+def _priced_with_report(days, ordinary=0.30, event_std=0.06):
+    t = days / 365
+    return math.sqrt((ordinary**2 * (t - metrics.TRADING_DAY) + event_std**2) / t)
+
+
+def test_implied_move_leaves_out_an_expiry_it_cannot_place():
+    # Timing unknown, and one expiry falls on the report day: it may or may not hold the report.
+    event = EarningsEvent(TODAY + timedelta(days=9), "unknown")
+    after, later = TODAY + timedelta(days=12), TODAY + timedelta(days=19)
+    atm = {
+        event.day: metrics.AtmPoint(100.0, 0.90, 5.0),
+        after: metrics.AtmPoint(100.0, _priced_with_report(12), 8.0),
+        later: metrics.AtmPoint(100.0, _priced_with_report(19), 9.0),
+    }
+    implied = em.implied_move(100.0, atm, event, ordinary=None, today=TODAY)
+    assert implied.expiry == after  # not read as the first expiry holding the report
+    assert implied.baseline_source == "the next expiry after it"  # nor as a quiet expiry before it
+    assert implied.event_move_pct == pytest.approx(0.06 * math.sqrt(2 / math.pi))
+
+
+def test_implied_move_does_not_borrow_an_expiry_that_holds_the_following_report():
+    event = EarningsEvent(TODAY + timedelta(days=9), "post")
+    after, far = TODAY + timedelta(days=12), TODAY + timedelta(days=120)  # 111 days past the report
+    atm = {after: metrics.AtmPoint(100.0, _priced_with_report(12), 8.0), far: metrics.AtmPoint(100.0, 0.45, 20.0)}
+    implied = em.implied_move(100.0, atm, event, ordinary=0.30, today=TODAY)
+    assert implied.baseline_source == "recent realized volatility"
+    assert implied.event_move_pct == pytest.approx(0.06 * math.sqrt(2 / math.pi))
+
+
+def test_implied_move_does_not_need_both_sides_quoted():
+    event = EarningsEvent(TODAY + timedelta(days=9), "post")
+    after = TODAY + timedelta(days=12)
+    one_sided = {after: metrics.AtmPoint(100.0, _priced_with_report(12), None)}
+    implied = em.implied_move(100.0, one_sided, event, ordinary=0.30, today=TODAY)
+    assert implied.straddle_pct is None
+    assert implied.event_move_pct == pytest.approx(0.06 * math.sqrt(2 / math.pi))
+
+
+def test_rank_with_no_room_returns_nothing():
+    c = analyzed()
+    c.score = 50.0
+    assert scoring.rank([c], per_side=5, top_n=0) == []
