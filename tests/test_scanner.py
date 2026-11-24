@@ -678,3 +678,126 @@ def test_the_brief_is_given_the_exit_plan(discovery):
     sold = demo_scanner().scan(ScanRequest(**PRESETS["sell-premium"]["settings"]))
     plan = ai.scan_payload(sold)["ranked_contracts"][0]["exit_plan"]
     assert plan["profit_target_buy_back_at_or_below"] > 0 and "decay_alone_reaches_target_on" in plan
+
+
+# -- Found in the exit-plan review -------------------------------------------------------
+
+
+def test_discovery_does_not_spend_its_slots_on_stocks_skip_earnings_will_discard():
+    # BOLT, ACME and FLUX report within 16 days, so under the preset (30 to 45 days out,
+    # nothing open over earnings) every contract of theirs is discarded. They used to be
+    # picked first, because an upcoming report earned extra points.
+    preset = PRESETS["sell-premium"]["settings"]
+    result = demo_scanner().scan(ScanRequest(**preset, max_symbols=2))
+    assert result.ideas  # the two slots went to stocks that have something to offer
+    assert not {"BOLT", "ACME", "FLUX"} & set(result.underlyings)
+    assert any(w.startswith("Skipped ACME, BOLT, FLUX: they report before any contract") for w in result.warnings)
+
+    # CRUX reports in 38 days: its nearest expiry in range comes first, so it stays.
+    everything = demo_scanner().scan(ScanRequest(**preset))
+    assert "CRUX" in everything.underlyings
+    assert all(c.expiry < date(2027, 1, 1) for c in everything.ideas if c.underlying == "CRUX")
+
+    # Without the filter, an upcoming report is still a reason to look.
+    plain = demo_scanner().scan(ScanRequest(max_symbols=2))
+    assert "BOLT" in plain.underlyings
+
+
+def test_skip_earnings_leaves_out_a_stock_whose_report_date_is_unknown():
+    preset = PRESETS["sell-premium"]["settings"]
+
+    def scan(sources):
+        earnings = EarningsService(NullCache(), history_sources=sources, today=TODAY)
+        scanner = Scanner(DemoMarket(TODAY), earnings, Settings(), universe=list(SPECS), today=TODAY)
+        return scanner.scan(ScanRequest(**preset, symbols=["ACME", "EMBR"]))
+
+    # ACME reports in nine days. With the lookup down, nothing says so, and its contracts used to pass.
+    failed = scan([_Source(httpx.ConnectError("down"))])
+    assert failed.ideas == []
+    assert any(w.startswith("Left out ACME, EMBR: no earnings date is known") for w in failed.warnings)
+    assert not any("ratings there do not account" in w for w in failed.warnings)  # said once, not twice
+
+    unconfigured = scan([])
+    assert unconfigured.ideas == []
+    assert any(w.startswith("Nothing can be shown as clear of an earnings report") for w in unconfigured.warnings)
+
+    # A security with no reports on file at all (an ETF) has nothing to avoid and still passes.
+    assert scan([_Source([])]).ideas
+
+
+def test_skip_earnings_explains_a_requested_stock_with_nothing_left():
+    preset = PRESETS["sell-premium"]["settings"]
+    result = demo_scanner().scan(ScanRequest(**preset, symbols=["ACME"]))
+    assert result.ideas == []
+    assert "Left out ACME: every contract in this range is still open over the next earnings report." in result.warnings
+
+
+def test_skip_earnings_gives_an_estimated_date_room():
+    # ORBT's next report is an estimate: 18 January, after the close. A contract expiring three
+    # days before an estimate may well be open over the real report, so skip-earnings drops it.
+    scanner = demo_scanner()
+    request = dict(symbols=["ORBT"], lens="sell", dte_min=40, dte_max=60, top_n=200, per_side=200)
+    every = scanner.scan(ScanRequest(**request))
+    assert not every.underlyings["ORBT"].next_earnings.confirmed
+    assert every.underlyings["ORBT"].next_earnings.day == date(2027, 1, 18)
+    assert {c.expiry for c in every.ideas} == {date(2027, 1, 8), date(2027, 1, 15), date(2027, 1, 22)}
+    assert {c.expiry for c in every.ideas if c.spans_earnings} == {date(2027, 1, 22)}
+
+    careful = scanner.scan(ScanRequest(**request, avoid_earnings=True))
+    assert {c.expiry for c in careful.ideas} == {date(2027, 1, 8)}
+
+    # A confirmed date needs no such room: CRUX reports before the open on 1 January,
+    # and a contract expiring a week before that is kept.
+    crux = scanner.scan(ScanRequest(symbols=["CRUX"], lens="sell", dte_min=25, dte_max=45, avoid_earnings=True, top_n=200, per_side=200))
+    assert crux.underlyings["CRUX"].next_earnings.confirmed
+    assert {c.expiry for c in crux.ideas} == {date(2026, 12, 25)}
+
+
+def test_a_date_from_the_calendar_is_known_even_if_the_history_lookup_failed():
+    market = DemoMarket(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[_Source(httpx.ConnectError("down"))], calendar_source=market, today=TODAY)
+    result = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY).scan(ScanRequest(symbols=["ACME"]))
+    acme = result.underlyings["ACME"]
+    assert acme.next_earnings.confirmed and acme.days_to_earnings == 9
+    assert acme.earnings_unknown is False and acme.earnings_note  # the date is known; the note says history is missing
+    assert not any("No earnings date is known" in w for w in result.warnings)
+
+
+def test_cli_exit_line_shows_the_time_stop_result_and_speaks_for_the_seller(capsys):
+    from app.__main__ import _exit_line, main
+    from app.analysis import exits
+
+    # A 35-day contract: the time stop lands 14 days out, on a date the path also samples.
+    scanner = demo_scanner()
+    result = scanner.scan(ScanRequest(symbols=["EMBR"], lens="sell", kind="put", dte_min=30, dte_max=45, top_n=200, per_side=200))
+    c = next(c for c in result.ideas if c.dte == 31)
+    c.dte, c.expiry = 35, TODAY + timedelta(days=35)
+    ctx = result.underlyings["EMBR"]
+    plan = exits.build(c, ctx, "sell", 0.04, TODAY)
+    assert [k.label for k in plan.checkpoints] == ["in 7 days", "time stop", "in 21 days", "at expiry"]
+    line = _exit_line(c, plan, ctx)
+    stop = plan.checkpoints[1]
+    assert f"time stop {stop.day:%b %d} {stop.pnl:+,.0f}" in line  # its result used to be dropped
+    assert line.count("time stop") == 1
+
+    # Across earnings, a seller is told what the position absorbs, not what a buyer needs.
+    bolt = scanner.scan(ScanRequest(symbols=["BOLT"], lens="sell", kind="put", dte_min=20, dte_max=30))
+    sold = bolt.ideas[0]
+    text = _exit_line(sold, bolt.exit_plans[sold.symbol], bolt.underlyings["BOLT"])
+    assert "buying back the next day costs less than was collected unless the stock moves more than -" in text
+    held = scanner.scan(ScanRequest(symbols=["ACME"], kind="call", dte_max=30))
+    bought = held.ideas[0]
+    text = _exit_line(bought, held.exit_plans[bought.symbol], held.underlyings["ACME"])
+    assert "the stock has to move +" in text and "to be back at the entry price" in text
+
+    # No cushion at all: buying back already costs what was collected.
+    plan = bolt.exit_plans[sold.symbol]
+    stuck = type(plan.earnings)(plan.earnings.report_day, 1.0, 1.0, 0.0, 0.0)
+    plan.earnings = stuck
+    assert "already costs at least what was collected" in _exit_line(sold, plan, bolt.underlyings["BOLT"])
+
+    # A preset's skip-earnings setting can be switched off from the command line.
+    assert main(["scan", "ACME", "--demo", "--preset", "sell-premium", "--no-avoid-earnings", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["ideas"]
+    assert main(["scan", "ACME", "--demo", "--preset", "sell-premium", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["ideas"] == []

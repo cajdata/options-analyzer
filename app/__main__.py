@@ -82,6 +82,21 @@ def print_scan(result: ScanResult) -> None:
     print("Not a forecast and not advice.")
 
 
+def _after_report(plan: ExitPlan) -> str:
+    """What the session after the report asks of the stock, in the holder's or the seller's terms."""
+    move = plan.earnings.move_to_breakeven_pct
+    if move is None:
+        return "no plausible move in the stock gets back to the entry price"
+    none_needed = abs(move) < 0.0005
+    if plan.lens == "sell":
+        if none_needed:
+            return "buying back the next day already costs at least what was collected"
+        return f"buying back the next day costs less than was collected unless the stock moves more than {move:+.1%}"
+    if none_needed:
+        return "selling the next day already returns the entry price"
+    return f"the stock has to move {move:+.1%} to be back at the entry price the next day"
+
+
 def _exit_line(c: ContractAnalysis, plan: ExitPlan, ctx: UnderlyingContext) -> str:
     """One contract's exit plan in a line or two."""
     name = f"{c.underlying} {c.expiry:%b %d} {c.strike:g} {c.kind}"
@@ -91,17 +106,22 @@ def _exit_line(c: ContractAnalysis, plan: ExitPlan, ctx: UnderlyingContext) -> s
         parts.append(f"buy back at ${plan.target_price:.2f} or less to keep {exits.PROFIT_TARGET:.0%} ({when})")
     elif plan.half_life_day:
         parts.append(f"half the time value is gone by {plan.half_life_day:%b %d}")
-    if plan.time_stop_day:
-        parts.append(f"time stop {plan.time_stop_day:%b %d}")
+    stop_shown = False
     for k in plan.checkpoints:
-        if k.label.startswith("in ") or k.label == "at expiry":
-            parts.append(f"{k.label} {k.pnl:+,.0f} ({k.pnl_pct:+.0%})")
+        if k.label in ("before earnings", "after earnings"):
+            continue  # the earnings line below covers these
+        stop_shown = stop_shown or k.label == "time stop"
+        when = f"time stop {k.day:%b %d}" if k.label == "time stop" else k.label
+        parts.append(f"{when} {k.pnl:+,.0f} ({k.pnl_pct:+.0%})")
+    if plan.time_stop_day and not stop_shown:
+        parts.append(f"time stop {plan.time_stop_day:%b %d}")
     text = f"  {name}: " + "; ".join(parts)
     report = plan.earnings
     if report:
-        move = report.move_to_breakeven_pct
-        back = "no plausible move gets back to the entry price" if move is None else f"{move:+.1%} in the stock gets back to the entry price"
-        text += f"\n      earnings {report.report_day:%b %d}: {report.crush_pct:+.0%} with the stock unchanged; {back}"
+        text += (
+            f"\n      earnings {report.report_day:%b %d}: {report.crush_pct:+.0%} "
+            f"with the stock unchanged; {_after_report(plan)}"
+        )
         if ctx.earnings_stats:
             text += f" (past reports averaged {ctx.earnings_stats.mean_abs:.1%})"
     for note in plan.notes:
@@ -143,7 +163,12 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument("--dte-max", type=int, help="most days to expiry (default 60)")
     scan.add_argument("--delta-min", type=float, help="smallest delta, ignoring its sign")
     scan.add_argument("--delta-max", type=float, help="largest delta, ignoring its sign")
-    scan.add_argument("--avoid-earnings", action="store_true", default=None, help="skip contracts open over the next report")
+    scan.add_argument(
+        "--avoid-earnings",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="skip contracts open over the next report (--no-avoid-earnings turns a preset's setting off)",
+    )
     scan.add_argument("--exits", action="store_true", help="print an exit plan for each contract")
     scan.add_argument("--top", type=int, default=20)
     scan.add_argument("--budget", type=float, help="most cash to put into one contract, in dollars")

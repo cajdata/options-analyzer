@@ -34,6 +34,9 @@ BUDGET_REACH = 2.5
 WINDOW_SIGMAS = 1.5
 MAX_STRIKE_WINDOW = 0.50
 DEFAULT_VOL = 0.40  # assumed when a stock has too little price history to measure
+# With "skip earnings" on, an estimated report date is given this much room in front
+# of it, since a company's reports move by days from one quarter to the next.
+ESTIMATE_MARGIN = timedelta(days=7)
 
 # Named starting points for a scan. Each is a set of ScanRequest fields.
 PRESETS: dict[str, dict] = {
@@ -77,6 +80,24 @@ class ScanRequest:
     avoid_earnings: bool = False  # drop contracts still open over the next report
 
 
+@dataclass
+class _Found:
+    """What one symbol contributed to a scan."""
+
+    ctx: UnderlyingContext
+    contracts: list[ContractAnalysis]
+    least_outlay: float | None  # cheapest contract seen, before any budget was applied
+    left_out: str | None = None  # why skip-earnings removed everything: "unknown" or "all open"
+
+
+def _names(symbols: list[str], limit: int = 8) -> str:
+    """A readable list of symbols, cut short when it is long."""
+    symbols = sorted(symbols)
+    if len(symbols) <= limit:
+        return ", ".join(symbols)
+    return ", ".join(symbols[:limit]) + f" and {len(symbols) - limit} more"
+
+
 class Scanner:
     def __init__(
         self,
@@ -117,10 +138,10 @@ class Scanner:
             if symbol not in quotes:
                 warnings.append(f"{symbol}: no stock quote found.")
         calendar = self.earnings.calendar()
-        selected = self._select(req, reasons, quotes, calendar, today)
+        selected = self._select(req, reasons, quotes, calendar, today, warnings)
         bars = self.market.daily_bars(selected, today - timedelta(days=HISTORY_DAYS)) if selected else {}
 
-        def analyze(symbol: str) -> tuple[UnderlyingContext, list[ContractAnalysis], float | None] | str:
+        def analyze(symbol: str) -> _Found | str:
             try:
                 return self._analyze(symbol, quotes[symbol], bars.get(symbol, []), reasons[symbol], req, today)
             except Exception as err:  # one bad symbol must not sink the scan
@@ -129,26 +150,23 @@ class Scanner:
         underlyings: dict[str, UnderlyingContext] = {}
         scored: list[ContractAnalysis] = []
         cheapest: tuple[float, str] | None = None  # least outlay seen, before the budget was applied
+        left_out: dict[str, list[str]] = {"unknown": [], "all open": []}
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(analyze, selected):
                 if isinstance(outcome, str):
                     warnings.append(outcome)
                     continue
-                ctx, found, least = outcome
+                ctx, least = outcome.ctx, outcome.least_outlay
                 underlyings[ctx.symbol] = ctx
-                scored.extend(found)
+                scored.extend(outcome.contracts)
                 if least is not None and (cheapest is None or least < cheapest[0]):
                     cheapest = (least, ctx.symbol)
+                if outcome.left_out:
+                    left_out[outcome.left_out].append(ctx.symbol)
                 if ctx.contracts_scanned == 0:
                     warnings.append(f"{ctx.symbol}: no two-sided option quotes in range.")
 
-        unknown = sorted(symbol for symbol, ctx in underlyings.items() if ctx.earnings_unknown)
-        if unknown and not self.earnings.sources:
-            warnings.append("No earnings data source is configured, so no rating accounts for an upcoming report.")
-        elif unknown:
-            warnings.append(
-                f"No earnings date is known for {', '.join(unknown)}, so ratings there do not account for a report."
-            )
+        warnings.extend(self._earnings_warnings(req, underlyings, left_out))
         if self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
         warnings.extend(dict.fromkeys(self.market.notes))
@@ -177,6 +195,36 @@ class Scanner:
             exit_plans={symbol: plan for symbol, plan in plans.items() if plan},
         )
 
+    def _earnings_warnings(
+        self, req: ScanRequest, underlyings: dict[str, UnderlyingContext], left_out: dict[str, list[str]]
+    ) -> list[str]:
+        """What the person should know about earnings dates the scan could not rely on."""
+        out = []
+        if req.avoid_earnings:
+            # The filter fails closed: a stock appears only if it can be shown clear of a report.
+            if left_out["unknown"] and not self.earnings.sources:
+                out.append(
+                    "Nothing can be shown as clear of an earnings report, because no earnings data source is "
+                    "configured. Set SEC_USER_AGENT or ALPHAVANTAGE_API_KEY in .env, or turn off the skip-earnings filter."
+                )
+            elif left_out["unknown"]:
+                out.append(
+                    f"Left out {_names(left_out['unknown'])}: no earnings date is known, "
+                    "and contracts open over earnings are being skipped."
+                )
+            if left_out["all open"]:
+                out.append(
+                    f"Left out {_names(left_out['all open'])}: every contract in this range "
+                    "is still open over the next earnings report."
+                )
+            return out
+        unknown = [symbol for symbol, ctx in underlyings.items() if ctx.earnings_unknown]
+        if unknown and not self.earnings.sources:
+            out.append("No earnings data source is configured, so no rating accounts for an upcoming report.")
+        elif unknown:
+            out.append(f"No earnings date is known for {_names(unknown)}, so ratings there do not account for a report.")
+        return out
+
     # -- Choosing symbols ---------------------------------------------------
 
     def _universe(self, req: ScanRequest, warnings: list[str]) -> dict[str, list[str]]:
@@ -203,13 +251,23 @@ class Scanner:
         quotes: dict[str, StockQuote],
         calendar: dict[str, EarningsEvent],
         today: date,
+        warnings: list[str],
     ) -> list[str]:
         if req.symbols:
             return [s for s in req.symbols if s in quotes]
         interest: dict[str, float] = {}
+        skipped: list[str] = []
+        first_expiry = today + timedelta(days=req.dte_min)
         for symbol, why in reasons.items():
             quote = quotes.get(symbol)
             if quote is None or quote.price < MIN_PRICE:
+                continue
+            listed = calendar.get(symbol)
+            days = (listed.day - today).days if listed else None
+            if req.avoid_earnings and listed and days >= 0 and earnings_math.spans(first_expiry, listed):
+                # Even the nearest expiry in range is still open over the report, so every
+                # contract would be thrown away. Scanning it would waste one of the few slots.
+                skipped.append(symbol)
                 continue
             if req.budget is not None and req.lens == "sell":
                 # Least collateral any contract in range could need: 100 shares for a
@@ -223,16 +281,17 @@ class Scanner:
                 # Lean toward stocks whose near-the-money contracts are within reach.
                 if quote.price * ATM_MONTH_COST * scoring.SHARES <= req.budget * BUDGET_REACH:
                     points += 3.0
-            listed = calendar.get(symbol)
-            if listed and 0 <= (listed.day - today).days <= 21:
-                points += 3.0
-                days = (listed.day - today).days
+            if listed and 0 <= days <= 21:
+                if not req.avoid_earnings:
+                    points += 3.0  # a report soon is a reason to look, unless reports are being avoided
                 why.append("earnings today" if days == 0 else f"earnings in {days}d")
             change = quote.change_pct or 0.0
             points += min(abs(change) / 0.02, 3.0)
             if abs(change) >= 0.03:
                 why.append(f"moved {change:+.1%} today")
             interest[symbol] = points
+        if skipped:
+            warnings.append(f"Skipped {_names(skipped)}: they report before any contract in this range expires.")
         return sorted(interest, key=lambda s: interest[s], reverse=True)[: req.max_symbols]
 
     # -- One symbol ---------------------------------------------------------
@@ -252,7 +311,7 @@ class Scanner:
 
     def _analyze(
         self, symbol: str, quote: StockQuote, bars: list[Bar], reasons: list[str], req: ScanRequest, today: date
-    ) -> tuple[UnderlyingContext, list[ContractAnalysis], float | None]:
+    ) -> _Found:
         spot = quote.price
         reach = self._strike_window(req, bars)
         window = dict(
@@ -286,8 +345,9 @@ class Scanner:
         moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
         # A stock that reports, with no date to go on: the lookup failed, nothing is
         # configured, the only source cannot answer for this company, or the reports
-        # on file are too old to estimate from.
-        unknown = note is not None or (bool(history) and upcoming is None)
+        # on file are too old to estimate from. A date from the calendar is a date,
+        # even when the history lookup behind it failed.
+        unknown = upcoming is None and (note is not None or bool(history))
 
         # The stock's own history: ordinary days with earnings reactions removed,
         # and the typical size of a report-day move.
@@ -328,13 +388,20 @@ class Scanner:
         low = req.delta_min if req.delta_min is not None else 0.0
         high = req.delta_max if req.delta_max is not None else 1.0
         wanted = [
-            c
-            for c in analyzed
-            if scoring.tradable(c)
-            and req.kind in ("both", c.kind)
-            and low <= abs(c.delta) <= high
-            and not (req.avoid_earnings and c.spans_earnings)
+            c for c in analyzed if scoring.tradable(c) and req.kind in ("both", c.kind) and low <= abs(c.delta) <= high
         ]
+        left_out = None
+        if req.avoid_earnings and wanted:
+            # Skipping earnings fails closed. With no date to go on, nothing can be shown
+            # as clear of a report; and an estimated date gets room in front of it.
+            def may_be_open(c: ContractAnalysis) -> bool:
+                if c.spans_earnings:
+                    return True
+                return bool(upcoming and not upcoming.confirmed and c.expiry >= upcoming.day - ESTIMATE_MARGIN)
+
+            wanted = [] if unknown else [c for c in wanted if not may_be_open(c)]
+            if not wanted:
+                left_out = "unknown" if unknown else "all open"
         for c in wanted:
             c.outlay = scoring.outlay(c, req.lens, spot)
         least = min((c.outlay for c in wanted), default=None)
@@ -343,7 +410,7 @@ class Scanner:
         for c in wanted:
             scoring.score(c, req.lens)
             c.risk_reward = risk.assess(c, spot, rate, req.lens)
-        return ctx, wanted, least
+        return _Found(ctx, wanted, least, left_out)
 
 
 def build_scanner(settings: Settings, demo: bool = False) -> Scanner:

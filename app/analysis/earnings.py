@@ -124,6 +124,14 @@ def reaction_day(event: EarningsEvent) -> date:
     return day
 
 
+def session_before(day: date) -> date:
+    """The last weekday before `day`. Market holidays are not accounted for."""
+    day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
 def _ambiguous(expiry: date, event: EarningsEvent) -> bool:
     """An expiry on the report day when nobody knows whether the report comes first."""
     return event.timing == "unknown" and expiry == event.day

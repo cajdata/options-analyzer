@@ -333,9 +333,11 @@ function exitBlock(idea, ctx) {
     let back;
     if (move === null) back = "No plausible move in the stock the next day gets back to the entry price.";
     else if (seller) back = Math.abs(move) < 0.0005
-      ? "Buying back the next day would already cost what was collected."
+      ? "Buying back the next day would already cost at least what was collected."
       : "Buying back the next day costs less than was collected unless the stock moves more than " + signedPct(move) + ".";
-    else back = "To be back at the entry price the next day, the stock has to move " + signedPct(move) + ".";
+    else back = Math.abs(move) < 0.0005
+      ? "Selling the next day would already return the entry price."
+      : "To be back at the entry price the next day, the stock has to move " + signedPct(move) + ".";
     const past = ctx.earnings_stats ? " Past reports averaged a " + pct(ctx.earnings_stats.mean_abs) + " move." : "";
     parts.push(el("p", { class: "sub" }, "Across earnings (" + dayMonth(report.report_day) + "), the option goes from "
       + money(report.value_before) + " to " + money(report.value_after) + " (" + signedPct(report.crush_pct, 0)
@@ -460,6 +462,7 @@ $("controls").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("scan").disabled = true;
   $("busy").textContent = "Scanning…";
+  $("hint").textContent = "";
   try {
     scan = await api("/api/scan", {
       symbols: $("symbols").value.split(/[\s,]+/).filter(Boolean),
@@ -484,6 +487,9 @@ $("controls").addEventListener("submit", async (event) => {
     $("busy").textContent = "";
   }
 });
+
+// A preset's note describes the controls as it left them, so it goes once they are edited.
+$("controls").addEventListener("input", () => { $("hint").textContent = ""; });
 
 (async function start() {
   try {

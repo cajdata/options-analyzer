@@ -115,6 +115,10 @@ there, and the rules are for managing risk, not signals.
 lens to 30 to 45 days, 0.16 to 0.30 delta, and skips contracts still open over an
 earnings report. Those filters are also available on their own.
 
+Skipping earnings is strict. A stock with no known report date is left out, an estimated
+date is given a week of room in front of it, and the scan says which stocks it left out
+and why. It needs an earnings data source to work at all.
+
 **Ranks through a lens.** `buy` ranks long calls and puts; `sell` ranks cash-secured
 puts and covered calls. The score is a weighted sum of five components (liquidity,
 breakeven or probability, how volatility is priced, decay or yield, delta). "How

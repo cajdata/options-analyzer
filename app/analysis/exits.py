@@ -32,9 +32,8 @@ import math
 from datetime import date, timedelta
 
 from app import pricing
-from app.analysis.contracts import TRADING_DAY
-from app.analysis.earnings import reaction_day
-from app.models import Checkpoint, ContractAnalysis, EarningsExit, ExitPlan, UnderlyingContext
+from app.analysis.earnings import reaction_day, session_before
+from app.models import Checkpoint, ContractAnalysis, EarningsEvent, EarningsExit, ExitPlan, UnderlyingContext
 
 PROFIT_TARGET = 0.50  # a seller's usual target: buy back once half the premium is kept
 TIME_STOP_DTE = 21  # and the usual time stop: close or roll this many days before expiry
@@ -43,6 +42,14 @@ SHARES = 100
 # The report's share of a contract's variance is capped, so the ordinary part
 # never goes to zero or below when the two estimates disagree.
 MAX_EVENT_SHARE = 0.90
+# Time on this path is counted in calendar days, so the report takes the place of
+# one calendar day: the session it lands on. The one-off decompositions in risk.py
+# and earnings.py use a trading day (1/252 of a year) instead, because they compare
+# against volatility annualized over trading days. That longer slot must not be used
+# here: stepping one calendar day past the report would then hand back about half a
+# day of ordinary time, and with a day or two to expiry the option would be priced
+# higher after the report than before it.
+REPORT_SLOT = 1.0 / 365.0
 
 
 class _Model:
@@ -57,18 +64,38 @@ class _Model:
 
         self.report: date | None = None  # first session that reflects the report, if modelled
         self.event_var = 0.0
-        event = ctx.next_earnings
-        if event and c.spans_earnings:
-            day = reaction_day(event)
-            # What the options price for the report, else what past reports have delivered.
-            priced = ctx.implied_move.event_var if ctx.implied_move else None
-            known = priced or ctx.event_var
-            if known and today < day <= c.expiry:
-                self.report = day
-                self.event_var = min(known, MAX_EVENT_SHARE * total)
-        self.report_ignored = bool(event and c.spans_earnings and self.report is None)
-        ordinary_time = t - (TRADING_DAY if self.report else 0.0)
-        self.ordinary_rate = (total - self.event_var) / max(ordinary_time, 1e-9)  # variance per year
+        self.report_note: str | None = None  # why a report the contract spans is not modelled
+        if ctx.next_earnings and c.spans_earnings:
+            self._place_report(ctx.next_earnings, ctx, total)
+
+        ordinary_time = t - (REPORT_SLOT if self.report else 0.0)
+        if self.report and ordinary_time <= 1e-9:
+            # One day left and the report lands on it: all that is left in the price is the report.
+            self.event_var, self.ordinary_rate = total, 0.0
+        else:
+            self.ordinary_rate = (total - self.event_var) / ordinary_time  # variance per year
+
+    def _place_report(self, event: EarningsEvent, ctx: UnderlyingContext, total: float) -> None:
+        day = reaction_day(event)
+        # What the options price for the report. Only when they give no reading at all
+        # does the size come from what past reports delivered; a reading of zero stands,
+        # so the plan never shows a step the rest of the page says is not priced.
+        priced = ctx.implied_move.event_var if ctx.implied_move else None
+        size = priced if priced is not None else ctx.event_var
+        if day <= self.today:
+            return  # already felt: today's price no longer holds the report
+        if day > self.c.expiry:
+            self.report_note = (
+                "The report's timing is unknown and it may land on this contract's last day. "
+                "These figures leave it out."
+            )
+        elif size is None:
+            self.report_note = "This contract spans an earnings report that could not be sized, so these figures ignore it."
+        elif size <= 0:
+            self.report_note = "The options price no extra move for the coming report, so no step is shown for it."
+        else:
+            self.report = day
+            self.event_var = min(size, MAX_EVENT_SHARE * total)
 
     def intrinsic(self, spot: float | None = None) -> float:
         s = self.spot if spot is None else spot
@@ -82,8 +109,8 @@ class _Model:
             return self.intrinsic(s)
         t = left / 365.0
         ahead = self.report is not None and day < self.report
-        # Until it lands, the report takes the place of one ordinary trading day.
-        variance = self.ordinary_rate * max(t - (TRADING_DAY if ahead else 0.0), 0.0)
+        # Until it lands, the report takes the place of one ordinary day.
+        variance = self.ordinary_rate * max(t - (REPORT_SLOT if ahead else 0.0), 0.0)
         variance += self.event_var if ahead else 0.0
         vol = math.sqrt(max(variance, 1e-12) / t)
         # The formula is for European exercise and can price a deep in-the-money put
@@ -126,7 +153,7 @@ def build(c: ContractAnalysis, ctx: UnderlyingContext, lens: str, rate: float, t
     if time_stop_day:
         marks[time_stop_day] = "time stop"
     if model.report:
-        eve = model.report - timedelta(days=1)
+        eve = session_before(model.report)  # the last day it can be closed before the report is felt
         if eve > today:
             marks[eve] = "before earnings"
         marks[model.report] = "after earnings"
@@ -160,7 +187,7 @@ def _earnings(model: _Model, close_price, entry: float, today: date) -> Earnings
     """The step in price across the report, and the move that would undo it."""
     if model.report is None:
         return None
-    eve = max(today, model.report - timedelta(days=1))
+    eve = max(today, session_before(model.report))
     before, after = model.value(eve), model.value(model.report)
     if before <= 0:
         return None
@@ -168,6 +195,8 @@ def _earnings(model: _Model, close_price, entry: float, today: date) -> Earnings
     # Stock move, in the direction that makes the option worth more, at which closing
     # the session after the report is back to the entry price. For a holder that is
     # the move needed to recover; for a seller it is the move the position can absorb.
+    # Zero means closing at an unchanged stock price already meets or passes the entry
+    # price: a holder is whole, a seller has no cushion.
     is_call = model.c.kind == "call"
     low, high = (model.spot, model.spot * 3.0) if is_call else (model.spot * 0.05, model.spot)
     worth_more = high if is_call else low
@@ -198,8 +227,8 @@ def _notes(c: ContractAnalysis, ctx: UnderlyingContext, lens: str, model: _Model
     notes = []
     if ctx.earnings_unknown:
         notes.append("No earnings date is known for this stock, so a report in this period is not modelled.")
-    elif model.report_ignored:
-        notes.append("This contract spans an earnings report that could not be sized, so these figures ignore it.")
+    elif model.report_note:
+        notes.append(model.report_note)
     elif model.report and ctx.next_earnings and not ctx.next_earnings.confirmed:
         notes.append("The earnings date is an estimate, so the before and after rows may be off by days.")
     if lens == "sell" and c.dte <= TIME_STOP_DTE:
