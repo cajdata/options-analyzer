@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
-from app.analysis import scoring
+from app.analysis import risk, scoring
 from app.cache import DiskCache, NullCache
 from app.config import Settings
 from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, UnderlyingContext
@@ -186,9 +187,18 @@ class Scanner:
         history, note = self.earnings.history(symbol)
         upcoming = self.earnings.upcoming(symbol, history)
         moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
-        implied = earnings_math.implied_move(spot, atm, upcoming, realized_20, today) if upcoming and atm else None
+
+        # The stock's own history: ordinary days with earnings reactions removed,
+        # and the typical size of a report-day move.
+        earnings_days = earnings_math.reaction_days(history, bars)
+        ordinary = metrics.realized_vol(bars, 60, earnings_days) or metrics.realized_vol(bars, 20, earnings_days)
+        enough = len(moves) >= risk.MIN_REPORTS
+        event_var = statistics.fmean(m.move_pct**2 for m in moves) if enough else None
+
+        implied = earnings_math.implied_move(spot, atm, upcoming, ordinary, today) if upcoming and atm else None
         for c in analyzed:
             c.spans_earnings = bool(upcoming and earnings_math.spans(c.expiry, upcoming))
+            c.history_vol = risk.history_vol(c, ordinary, event_var, upcoming)
 
         near_month = min(atm, key=lambda e: abs((e - today).days - 30)) if atm else None
         ctx = UnderlyingContext(
@@ -210,7 +220,8 @@ class Scanner:
 
         wanted = [c for c in analyzed if scoring.tradable(c) and req.kind in ("both", c.kind)]
         for c in wanted:
-            scoring.score(c, ctx, req.lens)
+            scoring.score(c, req.lens)
+            c.risk_reward = risk.assess(c, spot, rate, req.lens)
         return ctx, wanted
 
 

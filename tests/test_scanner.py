@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 from datetime import date
 from types import SimpleNamespace
 
@@ -255,3 +256,48 @@ def test_cli_without_keys_points_to_the_setup(capsys, monkeypatch):
     monkeypatch.setattr(cli, "load_settings", lambda: Settings())
     assert cli.main(["scan"]) == 2
     assert "ALPACA_API_KEY" in capsys.readouterr().err
+
+
+# -- Risk and reward ------------------------------------------------------------
+
+
+def test_every_idea_is_rated_and_the_rating_agrees_with_the_volatility_score(discovery):
+    for c in discovery.ideas:
+        rr = c.risk_reward
+        assert rr is not None and rr.rating in {"favorable", "balanced", "unfavorable"}
+        assert 0 < rr.win_prob < 1 and rr.avg_win > 0 and rr.avg_loss > 0
+        assert rr.max_loss == pytest.approx(c.mid * 100)  # a buyer can lose the premium and no more
+        assert rr.history_vol == c.history_vol
+        cheap = c.iv < c.history_vol
+        assert (rr.edge_pct > 0) == cheap  # priced below history means positive expected value for a buyer
+
+
+def test_rating_reflects_how_each_report_is_priced():
+    # ACME's options price its report at 70% of the usual move, BOLT's at 140%.
+    buy = demo_scanner().scan(ScanRequest(symbols=["ACME", "BOLT"], kind="call", dte_max=20))
+    spanning = {s: [c for c in buy.ideas if c.underlying == s and c.spans_earnings] for s in ("ACME", "BOLT")}
+    assert spanning["ACME"] and spanning["BOLT"]
+    assert all(c.risk_reward.rating == "favorable" for c in spanning["ACME"])
+    assert all(c.risk_reward.rating == "unfavorable" for c in spanning["BOLT"])
+
+    sell = demo_scanner().scan(ScanRequest(symbols=["BOLT"], lens="sell", kind="put", dte_max=20))
+    rated = [c.risk_reward for c in sell.ideas if c.spans_earnings]
+    assert rated and all(r.rating == "favorable" for r in rated)
+    assert all(r.bad_case_loss > r.avg_win for r in rated)  # the tail is still larger than a typical win
+
+
+def test_risk_reward_reaches_the_api_the_brief_and_the_command_line(client, discovery, capsys):
+    from app.__main__ import main
+
+    idea = client.post("/api/scan", json={"symbols": ["ACME"], "top_n": 3}).json()["ideas"][0]
+    assert set(idea["risk_reward"]) >= {"rating", "ratio", "win_prob", "avg_win", "avg_loss", "expected_value", "max_loss"}
+
+    block = ai.scan_payload(discovery)["ranked_contracts"][0]["risk_reward_if_history_repeats"]
+    assert block["rating"] in {"favorable", "balanced", "unfavorable"} and block["reward_to_risk"] > 0
+    assert "risk_reward_if_history_repeats" in ai.SYSTEM
+
+    # Short-dated ACME calls span a report the options price cheaply, so they rate favorable.
+    assert main(["scan", "ACME", "--demo", "--type", "call", "--dte-max", "20", "--top", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "R:R" in out and "Rating" in out
+    assert re.search(r"\bfavorable\b", out) and "unfavorable" not in out

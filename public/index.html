@@ -19,7 +19,7 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
-  header, main, footer, .controls, .notice, #brief { max-width: 1280px; margin: 0 auto; padding: 0 16px; }
+  header, main, footer, .controls, .notice, #brief { max-width: 1440px; margin: 0 auto; padding: 0 16px; }
   header { display: flex; align-items: baseline; gap: 12px; padding-top: 20px; flex-wrap: wrap; }
   h1 { font-size: 20px; margin: 0; }
   h2 { font-size: 15px; margin: 0 0 8px; }
@@ -36,8 +36,8 @@
   button:disabled { opacity: .55; cursor: default; }
   .notice { margin-top: 14px; }
   .notice p { margin: 0 0 6px; padding: 8px 12px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; margin-top: 16px; align-items: start; }
-  @media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); } }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; margin-top: 16px; align-items: start; }
+  @media (max-width: 1180px) { main { grid-template-columns: minmax(0, 1fr); } }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
@@ -56,8 +56,10 @@
   .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); margin-right: 4px; color: var(--muted); }
   .chip.hot { border-color: var(--warn-line); background: var(--warn-bg); color: var(--text); }
   .up { color: var(--good); } .down { color: var(--bad); }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
-  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .rating { text-transform: capitalize; }
+  .rating.favorable { color: var(--good); } .rating.unfavorable { color: var(--bad); }
+  dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; margin: 0; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .component { display: grid; grid-template-columns: 1fr 90px 34px; gap: 8px; align-items: center; margin: 5px 0; }
   .component span:last-child { text-align: right; color: var(--muted); font-size: 12px; }
   .compare { display: grid; grid-template-columns: 110px 1fr 48px; gap: 8px; align-items: center; margin: 5px 0; }
@@ -117,7 +119,8 @@
 
 <footer>
   Contracts are ranked by fixed, visible rules: liquidity, distance to breakeven, how volatility is priced,
-  time decay or yield, and delta. The ranking is a screen, not a forecast and not financial advice.
+  time decay or yield, and delta. The risk and reward rating compares each price with the stock's own history.
+  Neither is a forecast, and neither is financial advice.
   This app only reads market data. It cannot place orders.
 </footer>
 
@@ -144,6 +147,7 @@ const signedPct = (v, digits = 1) => v === null || v === undefined ? "–" : (v 
 const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
 const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
 const whole = (v) => v === null || v === undefined ? "–" : v.toLocaleString();
+const dollars = (v) => v === null || v === undefined ? "–" : (v < 0 ? "−$" : "$") + Math.abs(Math.round(v)).toLocaleString();
 const shortDate = (iso) => new Date(iso + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 const tone = (v) => v > 0 ? "up" : v < 0 ? "down" : "";
 
@@ -197,7 +201,7 @@ function renderResults() {
     $("results").replaceChildren(el("p", { class: "empty" }, "No contracts passed the filters. Try a wider range of days or different symbols."));
     return;
   }
-  const head = ["#", "Contract", "Score", "Mid", "Spread", "Delta", "IV", "POP", "Breakeven", "vs exp. move", "Context"];
+  const head = ["#", "Contract", "Score", "Mid", "Spread", "Delta", "IV", "POP", "Breakeven", "Reward : risk", "Context"];
   const rows = scan.ideas.map((idea, i) => {
     const ctx = scan.underlyings[idea.underlying];
     const row = el("tr", { tabindex: "0", onclick: () => select(idea), onkeydown: (e) => { if (e.key === "Enter") select(idea); } },
@@ -210,8 +214,11 @@ function renderResults() {
       el("td", {}, num(idea.delta)),
       el("td", {}, pct(idea.iv)),
       el("td", {}, pct(idea.pop, 0)),
-      el("td", {}, signedPct(idea.breakeven_move_pct)),
-      el("td", {}, idea.breakeven_vs_expected === null ? "–" : num(idea.breakeven_vs_expected) + "×"),
+      el("td", {}, signedPct(idea.breakeven_move_pct),
+        idea.breakeven_vs_expected === null ? null : el("div", { class: "sub" }, num(idea.breakeven_vs_expected) + "× exp. move")),
+      el("td", {}, idea.risk_reward
+        ? [num(idea.risk_reward.ratio, 1) + " : 1", el("div", { class: "sub rating " + idea.risk_reward.rating }, idea.risk_reward.rating)]
+        : "–"),
       el("td", {}, earningsChips(ctx, idea), ctx.reasons.filter((r) => !r.startsWith("earnings in")).map((r) => el("span", { class: "chip" }, r))),
     );
     row.dataset.symbol = idea.symbol;
@@ -222,6 +229,31 @@ function renderResults() {
 
 function facts(pairs) {
   return el("dl", {}, pairs.flatMap(([term, value]) => [el("dt", {}, term), el("dd", {}, value)]));
+}
+
+function riskBlock(idea) {
+  const rr = idea.risk_reward;
+  if (!rr) {
+    return [el("h3", {}, "Risk and reward"),
+      el("p", { class: "sub" }, "Not rated: there is not enough price or earnings history for this stock.")];
+  }
+  const caveat = scan.lens === "sell"
+    ? " Options usually cost more than history suggests. That gap is what a seller is paid for carrying the risk of a large move, so read the rating next to the losses above."
+      + (rr.max_loss === null ? " In a covered call, a loss on the option is offset by the shares you hold." : "")
+    : " Options usually cost more than history suggests, so most contracts look expensive to a buyer by this measure.";
+  return [
+    el("h3", {}, "Risk and reward if history repeats · ", el("span", { class: "rating " + rr.rating }, rr.rating)),
+    facts([
+      ["Chance of profit", pct(rr.win_prob, 0)],
+      ["Average win / loss per contract", dollars(rr.avg_win) + " / " + dollars(rr.avg_loss)],
+      ["Reward : risk", num(rr.ratio, 1) + " : 1"],
+      ["Expected value (share of premium)", (rr.expected_value > 0 ? "+" : "") + dollars(rr.expected_value) + " (" + signedPct(rr.edge_pct, 0) + ")"],
+      ["Most you can lose", rr.max_loss === null ? "No cap on the option alone" : dollars(rr.max_loss)],
+      ["Loss after a 2 s.d. move against you", dollars(rr.bad_case_loss)],
+    ]),
+    el("p", { class: "sub" }, "Assumes the stock is as volatile as its own history (" + pct(rr.history_vol)
+      + " over this contract's life, against " + pct(idea.iv) + " implied) with no view on direction." + caveat),
+  ];
 }
 
 function compareBar(label, value, max) {
@@ -243,7 +275,7 @@ function select(idea) {
       ["Bid × ask", money(idea.bid) + " × " + money(idea.ask)],
       ["Breakeven at expiry", money(idea.breakeven) + " (" + signedPct(idea.breakeven_move_pct) + ")"],
       ["Expected move to expiry (1 s.d.)", "±" + pct(idea.expected_move_pct)],
-      [scan.lens === "buy" ? "Probability of profit (buyer)" : "Probability of profit (seller)", pct(idea.pop, 0)],
+      ["Chance of profit, market-implied", pct(idea.pop, 0)],
       ["Probability in the money", pct(idea.prob_itm, 0)],
       ["Time decay per day", pct(idea.theta_pct_per_day, 2) + " of price"],
       scan.lens === "sell" ? ["Annualized yield on collateral", pct(idea.annualized_yield)] : null,
@@ -252,6 +284,7 @@ function select(idea) {
       ["Delta · gamma", num(idea.delta) + " · " + num(idea.gamma, 3) + " (" + idea.greeks_source + ")"],
       ["Theta · vega", num(idea.theta, 3) + " · " + num(idea.vega, 3)],
     ].filter(Boolean)),
+    riskBlock(idea),
     el("h3", {}, "Score " + num(idea.score, 1) + " of 100"),
     Object.entries(idea.components).map(([name, value]) => el("div", { class: "component" },
       el("span", {}, COMPONENTS[name] || name),

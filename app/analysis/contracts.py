@@ -123,10 +123,17 @@ def apply_expected_moves(
             c.breakeven_vs_expected = abs(c.breakeven / forward - 1.0) / expected
 
 
-def realized_vol(bars: list[Bar], window: int) -> float | None:
-    """Annualized close-to-close volatility over the last `window` trading days."""
-    closes = [b.close for b in bars[-(window + 1):] if b.close > 0]
-    if len(closes) < window + 1:
+def realized_vol(bars: list[Bar], window: int, exclude: frozenset[date] | set[date] = frozenset()) -> float | None:
+    """Annualized close-to-close volatility over the last `window` daily returns.
+
+    Returns landing on a day in `exclude` (earnings reactions) are left out, so
+    the result describes ordinary days only.
+    """
+    returns = [
+        math.log(b.close / a.close)
+        for a, b in zip(bars, bars[1:])
+        if a.close > 0 and b.close > 0 and b.day not in exclude
+    ][-window:]
+    if len(returns) < window:
         return None
-    returns = [math.log(b / a) for a, b in zip(closes, closes[1:])]
     return statistics.stdev(returns) * math.sqrt(252.0)

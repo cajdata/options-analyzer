@@ -34,7 +34,7 @@ def print_scan(result: ScanResult) -> None:
     else:
         header = (
             f"{'#':>2}  {'Score':>5}  {'Contract':<24} {'DTE':>3}  {'Mid':>7}  {'Spread':>6}  "
-            f"{'Delta':>6}  {'IV':>6}  {'POP':>5}  {'B/E move':>8}  {'vs exp.':>7}  Earnings"
+            f"{'Delta':>6}  {'IV':>6}  {'POP':>5}  {'B/E move':>8}  {'vs exp.':>7}  {'R:R':>5}  {'Rating':<11}  Earnings"
         )
         print(header)
         print("-" * len(header))
@@ -42,10 +42,11 @@ def print_scan(result: ScanResult) -> None:
             ctx = result.underlyings[c.underlying]
             name = f"{c.underlying} {c.expiry:%b %d} {c.strike:g} {c.kind}"
             ratio = "-" if c.breakeven_vs_expected is None else f"{c.breakeven_vs_expected:.2f}x"
+            reward = f"{c.risk_reward.ratio:>5.2f}  {c.risk_reward.rating:<11}" if c.risk_reward else f"{'-':>5}  {'-':<11}"
             print(
                 f"{i:>2}  {c.score:>5.1f}  {name:<24} {c.dte:>3}  {c.mid:>7.2f}  {_pct(c.spread_pct):>6}  "
                 f"{c.delta:>+6.2f}  {_pct(c.iv):>6}  {_pct(c.pop):>5}  {_pct(c.breakeven_move_pct, True):>8}  "
-                f"{ratio:>7}  {_earnings(ctx, c)}"
+                f"{ratio:>7}  {reward}  {_earnings(ctx, c)}"
             )
 
     shown = {c.underlying for c in result.ideas}
@@ -66,7 +67,8 @@ def print_scan(result: ScanResult) -> None:
         print("\nNotes")
         for warning in result.warnings:
             print(f"  - {warning}")
-    print("\nRanked by fixed, visible rules. Not a forecast and not advice.")
+    print("\nR:R is average win over average loss, and the rating compares the price with the stock's")
+    print("own history. Ranked by fixed, visible rules. Not a forecast and not advice.")
 
 
 def main(argv: list[str] | None = None) -> int:

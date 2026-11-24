@@ -13,30 +13,49 @@ from app.models import Bar, EarningsEvent, EarningsStats, ImpliedMove, Reaction
 _MAX_GAP = timedelta(days=6)  # skip an event if the price history has a hole around it
 
 
-def reactions(events: list[EarningsEvent], bars: list[Bar]) -> list[Reaction]:
-    """Close-to-close move across each past report, newest first.
+def _window(event: EarningsEvent, days: list[date]) -> tuple[int, int] | None:
+    """Indexes of the last close before the report takes effect and the first close after.
 
     A report before the open moves the stock that same day; one after the close
-    moves it the next trading day. When the timing is unknown the move is
-    measured from the close before the report day to the close after it, which
-    covers both cases.
+    moves it the next trading day. When the timing is unknown the window runs
+    from the close before the report day to the close after it, which covers
+    both cases.
     """
+    if event.timing == "post":
+        before, after = bisect_right(days, event.day) - 1, bisect_right(days, event.day)
+    elif event.timing == "pre":
+        before, after = bisect_left(days, event.day) - 1, bisect_left(days, event.day)
+    else:
+        before, after = bisect_left(days, event.day) - 1, bisect_right(days, event.day)
+    if before < 0 or after >= len(days):
+        return None
+    if event.day - days[before] > _MAX_GAP or days[after] - event.day > _MAX_GAP:
+        return None
+    return before, after
+
+
+def reactions(events: list[EarningsEvent], bars: list[Bar]) -> list[Reaction]:
+    """Close-to-close move across each past report, newest first."""
     days = [b.day for b in bars]
     out: list[Reaction] = []
     for event in events:
-        if event.timing == "post":
-            before, after = bisect_right(days, event.day) - 1, bisect_right(days, event.day)
-        elif event.timing == "pre":
-            before, after = bisect_left(days, event.day) - 1, bisect_left(days, event.day)
-        else:
-            before, after = bisect_left(days, event.day) - 1, bisect_right(days, event.day)
-        if before < 0 or after >= len(bars):
+        window = _window(event, days)
+        if window is None:
             continue
-        if event.day - days[before] > _MAX_GAP or days[after] - event.day > _MAX_GAP:
-            continue
-        move = bars[after].close / bars[before].close - 1.0
+        move = bars[window[1]].close / bars[window[0]].close - 1.0
         out.append(Reaction(day=event.day, timing=event.timing, move_pct=move, surprise_pct=event.surprise_pct))
     return sorted(out, key=lambda r: r.day, reverse=True)
+
+
+def reaction_days(events: list[EarningsEvent], bars: list[Bar]) -> set[date]:
+    """Trading days whose return carries an earnings reaction."""
+    days = [b.day for b in bars]
+    out: set[date] = set()
+    for event in events:
+        window = _window(event, days)
+        if window is not None:
+            out.update(days[window[0] + 1 : window[1] + 1])
+    return out
 
 
 def summarize(moves: list[Reaction]) -> EarningsStats | None:

@@ -7,23 +7,21 @@ weight lives in LENSES below so it can be tuned in one place.
 
 from __future__ import annotations
 
-from app.models import ContractAnalysis, UnderlyingContext
+from app.models import ContractAnalysis
 
 # (zero, one) pairs: the value that scores 0 and the value that scores 1.
 LENSES: dict[str, dict] = {
     "buy": {  # long calls and long puts
         "weights": {"liquidity": 0.25, "breakeven": 0.25, "vol_value": 0.20, "decay": 0.15, "delta_fit": 0.15},
         "breakeven_vs_expected": (1.5, 0.0),  # breakeven closer than the expected move is better
-        "iv_vs_realized": (1.6, 0.9),  # cheaper volatility is better for a buyer
-        "implied_vs_past_earnings": (1.3, 0.7),
+        "iv_vs_history": (1.6, 0.9),  # cheaper volatility is better for a buyer
         "theta_pct_per_day": (0.04, 0.005),
         "delta_band": (0.30, 0.60),
     },
     "sell": {  # cash-secured puts and covered calls
         "weights": {"liquidity": 0.25, "probability": 0.25, "vol_value": 0.20, "yield": 0.15, "delta_fit": 0.15},
         "pop": (0.50, 0.90),
-        "iv_vs_realized": (0.9, 1.6),  # richer volatility is better for a seller
-        "implied_vs_past_earnings": (0.7, 1.3),
+        "iv_vs_history": (0.9, 1.6),  # richer volatility is better for a seller
         "annualized_yield": (0.0, 0.30),
         "delta_band": (0.15, 0.35),
     },
@@ -59,12 +57,15 @@ def _liquidity(c: ContractAnalysis) -> float:
     return spread * (0.6 + 0.4 * min(c.open_interest / OPEN_INTEREST_FULL, 1.0))
 
 
-def _vol_value(c: ContractAnalysis, ctx: UnderlyingContext, cfg: dict) -> float:
-    implied, stats = ctx.implied_move, ctx.earnings_stats
-    if c.spans_earnings and implied and implied.event_move_pct and stats and stats.mean_abs > 0:
-        return ramp(implied.event_move_pct / stats.mean_abs, *cfg["implied_vs_past_earnings"])
-    if ctx.realized_vol_20d:
-        return ramp(c.iv / ctx.realized_vol_20d, *cfg["iv_vs_realized"])
+def _vol_value(c: ContractAnalysis, cfg: dict) -> float:
+    """Implied volatility against what the stock's history implies for the same period.
+
+    `history_vol` blends ordinary realized volatility with past earnings moves
+    for any report the contract spans, so one comparison covers both cases. The
+    risk/reward rating is built on the same number, so the two cannot disagree.
+    """
+    if c.history_vol:
+        return ramp(c.iv / c.history_vol, *cfg["iv_vs_history"])
     return 0.5  # nothing to compare against
 
 
@@ -76,11 +77,11 @@ def _delta_fit(c: ContractAnalysis, band: tuple[float, float]) -> float:
     return ramp(distance, 0.20, 0.0)
 
 
-def score(c: ContractAnalysis, ctx: UnderlyingContext, lens: str) -> None:
+def score(c: ContractAnalysis, lens: str) -> None:
     cfg = LENSES[lens]
     parts = {
         "liquidity": _liquidity(c),
-        "vol_value": _vol_value(c, ctx, cfg),
+        "vol_value": _vol_value(c, cfg),
         "delta_fit": _delta_fit(c, cfg["delta_band"]),
     }
     if lens == "buy":

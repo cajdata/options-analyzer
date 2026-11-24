@@ -62,6 +62,8 @@ weeks and large moves today, and says why each one was picked.
 | POP | Probability of profit at expiry, for the buyer or the seller depending on the lens |
 | Time decay | Theta as a share of the option's price, per day |
 | Annualized yield | Premium over collateral (strike for a put, share price for a call), annualized |
+| Reward : risk | Average win divided by average loss at expiry, if the stock is as volatile as its own history |
+| Rating | Favorable, balanced or unfavorable: expected value beyond +10% or -10% of the premium on that same basis |
 
 **Adds earnings context** for each stock: the next report date (confirmed from the
 calendar, or estimated from the usual gap), the close-to-close move on each of the last
@@ -70,10 +72,22 @@ number takes the first expiration after the report and subtracts ordinary volati
 which comes from the last expiration before the report, else from the next expiration
 after it, else from recent realized volatility.
 
+**Rates risk and reward.** At the market's own prices an option's expected profit is
+about zero, so reward-to-risk is just the mirror image of the probability of profit: a
+bigger payoff always comes with lower odds. To say something more, the app prices each
+contract against the stock's own history instead: recent volatility with earnings days
+removed, plus past report-day moves for any report the contract spans. From that it
+shows the chance of profit, average win and loss, expected value, the most you can lose
+and the loss after a two-standard-deviation move against you. Options usually cost more
+than history suggests, which is what sellers are paid for carrying the risk of a large
+move, so a seller's favorable rating always sits next to those loss figures.
+
 **Ranks through a lens.** `buy` ranks long calls and puts; `sell` ranks cash-secured
 puts and covered calls. The score is a weighted sum of five components (liquidity,
-breakeven or probability, how volatility is priced, decay or yield, delta). Every
-weight and threshold is in `app/analysis/scoring.py`.
+breakeven or probability, how volatility is priced, decay or yield, delta). "How
+volatility is priced" uses the same history-based comparison as the rating, so the
+rating is shown beside the score, not added into it a second time. Every weight and
+threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/risk.py`.
 
 ## Limits worth knowing
 
@@ -84,6 +98,8 @@ weight and threshold is in `app/analysis/scoring.py`.
 - **Pricing math is Black-Scholes** with no dividends and a flat rate (`RISK_FREE_RATE`).
   US equity options are American, so deep in-the-money puts and calls just before a
   dividend are approximate.
+- **Risk and reward assumes history repeats** and takes no view on direction. It is a
+  comparison of price with past behavior, and past volatility is a rough guide at best.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
 - **The AI brief knows only the scan.** It has no news and no view of your account. It

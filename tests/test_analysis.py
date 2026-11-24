@@ -8,7 +8,7 @@ from app import pricing
 from app.analysis import contracts as metrics
 from app.analysis import earnings as em
 from app.analysis import scoring
-from app.models import Bar, ContractAnalysis, EarningsEvent, EarningsStats, ImpliedMove, OptionQuote, UnderlyingContext
+from app.models import Bar, ContractAnalysis, EarningsEvent, OptionQuote
 
 TODAY = date(2026, 11, 24)
 RATE = 0.04
@@ -23,11 +23,6 @@ def analyzed(**overrides) -> ContractAnalysis:
     for name, value in overrides.items():
         setattr(c, name, value)
     return c
-
-
-def context(**overrides) -> UnderlyingContext:
-    base = dict(symbol="XYZ", price=100.0, change_pct=0.0, realized_vol_20d=0.30, realized_vol_60d=0.30, atm_iv=0.30)
-    return UnderlyingContext(**{**base, **overrides})
 
 
 # -- Contract metrics ---------------------------------------------------------
@@ -217,8 +212,8 @@ def test_tradable_filters():
 
 @pytest.mark.parametrize("lens", ["buy", "sell"])
 def test_score_is_the_weighted_sum_of_its_components(lens):
-    c = analyzed(breakeven_vs_expected=0.6)
-    scoring.score(c, context(), lens)
+    c = analyzed(breakeven_vs_expected=0.6, history_vol=0.28)
+    scoring.score(c, lens)
     weights = scoring.LENSES[lens]["weights"]
     assert set(c.components) == set(weights)
     assert all(0.0 <= v <= 1.0 for v in c.components.values())
@@ -226,26 +221,19 @@ def test_score_is_the_weighted_sum_of_its_components(lens):
     assert c.pop == pytest.approx(c.pop_long if lens == "buy" else 1 - c.pop_long)
 
 
-def test_cheap_volatility_favors_buyers_and_rich_volatility_favors_sellers():
-    cheap, rich = analyzed(iv=0.25), analyzed(iv=0.50)
-    for c in (cheap, rich):
-        scoring.score(c, context(realized_vol_20d=0.30), "buy")
-    assert cheap.components["vol_value"] > rich.components["vol_value"]
-    for c in (cheap, rich):
-        scoring.score(c, context(realized_vol_20d=0.30), "sell")
-    assert cheap.components["vol_value"] < rich.components["vol_value"]
+def test_volatility_is_judged_against_the_stocks_own_history():
+    # Implied volatility is 30%. History says 40% (cheap), 30% (in line) or 15% (rich).
+    cheap, in_line, rich = (analyzed(history_vol=v) for v in (0.40, 0.30, 0.15))
+    for c in (cheap, in_line, rich):
+        scoring.score(c, "buy")
+    assert cheap.components["vol_value"] == 1.0 > in_line.components["vol_value"] > rich.components["vol_value"] == 0.0
+    for c in (cheap, in_line, rich):
+        scoring.score(c, "sell")
+    assert cheap.components["vol_value"] == 0.0 < in_line.components["vol_value"] < rich.components["vol_value"] == 1.0
 
-
-def test_earnings_pricing_replaces_the_volatility_comparison_when_the_contract_spans_the_report():
-    stats = EarningsStats(count=8, mean_abs=0.08, median_abs=0.07, max_abs=0.15, up=5, down=3)
-    underpriced = ImpliedMove(TODAY, 0.06, 0.04, 0.3, "realized volatility")  # half the usual move
-    ctx = context(earnings_stats=stats, implied_move=underpriced, realized_vol_20d=0.10)
-
-    spanning, not_spanning = analyzed(spans_earnings=True), analyzed(spans_earnings=False)
-    scoring.score(spanning, ctx, "buy")
-    scoring.score(not_spanning, ctx, "buy")
-    assert spanning.components["vol_value"] == 1.0  # options price half the historical move
-    assert not_spanning.components["vol_value"] == 0.0  # 30% implied against 10% realized
+    unknown = analyzed(history_vol=None)
+    scoring.score(unknown, "buy")
+    assert unknown.components["vol_value"] == 0.5  # nothing to compare against
 
 
 def test_rank_keeps_the_best_call_and_put_per_stock():

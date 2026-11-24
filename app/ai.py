@@ -32,6 +32,14 @@ the next earnings date, how the stock moved on past reports, and the size of mov
 the options are pricing for the next one. The "lens" says whether the scan ranks \
 contracts to buy or contracts to sell.
 
+Each contract also carries risk_reward_if_history_repeats: its payoff at expiry \
+if the stock is as volatile as its own past (recent volatility outside earnings, \
+plus past earnings moves for any report the contract spans), with no view on \
+direction. Read it as a comparison of the price with history, not a forecast. \
+Options usually cost more than history suggests, which is what sellers are paid \
+for carrying the risk of a large move, so weigh a seller's favorable rating \
+against the losses listed beside it.
+
 Choose up to five contracts from the scan that make the most coherent case under \
 that lens. A setup where several independent numbers agree is stronger than one \
 with a single standout metric. Returning fewer than five, or none, is the right \
@@ -86,7 +94,7 @@ def _r(value: float | None, digits: int = 4) -> float | None:
 
 
 def _contract(c: ContractAnalysis) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "contract": c.symbol,
         "underlying": c.underlying,
         "type": c.kind,
@@ -110,6 +118,21 @@ def _contract(c: ContractAnalysis) -> dict[str, Any]:
         "annualized_yield_if_sold": _r(c.annualized_yield),
         "expires_after_next_earnings": c.spans_earnings,
     }
+    if c.risk_reward:
+        r = c.risk_reward
+        out["risk_reward_if_history_repeats"] = {
+            "rating": r.rating,
+            "volatility_from_history": _r(r.history_vol),
+            "chance_of_profit": _r(r.win_prob, 3),
+            "average_win_usd": round(r.avg_win),
+            "average_loss_usd": round(r.avg_loss),
+            "reward_to_risk": _r(r.ratio, 2),
+            "expected_value_usd": round(r.expected_value),
+            "expected_value_pct_of_premium": _r(r.edge_pct, 3),
+            "max_loss_usd": "no cap on the option alone" if r.max_loss is None else round(r.max_loss),
+            "loss_after_2sd_adverse_move_usd": round(r.bad_case_loss),
+        }
+    return out
 
 
 def _underlying(u: UnderlyingContext) -> dict[str, Any]:

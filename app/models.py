@@ -88,6 +88,25 @@ class ImpliedMove:
     baseline_source: str  # where ordinary volatility was taken from, as a phrase
 
 
+@dataclass(frozen=True)
+class RiskReward:
+    """Payoff at expiry if the stock is as volatile as its own history.
+
+    Dollar figures are per contract of 100 shares.
+    """
+
+    history_vol: float
+    win_prob: float
+    avg_win: float
+    avg_loss: float
+    ratio: float  # average win divided by average loss
+    expected_value: float
+    edge_pct: float  # expected value as a share of the premium
+    max_loss: float | None  # None: no cap on the option alone (a covered call is backed by shares)
+    bad_case_loss: float  # loss after a two-standard-deviation move against the position
+    rating: str  # "favorable", "balanced" or "unfavorable"
+
+
 @dataclass
 class ContractAnalysis:
     symbol: str
@@ -118,6 +137,8 @@ class ContractAnalysis:
     theta_pct_per_day: float
     annualized_yield: float
     spans_earnings: bool = False
+    history_vol: float | None = None  # volatility over the contract's life if history repeats
+    risk_reward: RiskReward | None = None
     lens: str = ""
     pop: float | None = None
     score: float | None = None
