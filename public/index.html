@@ -30,6 +30,7 @@
   label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
   input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
   input[type=number] { width: 72px; }
+  #budget { width: 120px; }
   #symbols { width: 260px; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
@@ -101,6 +102,9 @@
   </label>
   <label>Min days <input id="dte_min" type="number" min="0" max="730" value="7"></label>
   <label>Max days <input id="dte_max" type="number" min="1" max="730" value="60"></label>
+  <label title="Buying: the ask price times 100. Selling: the collateral, meaning the strike in cash for a put or 100 shares for a call.">Budget per contract ($)
+    <input id="budget" type="number" min="1" step="1" placeholder="No limit">
+  </label>
   <button class="primary" id="scan" type="submit">Scan</button>
   <span id="busy" class="sub" role="status"></span>
 </form>
@@ -194,14 +198,17 @@ function earningsChips(ctx, idea) {
 }
 
 function renderResults() {
+  const limit = !scan.budget ? "" : scan.lens === "buy"
+    ? " for " + dollars(scan.budget) + " or less"
+    : " needing " + dollars(scan.budget) + " or less in collateral";
   $("results-title").textContent = scan.ideas.length
-    ? scan.ideas.length + " contracts to " + scan.lens + ", best first"
+    ? scan.ideas.length + " contracts to " + scan.lens + limit + ", best first"
     : "Results";
   if (!scan.ideas.length) {
     $("results").replaceChildren(el("p", { class: "empty" }, "No contracts passed the filters. Try a wider range of days or different symbols."));
     return;
   }
-  const head = ["#", "Contract", "Score", "Mid", "Spread", "Delta", "IV", "POP", "Breakeven", "Reward : risk", "Context"];
+  const head = ["#", "Contract", "Score", "Price", "Spread", "Delta", "IV", "POP", "Breakeven", "Reward : risk", "Context"];
   const rows = scan.ideas.map((idea, i) => {
     const ctx = scan.underlyings[idea.underlying];
     const row = el("tr", { tabindex: "0", onclick: () => select(idea), onkeydown: (e) => { if (e.key === "Enter") select(idea); } },
@@ -209,7 +216,7 @@ function renderResults() {
       el("td", {}, el("strong", {}, idea.underlying), " ",
         el("span", { class: "sub" }, shortDate(idea.expiry).replace(/, \d{4}$/, "") + " · " + idea.strike + " " + idea.kind + " · " + idea.dte + "d")),
       el("td", {}, el("span", { class: "score" }, num(idea.score, 1), el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + idea.score + "%;display:block" })))),
-      el("td", {}, money(idea.mid)),
+      el("td", {}, money(idea.mid), el("div", { class: "sub" }, dollars(idea.outlay) + (scan.lens === "buy" ? " cost" : " held"))),
       el("td", {}, pct(idea.spread_pct)),
       el("td", {}, num(idea.delta)),
       el("td", {}, pct(idea.iv)),
@@ -217,7 +224,9 @@ function renderResults() {
       el("td", {}, signedPct(idea.breakeven_move_pct),
         idea.breakeven_vs_expected === null ? null : el("div", { class: "sub" }, num(idea.breakeven_vs_expected) + "× exp. move")),
       el("td", {}, idea.risk_reward
-        ? [num(idea.risk_reward.ratio, 1) + " : 1", el("div", { class: "sub rating " + idea.risk_reward.rating }, idea.risk_reward.rating)]
+        ? [num(idea.risk_reward.ratio, 1) + " : 1",
+          el("div", { class: "sub rating " + idea.risk_reward.rating }, idea.risk_reward.rating),
+          idea.risk_reward.shape ? el("div", {}, el("span", { class: "chip hot" }, idea.risk_reward.shape)) : null]
         : "–"),
       el("td", {}, earningsChips(ctx, idea), ctx.reasons.filter((r) => !r.startsWith("earnings in")).map((r) => el("span", { class: "chip" }, r))),
     );
@@ -237,12 +246,18 @@ function riskBlock(idea) {
     return [el("h3", {}, "Risk and reward"),
       el("p", { class: "sub" }, "Not rated: there is not enough price or earnings history for this stock.")];
   }
-  const caveat = scan.lens === "sell"
+  const shape = rr.shape === "long shot"
+    ? " This is a long shot: the market puts its chance of profit below one in five, so the odds matter far more than the rating."
+    : rr.shape === "tail risk"
+      ? " This wins small most of the time and occasionally loses several times as much."
+      : "";
+  const caveat = shape + (scan.lens === "sell"
     ? " Options usually cost more than history suggests. That gap is what a seller is paid for carrying the risk of a large move, so read the rating next to the losses above."
       + (rr.max_loss === null ? " In a covered call, a loss on the option is offset by the shares you hold." : "")
-    : " Options usually cost more than history suggests, so most contracts look expensive to a buyer by this measure.";
+    : " Options usually cost more than history suggests, so most contracts look expensive to a buyer by this measure.");
   return [
-    el("h3", {}, "Risk and reward if history repeats · ", el("span", { class: "rating " + rr.rating }, rr.rating)),
+    el("h3", {}, "Risk and reward if history repeats · ", el("span", { class: "rating " + rr.rating }, rr.rating),
+      rr.shape ? " · " + rr.shape : ""),
     facts([
       ["Chance of profit", pct(rr.win_prob, 0)],
       ["Average win / loss per contract", dollars(rr.avg_win) + " / " + dollars(rr.avg_loss)],
@@ -273,6 +288,8 @@ function select(idea) {
     el("h3", {}, "Contract"),
     facts([
       ["Bid × ask", money(idea.bid) + " × " + money(idea.ask)],
+      [scan.lens === "buy" ? "Cost of one contract (ask × 100)"
+        : idea.kind === "put" ? "Cash held as collateral (strike × 100)" : "Shares held as collateral (100 shares)", dollars(idea.outlay)],
       ["Breakeven at expiry", money(idea.breakeven) + " (" + signedPct(idea.breakeven_move_pct) + ")"],
       ["Expected move to expiry (1 s.d.)", "±" + pct(idea.expected_move_pct)],
       ["Chance of profit, market-implied", pct(idea.pop, 0)],
@@ -373,6 +390,7 @@ $("controls").addEventListener("submit", async (event) => {
       kind: $("kind").value,
       dte_min: Number($("dte_min").value),
       dte_max: Number($("dte_max").value),
+      budget: $("budget").value ? Number($("budget").value) : null,
     });
     showNotices(scan.warnings);
     renderResults();

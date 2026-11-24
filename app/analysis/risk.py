@@ -23,6 +23,10 @@ from app.models import ContractAnalysis, EarningsEvent, RiskReward
 MIN_REPORTS = 4  # past earnings moves needed before they are used to size the next one
 RATING_EDGE = 0.10  # expected value beyond +/-10% of the premium is favorable / unfavorable
 BAD_CASE_SIGMAS = 2.0
+# Lopsided payoffs get a label, because the rating alone hides them. A cheap
+# far-out contract can have positive expected value and still lose nearly every
+# time; its mirror image for a seller wins often and occasionally loses big.
+LOPSIDED = 0.20
 SHARES = 100
 
 
@@ -83,6 +87,9 @@ def assess(c: ContractAnalysis, spot: float, rate: float, lens: str) -> RiskRewa
     avg_win, avg_loss = gains / win_prob, losses / (1.0 - win_prob)
     edge = value / c.mid
     rating = "favorable" if edge >= RATING_EDGE else "unfavorable" if edge <= -RATING_EDGE else "balanced"
+    # Judged on the market's own odds, the probability shown beside every contract.
+    odds = c.pop_long if lens == "buy" else 1.0 - c.pop_long
+    shape = "long shot" if odds < LOPSIDED else "tail risk" if odds > 1.0 - LOPSIDED else None
     return RiskReward(
         history_vol=vol,
         win_prob=win_prob,
@@ -94,4 +101,5 @@ def assess(c: ContractAnalysis, spot: float, rate: float, lens: str) -> RiskRewa
         max_loss=None if max_loss is None else max_loss * SHARES,
         bad_case_loss=max(bad_case, 0.0) * SHARES,
         rating=rating,
+        shape=shape,
     )

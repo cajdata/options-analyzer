@@ -105,6 +105,10 @@ class RiskReward:
     max_loss: float | None  # None: no cap on the option alone (a covered call is backed by shares)
     bad_case_loss: float  # loss after a two-standard-deviation move against the position
     rating: str  # "favorable", "balanced" or "unfavorable"
+    # Judged on the market-implied odds. "long shot": profits less than one time in
+    # five. "tail risk": profits more than four times in five, with an occasional
+    # much larger loss. None otherwise.
+    shape: str | None = None
 
 
 @dataclass
@@ -139,6 +143,7 @@ class ContractAnalysis:
     spans_earnings: bool = False
     history_vol: float | None = None  # volatility over the contract's life if history repeats
     risk_reward: RiskReward | None = None
+    outlay: float | None = None  # cash needed to open one contract under the scan's lens
     lens: str = ""
     pop: float | None = None
     score: float | None = None
@@ -173,3 +178,4 @@ class ScanResult:
     ideas: list[ContractAnalysis]
     underlyings: dict[str, UnderlyingContext]
     warnings: list[str] = field(default_factory=list)
+    budget: float | None = None  # per-contract limit the scan was run with

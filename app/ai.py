@@ -38,7 +38,10 @@ plus past earnings moves for any report the contract spans), with no view on \
 direction. Read it as a comparison of the price with history, not a forecast. \
 Options usually cost more than history suggests, which is what sellers are paid \
 for carrying the risk of a large move, so weigh a seller's favorable rating \
-against the losses listed beside it.
+against the losses listed beside it. A payoff_shape of "long shot" means the \
+position profits less than one time in five, and "tail risk" means it profits \
+more than four times in five with an occasional much larger loss; say so \
+plainly whenever you write up either kind.
 
 Choose up to five contracts from the scan that make the most coherent case under \
 that lens. A setup where several independent numbers agree is stronger than one \
@@ -104,6 +107,7 @@ def _contract(c: ContractAnalysis) -> dict[str, Any]:
         "score": c.score,
         "score_components": c.components,
         "mid": _r(c.mid, 2),
+        "cash_to_open_one_contract_usd": None if c.outlay is None else round(c.outlay),
         "spread_pct_of_mid": _r(c.spread_pct),
         "open_interest": c.open_interest,
         "volume": c.volume,
@@ -122,6 +126,7 @@ def _contract(c: ContractAnalysis) -> dict[str, Any]:
         r = c.risk_reward
         out["risk_reward_if_history_repeats"] = {
             "rating": r.rating,
+            "payoff_shape": r.shape or "ordinary",
             "volatility_from_history": _r(r.history_vol),
             "chance_of_profit": _r(r.win_prob, 3),
             "average_win_usd": round(r.avg_win),
@@ -180,6 +185,7 @@ def scan_payload(result: ScanResult) -> dict[str, Any]:
     symbols = {c.underlying for c in result.ideas}
     return {
         "lens": result.lens,
+        "budget_per_contract_usd": result.budget,
         "data": "synthetic demo data, not real markets" if result.mode == "demo" else "live market data",
         "options_quote_feed": result.options_feed,
         "generated_at": result.generated_at.isoformat(timespec="seconds"),

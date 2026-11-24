@@ -13,6 +13,9 @@ from app.models import ContractAnalysis, ScanResult, UnderlyingContext
 from app.scanner import ConfigError, ScanRequest, build_scanner
 
 
+_RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
+
+
 def _pct(value: float | None, signed: bool = False) -> str:
     if value is None:
         return "-"
@@ -28,13 +31,14 @@ def _earnings(ctx: UnderlyingContext, c: ContractAnalysis) -> str:
 
 def print_scan(result: ScanResult) -> None:
     feed = "SYNTHETIC DEMO DATA" if result.mode == "demo" else f"Alpaca, {result.options_feed} option quotes"
-    print(f"\nLens: {result.lens} premium   Data: {feed}\n")
+    budget = f"   Budget: ${result.budget:,.0f} per contract" if result.budget else ""
+    print(f"\nLens: {result.lens} premium   Data: {feed}{budget}\n")
     if not result.ideas:
         print("No contracts passed the filters.")
     else:
         header = (
-            f"{'#':>2}  {'Score':>5}  {'Contract':<24} {'DTE':>3}  {'Mid':>7}  {'Spread':>6}  "
-            f"{'Delta':>6}  {'IV':>6}  {'POP':>5}  {'B/E move':>8}  {'vs exp.':>7}  {'R:R':>5}  {'Rating':<11}  Earnings"
+            f"{'#':>2}  {'Score':>5}  {'Contract':<24} {'DTE':>3}  {'Mid':>7}  {'Outlay':>8}  {'Spread':>6}  "
+            f"{'Delta':>6}  {'IV':>6}  {'POP':>5}  {'B/E move':>8}  {'vs exp.':>7}  {'R:R':>5}  {'Rating':<{_RATING}}  Earnings"
         )
         print(header)
         print("-" * len(header))
@@ -42,9 +46,13 @@ def print_scan(result: ScanResult) -> None:
             ctx = result.underlyings[c.underlying]
             name = f"{c.underlying} {c.expiry:%b %d} {c.strike:g} {c.kind}"
             ratio = "-" if c.breakeven_vs_expected is None else f"{c.breakeven_vs_expected:.2f}x"
-            reward = f"{c.risk_reward.ratio:>5.2f}  {c.risk_reward.rating:<11}" if c.risk_reward else f"{'-':>5}  {'-':<11}"
+            reward = f"{'-':>5}  {'-':<{_RATING}}"
+            if c.risk_reward:
+                label = c.risk_reward.rating + (f", {c.risk_reward.shape}" if c.risk_reward.shape else "")
+                reward = f"{c.risk_reward.ratio:>5.2f}  {label:<{_RATING}}"
             print(
-                f"{i:>2}  {c.score:>5.1f}  {name:<24} {c.dte:>3}  {c.mid:>7.2f}  {_pct(c.spread_pct):>6}  "
+                f"{i:>2}  {c.score:>5.1f}  {name:<24} {c.dte:>3}  {c.mid:>7.2f}  {f'${c.outlay:,.0f}':>8}  "
+                f"{_pct(c.spread_pct):>6}  "
                 f"{c.delta:>+6.2f}  {_pct(c.iv):>6}  {_pct(c.pop):>5}  {_pct(c.breakeven_move_pct, True):>8}  "
                 f"{ratio:>7}  {reward}  {_earnings(ctx, c)}"
             )
@@ -67,7 +75,8 @@ def print_scan(result: ScanResult) -> None:
         print("\nNotes")
         for warning in result.warnings:
             print(f"  - {warning}")
-    print("\nR:R is average win over average loss, and the rating compares the price with the stock's")
+    print("\nOutlay is the cash to open one contract: the ask x 100 to buy, or the collateral to sell.")
+    print("R:R is average win over average loss, and the rating compares the price with the stock's")
     print("own history. Ranked by fixed, visible rules. Not a forecast and not advice.")
 
 
@@ -82,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument("--dte-min", type=int, default=7)
     scan.add_argument("--dte-max", type=int, default=60)
     scan.add_argument("--top", type=int, default=20)
+    scan.add_argument("--budget", type=float, help="most cash to put into one contract, in dollars")
     scan.add_argument("--brief", action="store_true", help="add an AI write-up (uses the Claude API)")
     scan.add_argument("--json", action="store_true", help="print the full result as JSON")
     scan.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
@@ -114,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         dte_min=args.dte_min,
         dte_max=args.dte_max,
         top_n=args.top,
+        budget=args.budget,
     )
     result = scanner.scan(request)
     if args.json:

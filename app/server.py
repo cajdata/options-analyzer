@@ -26,6 +26,7 @@ class ScanBody(BaseModel):
     dte_min: int = Field(7, ge=0, le=730)
     dte_max: int = Field(60, ge=1, le=730)
     top_n: int = Field(20, ge=1, le=100)
+    budget: float | None = Field(None, gt=0, le=10_000_000)
 
     @field_validator("symbols")
     @classmethod
@@ -77,6 +78,7 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             dte_min=body.dte_min,
             dte_max=body.dte_max,
             top_n=body.top_n,
+            budget=body.budget,
         )
         try:
             result = scanner.scan(request)

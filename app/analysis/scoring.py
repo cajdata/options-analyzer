@@ -35,6 +35,20 @@ MAX_SPREAD_PCT = 0.50
 DELTA_LIMITS = (0.05, 0.95)
 
 
+SHARES = 100
+
+
+def outlay(c: ContractAnalysis, lens: str, spot: float) -> float:
+    """Cash needed to open one contract.
+
+    A buyer pays the ask. A seller sets aside collateral: the strike in cash for
+    a cash-secured put, or 100 shares for a covered call.
+    """
+    if lens == "buy":
+        return c.ask * SHARES
+    return (c.strike if c.kind == "put" else spot) * SHARES
+
+
 def ramp(value: float, zero: float, one: float) -> float:
     """Linear 0-to-1 scale between two anchors, clamped; works in either direction."""
     if one == zero:

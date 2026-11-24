@@ -40,6 +40,7 @@ earnings dates are made up.
 .venv\Scripts\python.exe -m app scan                      # discover candidates
 .venv\Scripts\python.exe -m app scan AAPL NVDA            # specific symbols
 .venv\Scripts\python.exe -m app scan --lens sell --type put --dte-min 20 --dte-max 45
+.venv\Scripts\python.exe -m app scan --budget 100         # only contracts that cost $100 or less
 .venv\Scripts\python.exe -m app scan --brief              # add the AI write-up
 ```
 
@@ -56,6 +57,7 @@ weeks and large moves today, and says why each one was picked.
 
 | Number | Meaning |
 |---|---|
+| Outlay | Cash to open one contract: the ask x 100 to buy; to sell, the strike x 100 for a put or 100 shares for a call |
 | Spread | Bid-ask spread as a share of the mid price |
 | Breakeven | Stock move needed at expiry for the buyer to break even |
 | vs exp. move | Breakeven distance divided by the one-standard-deviation move the options imply by expiry |
@@ -64,6 +66,7 @@ weeks and large moves today, and says why each one was picked.
 | Annualized yield | Premium over collateral (strike for a put, share price for a call), annualized |
 | Reward : risk | Average win divided by average loss at expiry, if the stock is as volatile as its own history |
 | Rating | Favorable, balanced or unfavorable: expected value beyond +10% or -10% of the premium on that same basis |
+| Long shot / tail risk | Label for lopsided payoffs, on the market's own odds: profits less than one time in five, or more than four in five with a rare much larger loss |
 
 **Adds earnings context** for each stock: the next report date (confirmed from the
 calendar, or estimated from the usual gap), the close-to-close move on each of the last
@@ -71,6 +74,11 @@ twelve reports, and the size of move the options price for the next one. That la
 number takes the first expiration after the report and subtracts ordinary volatility,
 which comes from the last expiration before the report, else from the next expiration
 after it, else from recent realized volatility.
+
+**Applies a budget, if you set one.** Only contracts whose outlay is within the budget
+are ranked, and discovery leans toward lower-priced stocks, where contracts in that range
+sit closer to the money. A small budget on an expensive stock leaves only contracts far
+from the current price; their low chance of profit shows in the numbers beside them.
 
 **Rates risk and reward.** At the market's own prices an option's expected profit is
 about zero, so reward-to-risk is just the mirror image of the probability of profit: a

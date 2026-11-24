@@ -301,3 +301,62 @@ def test_risk_reward_reaches_the_api_the_brief_and_the_command_line(client, disc
     out = capsys.readouterr().out
     assert "R:R" in out and "Rating" in out
     assert re.search(r"\bfavorable\b", out) and "unfavorable" not in out
+
+
+# -- Budget -----------------------------------------------------------------------
+
+
+def test_budget_keeps_only_contracts_a_buyer_can_afford(discovery):
+    result = demo_scanner().scan(ScanRequest(budget=100))
+    assert result.budget == 100 and result.ideas
+    for c in result.ideas:
+        assert c.outlay == pytest.approx(c.ask * 100) and c.outlay <= 100
+    assert max(c.outlay for c in discovery.ideas) > 1000  # the same scan without a budget is far pricier
+    assert all(c.outlay == pytest.approx(c.ask * 100) for c in discovery.ideas)
+    # Cheap contracts sit far from the money, and the scan says so.
+    assert any(c.risk_reward.shape == "long shot" for c in result.ideas)
+    assert max(c.score for c in result.ideas) < max(c.score for c in discovery.ideas)
+
+
+def test_budget_for_a_seller_is_the_collateral():
+    puts = demo_scanner().scan(ScanRequest(lens="sell", kind="put", budget=3000))
+    assert puts.ideas and {c.underlying for c in puts.ideas} == {"EMBR"}  # the only stock under $30
+    assert all(c.outlay == pytest.approx(c.strike * 100) for c in puts.ideas)
+    assert all(c.outlay <= 3000 for c in puts.ideas)
+
+    calls = demo_scanner().scan(ScanRequest(symbols=["EMBR"], lens="sell", kind="call", budget=3000))
+    assert calls.ideas and all(c.outlay == pytest.approx(27.80 * 100) for c in calls.ideas)  # 100 shares
+
+
+def test_a_budget_nothing_fits_says_what_the_cheapest_contract_costs():
+    result = demo_scanner().scan(ScanRequest(budget=5))
+    assert result.ideas == []
+    note = next(w for w in result.warnings if w.startswith("Nothing fits a $5 budget."))
+    assert "The cheapest contract that passed the other filters needs $" in note
+
+
+def test_discovery_under_a_budget_leans_toward_cheaper_stocks():
+    unlimited = demo_scanner().scan(ScanRequest(max_symbols=2))
+    assert "EMBR" not in unlimited.underlyings
+    limited = demo_scanner().scan(ScanRequest(max_symbols=2, budget=60))
+    assert "EMBR" in limited.underlyings  # at $27.80 it is the only stock with near-the-money contracts under $60
+
+
+def test_budget_reaches_the_api_the_brief_and_the_command_line(client, capsys):
+    from app.__main__ import main
+
+    body = client.post("/api/scan", json={"budget": 100}).json()
+    assert body["budget"] == 100 and body["ideas"] and all(i["outlay"] <= 100 for i in body["ideas"])
+    for bad in (0, -50, "cheap"):
+        assert client.post("/api/scan", json={"budget": bad}).status_code == 422
+
+    result = demo_scanner().scan(ScanRequest(budget=100))
+    payload = ai.scan_payload(result)
+    assert payload["budget_per_contract_usd"] == 100
+    first = payload["ranked_contracts"][0]
+    assert first["cash_to_open_one_contract_usd"] <= 100
+    assert first["risk_reward_if_history_repeats"]["payoff_shape"] in {"ordinary", "long shot", "tail risk"}
+
+    assert main(["scan", "--demo", "--budget", "100", "--top", "5"]) == 0
+    out = capsys.readouterr().out
+    assert "Budget: $100 per contract" in out and "Outlay" in out and "long shot" in out

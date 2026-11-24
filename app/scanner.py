@@ -22,6 +22,10 @@ ET = ZoneInfo("America/New_York")
 HISTORY_DAYS = 1200  # a little over three years: twelve earnings reports
 MAX_REPORTS = 12
 MIN_PRICE = 5.0  # discovery skips stocks below this
+# Rule of thumb for discovery under a budget: a one-month at-the-money option costs
+# about 4% of the share price, and out-of-the-money ones down to about 40% of that.
+ATM_MONTH_COST = 0.04
+BUDGET_REACH = 2.5
 
 
 class ConfigError(RuntimeError):
@@ -38,6 +42,9 @@ class ScanRequest:
     strike_window: float = 0.15  # strikes within this share of the stock price
     max_symbols: int = 20
     top_n: int = 20
+    # Most cash to put into one contract: the ask x 100 for a buyer, the collateral
+    # for a seller. None means no limit.
+    budget: float | None = None
     # Calls and puts kept per stock. None: one of each when discovering (a varied
     # list), five of each when specific symbols were asked for (depth).
     per_side: int | None = None
@@ -73,7 +80,7 @@ class Scanner:
         selected = self._select(req, reasons, quotes, calendar, today)
         bars = self.market.daily_bars(selected, today - timedelta(days=HISTORY_DAYS)) if selected else {}
 
-        def analyze(symbol: str) -> tuple[UnderlyingContext, list[ContractAnalysis]] | str:
+        def analyze(symbol: str) -> tuple[UnderlyingContext, list[ContractAnalysis], float | None] | str:
             try:
                 return self._analyze(symbol, quotes[symbol], bars.get(symbol, []), reasons[symbol], req, today)
             except Exception as err:  # one bad symbol must not sink the scan
@@ -81,14 +88,17 @@ class Scanner:
 
         underlyings: dict[str, UnderlyingContext] = {}
         scored: list[ContractAnalysis] = []
+        cheapest: tuple[float, str] | None = None  # least outlay seen, before the budget was applied
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(analyze, selected):
                 if isinstance(outcome, str):
                     warnings.append(outcome)
                     continue
-                ctx, found = outcome
+                ctx, found, least = outcome
                 underlyings[ctx.symbol] = ctx
                 scored.extend(found)
+                if least is not None and (cheapest is None or least < cheapest[0]):
+                    cheapest = (least, ctx.symbol)
                 if ctx.contracts_scanned == 0:
                     warnings.append(f"{ctx.symbol}: no two-sided option quotes in range.")
 
@@ -97,15 +107,23 @@ class Scanner:
         warnings.extend(dict.fromkeys(self.market.notes))
         self.market.notes.clear()
 
+        ideas = scoring.rank(scored, req.per_side or (5 if req.symbols else 1), req.top_n)
+        if req.budget is not None and not ideas:
+            note = f"Nothing fits a ${req.budget:,.0f} budget."
+            if cheapest:
+                note += f" The cheapest contract that passed the other filters needs ${cheapest[0]:,.0f} ({cheapest[1]})."
+            warnings.append(note)
+
         return ScanResult(
             id=uuid.uuid4().hex[:12],
             generated_at=datetime.now(timezone.utc),
             mode=self.market.mode,
             options_feed=self.market.options_feed,
             lens=req.lens,
-            ideas=scoring.rank(scored, req.per_side or (5 if req.symbols else 1), req.top_n),
+            ideas=ideas,
             underlyings=underlyings,
             warnings=warnings,
+            budget=req.budget,
         )
 
     # -- Choosing symbols ---------------------------------------------------
@@ -142,8 +160,15 @@ class Scanner:
             quote = quotes.get(symbol)
             if quote is None or quote.price < MIN_PRICE:
                 continue
+            if req.budget is not None and req.lens == "sell":
+                if quote.price * (1 - req.strike_window) * scoring.SHARES > req.budget:
+                    continue  # even the lowest strike in range needs more collateral than the budget
             points = 100.0 if "watchlist" in why else 0.0
             points += sum(1.0 for label in why if label != "watchlist")
+            if req.budget is not None and req.lens == "buy":
+                # Lean toward stocks whose near-the-money contracts are within reach.
+                if quote.price * ATM_MONTH_COST * scoring.SHARES <= req.budget * BUDGET_REACH:
+                    points += 3.0
             listed = calendar.get(symbol)
             if listed and 0 <= (listed.day - today).days <= 21:
                 points += 3.0
@@ -159,7 +184,7 @@ class Scanner:
 
     def _analyze(
         self, symbol: str, quote: StockQuote, bars: list[Bar], reasons: list[str], req: ScanRequest, today: date
-    ) -> tuple[UnderlyingContext, list[ContractAnalysis]]:
+    ) -> tuple[UnderlyingContext, list[ContractAnalysis], float | None]:
         spot = quote.price
         window = dict(
             expiry_from=today + timedelta(days=req.dte_min),
@@ -220,9 +245,14 @@ class Scanner:
 
         wanted = [c for c in analyzed if scoring.tradable(c) and req.kind in ("both", c.kind)]
         for c in wanted:
+            c.outlay = scoring.outlay(c, req.lens, spot)
+        least = min((c.outlay for c in wanted), default=None)
+        if req.budget is not None:
+            wanted = [c for c in wanted if c.outlay <= req.budget]
+        for c in wanted:
             scoring.score(c, req.lens)
             c.risk_reward = risk.assess(c, spot, rate, req.lens)
-        return ctx, wanted
+        return ctx, wanted, least
 
 
 def build_scanner(settings: Settings, demo: bool = False) -> Scanner:

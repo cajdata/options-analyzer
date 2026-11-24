@@ -168,3 +168,17 @@ def test_worst_cases():
     short_call = risk.assess(call, SPOT, RATE, "sell")
     assert short_call.max_loss is None  # uncapped on its own; a covered call is backed by shares
     assert short_call.bad_case_loss == pytest.approx((SPOT * math.exp(sigma_move) - 105.0 - call.mid) * 100)
+
+
+def test_lopsided_payoffs_are_labelled():
+    far_call = contract("call", 118.0, days=20)  # needs a move the stock rarely makes
+    buyer, seller = risk.assess(far_call, SPOT, RATE, "buy"), risk.assess(far_call, SPOT, RATE, "sell")
+    assert buyer.win_prob < 0.20 and buyer.shape == "long shot"
+    assert seller.win_prob > 0.80 and seller.shape == "tail risk"
+    assert buyer.ratio > 5 and seller.ratio < 0.2  # big wins that rarely come; small wins with a rare big loss
+    assert risk.assess(contract("call", 100.0), SPOT, RATE, "buy").shape is None
+
+    # History above the price makes a long shot "favorable" on expected value; the label keeps it honest.
+    cheap_long_shot = contract("call", 118.0, days=20, iv=0.30, history_vol=0.36)
+    rated = risk.assess(cheap_long_shot, SPOT, RATE, "buy")
+    assert (rated.rating, rated.shape) == ("favorable", "long shot")
