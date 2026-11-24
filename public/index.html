@@ -1,53 +1,373 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="UTF-8">
-    <title>Options Analyzer</title>
-    <style>
-      body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
-      .result { background: #f9f9f9; padding: 10px; margin-top: 20px; }
-      label { display: block; margin-bottom: 5px; }
-    </style>
-  </head>
-  <body>
-    <h1>Upload an Options Screenshot</h1>
-    <label for="screenshot">Choose an image:</label>
-    <input type="file" id="screenshot" accept="image/*" />
-    <button onclick="analyze()">Analyze</button>
-    
-    <div class="result" id="result"></div>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Options Analyzer</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #16202b; --muted: #5b6876; --line: #dfe4ea;
+    --accent: #1f5fbf; --accent-soft: #e4edfb; --good: #1c7c4a; --bad: #b3372b; --warn-bg: #fff6dd; --warn-line: #e6c764;
+    --bar: #c9d6ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10151b; --panel: #18202a; --text: #e6ebf1; --muted: #93a1b0; --line: #2a3542;
+      --accent: #6fa5f5; --accent-soft: #1d2c44; --good: #58c48a; --bad: #f08477; --warn-bg: #2d2714; --warn-line: #6d5c1f;
+      --bar: #33465f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header, main, footer, .controls, .notice, #brief { max-width: 1280px; margin: 0 auto; padding: 0 16px; }
+  header { display: flex; align-items: baseline; gap: 12px; padding-top: 20px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 6px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); }
+  .badge.demo { background: var(--warn-bg); color: var(--text); border: 1px solid var(--warn-line); }
+  .controls { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin-top: 16px; }
+  label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
+  input[type=number] { width: 72px; }
+  #symbols { width: 260px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .55; cursor: default; }
+  .notice { margin-top: 14px; }
+  .notice p { margin: 0 0 6px; padding: 8px 12px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; margin-top: 16px; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 6px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  th:nth-child(2), td:nth-child(2), th:last-child, td:last-child { text-align: left; }
+  #results td:last-child { white-space: normal; min-width: 120px; }
+  #results .chip { white-space: nowrap; margin-bottom: 2px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
+  tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .score { display: inline-grid; grid-template-columns: 34px 40px; gap: 6px; align-items: center; }
+  .track { height: 6px; border-radius: 3px; background: var(--bar); overflow: hidden; }
+  .fill { height: 100%; background: var(--accent); }
+  .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); margin-right: 4px; color: var(--muted); }
+  .chip.hot { border-color: var(--warn-line); background: var(--warn-bg); color: var(--text); }
+  .up { color: var(--good); } .down { color: var(--bad); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .component { display: grid; grid-template-columns: 1fr 90px 34px; gap: 8px; align-items: center; margin: 5px 0; }
+  .component span:last-child { text-align: right; color: var(--muted); font-size: 12px; }
+  .compare { display: grid; grid-template-columns: 110px 1fr 48px; gap: 8px; align-items: center; margin: 5px 0; }
+  .compare .track { height: 10px; border-radius: 5px; }
+  .history td, .history th { padding: 4px 6px; font-size: 13px; }
+  .history th:nth-child(2), .history td:nth-child(2) { text-align: right; }
+  .history th:first-child, .history td:first-child { text-align: left; }
+  #brief { margin-top: 16px; }
+  .pick { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+  .pick p { margin: 4px 0; }
+  .empty { color: var(--muted); padding: 24px 4px; }
+  .error { color: var(--bad); }
+  footer { color: var(--muted); font-size: 12px; padding-top: 18px; padding-bottom: 28px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Options Analyzer</h1>
+  <span id="mode" class="badge">loading</span>
+  <span id="sources" class="sub"></span>
+</header>
 
-    <script>
-      async function analyze() {
-        const fileInput = document.getElementById('screenshot');
-        if (!fileInput.files.length) {
-          alert("Please select an image file first.");
-          return;
-        }
+<form class="controls" id="controls">
+  <label>Symbols
+    <input id="symbols" placeholder="Leave blank to discover" autocomplete="off" spellcheck="false">
+  </label>
+  <label>Rank contracts to
+    <select id="lens">
+      <option value="buy">Buy (long calls and puts)</option>
+      <option value="sell">Sell (cash-secured puts, covered calls)</option>
+    </select>
+  </label>
+  <label>Type
+    <select id="kind">
+      <option value="both">Calls and puts</option>
+      <option value="call">Calls</option>
+      <option value="put">Puts</option>
+    </select>
+  </label>
+  <label>Min days <input id="dte_min" type="number" min="0" max="730" value="7"></label>
+  <label>Max days <input id="dte_max" type="number" min="1" max="730" value="60"></label>
+  <button class="primary" id="scan" type="submit">Scan</button>
+  <span id="busy" class="sub" role="status"></span>
+</form>
 
-        const formData = new FormData();
-        formData.append("file", fileInput.files[0]);
+<div class="notice" id="notice"></div>
 
-        try {
-          const response = await fetch("/analyze", {
-            method: "POST",
-            body: formData
-          });
-          if (!response.ok) {
-            throw new Error("Server error: " + response.status);
-          }
-          const data = await response.json();
-          document.getElementById('result').innerHTML = `
-            <h3>Parsed Data:</h3>
-            <pre>${JSON.stringify(data.parsed_data, null, 2)}</pre>
-            <h3>Analysis Result:</h3>
-            <pre>${JSON.stringify(data.analysis_result, null, 2)}</pre>
-          `;
-        } catch (err) {
-          console.error(err);
-          document.getElementById('result').textContent = "Error: " + err.message;
-        }
-      }
-    </script>
-  </body>
+<main>
+  <section class="panel">
+    <h2 id="results-title">Results</h2>
+    <div class="scroll" id="results"><p class="empty">Run a scan to see ranked contracts.</p></div>
+  </section>
+  <aside class="panel" id="detail"><p class="empty">Select a contract to see its numbers and the stock's earnings history.</p></aside>
+</main>
+
+<section id="brief"></section>
+
+<footer>
+  Contracts are ranked by fixed, visible rules: liquidity, distance to breakeven, how volatility is priced,
+  time decay or yield, and delta. The ranking is a screen, not a forecast and not financial advice.
+  This app only reads market data. It cannot place orders.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let status = null, scan = null, selected = null;
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.className = value;
+    else if (key === "style") node.style.cssText = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child !== null && child !== undefined && child !== false) node.append(child);
+  }
+  return node;
+}
+const pct = (v, digits = 1) => v === null || v === undefined ? "–" : (v * 100).toFixed(digits) + "%";
+const signedPct = (v, digits = 1) => v === null || v === undefined ? "–" : (v > 0 ? "+" : "") + (v * 100).toFixed(digits) + "%";
+const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
+const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
+const whole = (v) => v === null || v === undefined ? "–" : v.toLocaleString();
+const shortDate = (iso) => new Date(iso + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+const tone = (v) => v > 0 ? "up" : v < 0 ? "down" : "";
+
+const COMPONENTS = {
+  liquidity: "Liquidity (spread, open interest)",
+  breakeven: "Breakeven vs expected move",
+  probability: "Probability of profit",
+  vol_value: "How volatility is priced",
+  decay: "Time decay",
+  yield: "Annualized yield",
+  delta_fit: "Delta in target band",
+};
+const TIMING = { pre: "before the open", post: "after the close", unknown: "time unknown" };
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data);
+    throw new Error(detail || ("Request failed: " + response.status));
+  }
+  return data;
+}
+
+function showNotices(extra) {
+  const lines = [];
+  if (status && status.setup_error) lines.push(status.setup_error);
+  if (status && status.mode === "demo") lines.push("Synthetic demo data. The tickers, prices and earnings dates are made up.");
+  if (status && status.options_feed === "indicative") {
+    lines.push("Option quotes come from Alpaca's free indicative feed: quotes are modified and trades are 15 minutes delayed. Use this to screen, then check the live quote at your broker.");
+  }
+  if (status && status.mode === "live" && !status.earnings_sources.length) {
+    lines.push("No earnings data source is configured, so earnings context is missing. Set SEC_USER_AGENT or ALPHAVANTAGE_API_KEY in .env.");
+  }
+  $("notice").replaceChildren(...lines.concat(extra || []).map((text) => el("p", {}, text)));
+}
+
+function earningsChips(ctx, idea) {
+  if (ctx.days_to_earnings === null || ctx.days_to_earnings === undefined) return [];
+  const label = "earnings in " + ctx.days_to_earnings + "d" + (ctx.next_earnings.confirmed ? "" : " (est.)");
+  return [el("span", { class: "chip" + (idea.spans_earnings ? " hot" : "") }, label + (idea.spans_earnings ? " · spans" : ""))];
+}
+
+function renderResults() {
+  $("results-title").textContent = scan.ideas.length
+    ? scan.ideas.length + " contracts to " + scan.lens + ", best first"
+    : "Results";
+  if (!scan.ideas.length) {
+    $("results").replaceChildren(el("p", { class: "empty" }, "No contracts passed the filters. Try a wider range of days or different symbols."));
+    return;
+  }
+  const head = ["#", "Contract", "Score", "Mid", "Spread", "Delta", "IV", "POP", "Breakeven", "vs exp. move", "Context"];
+  const rows = scan.ideas.map((idea, i) => {
+    const ctx = scan.underlyings[idea.underlying];
+    const row = el("tr", { tabindex: "0", onclick: () => select(idea), onkeydown: (e) => { if (e.key === "Enter") select(idea); } },
+      el("td", {}, String(i + 1)),
+      el("td", {}, el("strong", {}, idea.underlying), " ",
+        el("span", { class: "sub" }, shortDate(idea.expiry).replace(/, \d{4}$/, "") + " · " + idea.strike + " " + idea.kind + " · " + idea.dte + "d")),
+      el("td", {}, el("span", { class: "score" }, num(idea.score, 1), el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + idea.score + "%;display:block" })))),
+      el("td", {}, money(idea.mid)),
+      el("td", {}, pct(idea.spread_pct)),
+      el("td", {}, num(idea.delta)),
+      el("td", {}, pct(idea.iv)),
+      el("td", {}, pct(idea.pop, 0)),
+      el("td", {}, signedPct(idea.breakeven_move_pct)),
+      el("td", {}, idea.breakeven_vs_expected === null ? "–" : num(idea.breakeven_vs_expected) + "×"),
+      el("td", {}, earningsChips(ctx, idea), ctx.reasons.filter((r) => !r.startsWith("earnings in")).map((r) => el("span", { class: "chip" }, r))),
+    );
+    row.dataset.symbol = idea.symbol;
+    return row;
+  });
+  $("results").replaceChildren(el("table", {}, el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, h)))), el("tbody", {}, rows)));
+}
+
+function facts(pairs) {
+  return el("dl", {}, pairs.flatMap(([term, value]) => [el("dt", {}, term), el("dd", {}, value)]));
+}
+
+function compareBar(label, value, max) {
+  const width = max > 0 && value !== null ? Math.min(100, (value / max) * 100) : 0;
+  return el("div", { class: "compare" }, el("span", { class: "sub" }, label),
+    el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + width + "%;display:block" })), pct(value));
+}
+
+function select(idea) {
+  selected = idea;
+  document.querySelectorAll("#results tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.symbol === idea.symbol));
+  const ctx = scan.underlyings[idea.underlying];
+  const weights = status.lenses[scan.lens];
+  const parts = [
+    el("h2", {}, idea.underlying + " " + shortDate(idea.expiry) + " " + idea.strike + " " + idea.kind),
+    el("div", { class: "sub" }, idea.symbol),
+    el("h3", {}, "Contract"),
+    facts([
+      ["Bid × ask", money(idea.bid) + " × " + money(idea.ask)],
+      ["Breakeven at expiry", money(idea.breakeven) + " (" + signedPct(idea.breakeven_move_pct) + ")"],
+      ["Expected move to expiry (1 s.d.)", "±" + pct(idea.expected_move_pct)],
+      [scan.lens === "buy" ? "Probability of profit (buyer)" : "Probability of profit (seller)", pct(idea.pop, 0)],
+      ["Probability in the money", pct(idea.prob_itm, 0)],
+      ["Time decay per day", pct(idea.theta_pct_per_day, 2) + " of price"],
+      scan.lens === "sell" ? ["Annualized yield on collateral", pct(idea.annualized_yield)] : null,
+      ["Open interest / volume", whole(idea.open_interest) + " / " + whole(idea.volume)],
+      ["Implied volatility", pct(idea.iv) + " (" + idea.iv_source + ")"],
+      ["Delta · gamma", num(idea.delta) + " · " + num(idea.gamma, 3) + " (" + idea.greeks_source + ")"],
+      ["Theta · vega", num(idea.theta, 3) + " · " + num(idea.vega, 3)],
+    ].filter(Boolean)),
+    el("h3", {}, "Score " + num(idea.score, 1) + " of 100"),
+    Object.entries(idea.components).map(([name, value]) => el("div", { class: "component" },
+      el("span", {}, COMPONENTS[name] || name),
+      el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + value * 100 + "%;display:block" })),
+      el("span", {}, Math.round(weights[name] * 100) + "%"))),
+    el("h3", {}, idea.underlying + " stock"),
+    facts([
+      ["Price", [money(ctx.price), " ", el("span", { class: tone(ctx.change_pct) }, signedPct(ctx.change_pct))]],
+      ["Realized volatility, 20d / 60d", pct(ctx.realized_vol_20d) + " / " + pct(ctx.realized_vol_60d)],
+      ["At-the-money implied volatility", pct(ctx.atm_iv)],
+    ]),
+    el("h3", {}, "Earnings"),
+  ];
+  if (ctx.next_earnings) {
+    const e = ctx.next_earnings;
+    parts.push(facts([
+      ["Next report", shortDate(e.day) + ", " + (TIMING[e.timing] || e.timing)],
+      ["Days away", String(ctx.days_to_earnings) + (e.confirmed ? "" : " (estimated date)")],
+      ["This contract", idea.spans_earnings ? "still open at the report" : "expires before the report"],
+    ]));
+  } else {
+    parts.push(el("p", { class: "sub" }, ctx.earnings_note || "No upcoming earnings date on record (normal for ETFs)."));
+  }
+  const stats = ctx.earnings_stats, implied = ctx.implied_move;
+  if (stats) {
+    const impliedMove = implied ? implied.event_move_pct : null;
+    const max = Math.max(stats.max_abs, impliedMove || 0);
+    parts.push(el("p", { class: "sub" }, "One-day move on the last " + stats.count + " reports: " + stats.up + " up, " + stats.down + " down."));
+    parts.push(compareBar("Average", stats.mean_abs, max), compareBar("Largest", stats.max_abs, max));
+    if (impliedMove !== null && impliedMove !== undefined) {
+      parts.push(compareBar("Options price in", impliedMove, max));
+      parts.push(el("p", { class: "sub" }, "Priced-in move uses the " + shortDate(implied.expiry) + " expiry, with ordinary volatility taken from " + implied.baseline_source + "."));
+    }
+    parts.push(el("table", { class: "history" },
+      el("thead", {}, el("tr", {}, el("th", {}, "Report"), el("th", {}, "Move"), el("th", {}, "EPS surprise"))),
+      el("tbody", {}, ctx.reactions.map((r) => el("tr", {},
+        el("td", {}, shortDate(r.day)),
+        el("td", { class: tone(r.move_pct) }, signedPct(r.move_pct)),
+        el("td", {}, r.surprise_pct === null ? "–" : (r.surprise_pct > 0 ? "+" : "") + r.surprise_pct.toFixed(1) + "%"))))));
+  } else if (ctx.next_earnings && ctx.earnings_note) {
+    parts.push(el("p", { class: "sub" }, ctx.earnings_note));
+  }
+  $("detail").replaceChildren(...parts.flat());
+}
+
+function renderBriefButton() {
+  if (!scan || !scan.ideas.length || !status.ai_available) { $("brief").replaceChildren(); return; }
+  $("brief").replaceChildren(el("div", { class: "panel" },
+    el("h2", {}, "AI brief"),
+    el("p", { class: "sub" }, "Claude reads this scan and writes up the setups worth a closer look. Uses your Anthropic API key and is billed to it."),
+    el("button", { id: "write-brief", onclick: writeBrief }, "Write brief")));
+}
+
+async function writeBrief() {
+  const button = $("write-brief");
+  button.disabled = true;
+  button.textContent = "Writing…";
+  const panel = button.parentElement;
+  try {
+    const brief = await api("/api/brief/" + scan.id, {});
+    panel.replaceChildren(
+      el("h2", {}, "AI brief"),
+      el("p", {}, brief.summary),
+      brief.picks.map((pick) => el("div", { class: "pick" },
+        el("strong", {}, pick.headline), el("div", { class: "sub" }, pick.contract),
+        el("p", {}, pick.rationale),
+        el("p", {}, el("strong", {}, "Risks: "), pick.risks),
+        el("p", {}, el("strong", {}, "Check first: "), pick.check_first))),
+      el("p", { class: "sub" }, (brief.model ? "Written by " + brief.model + ". " : "") + "Based only on the numbers in this scan. Not advice."));
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = "Write brief";
+    panel.querySelectorAll(".error").forEach((n) => n.remove());
+    panel.append(el("p", { class: "error" }, err.message));
+  }
+}
+
+$("controls").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("scan").disabled = true;
+  $("busy").textContent = "Scanning…";
+  try {
+    scan = await api("/api/scan", {
+      symbols: $("symbols").value.split(/[\s,]+/).filter(Boolean),
+      lens: $("lens").value,
+      kind: $("kind").value,
+      dte_min: Number($("dte_min").value),
+      dte_max: Number($("dte_max").value),
+    });
+    showNotices(scan.warnings);
+    renderResults();
+    $("detail").replaceChildren(el("p", { class: "empty" }, "Select a contract to see its numbers and the stock's earnings history."));
+    if (scan.ideas.length) select(scan.ideas[0]);
+    renderBriefButton();
+  } catch (err) {
+    showNotices(["Scan failed: " + err.message]);
+  } finally {
+    $("scan").disabled = Boolean(status && status.setup_error);
+    $("busy").textContent = "";
+  }
+});
+
+(async function start() {
+  try {
+    status = await api("/api/status");
+  } catch (err) {
+    showNotices(["Could not reach the app: " + err.message]);
+    return;
+  }
+  const mode = $("mode");
+  mode.textContent = status.mode === "demo" ? "Demo data" : status.mode === "live" ? "Alpaca · " + status.options_feed + " quotes" : "Not configured";
+  mode.classList.toggle("demo", status.mode !== "live");
+  $("sources").textContent = status.earnings_sources.length ? "Earnings data: " + status.earnings_sources.join(", ") : "";
+  $("scan").disabled = Boolean(status.setup_error);
+  showNotices();
+})();
+</script>
+</body>
 </html>
