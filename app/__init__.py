@@ -1,4 +1,1 @@
-# app/__init__.py
-"""
-Initialize the app package.
-"""
+"""Read-only options scanner with earnings context."""

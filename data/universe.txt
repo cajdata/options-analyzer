@@ -1,0 +1,44 @@
+# Starter list of widely traded, optionable symbols that a discovery scan
+# considers alongside your watchlist and the day's most active stocks.
+# This is a convenience list, not a recommendation. Edit it freely:
+# one symbol per line, '#' starts a comment.
+SPY
+QQQ
+IWM
+AAPL
+MSFT
+NVDA
+AMZN
+GOOGL
+META
+TSLA
+AMD
+NFLX
+AVGO
+INTC
+MU
+PLTR
+COIN
+UBER
+DIS
+BA
+JPM
+BAC
+C
+GS
+XOM
+CVX
+WMT
+COST
+HD
+NKE
+CRM
+ORCL
+ADBE
+PYPL
+SHOP
+SOFI
+F
+GM
+PFE
+LLY
