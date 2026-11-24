@@ -126,6 +126,16 @@ def test_a_failing_symbol_does_not_sink_the_scan():
     assert "BOLT" not in result.underlyings and result.ideas
 
 
+def test_stocks_with_no_option_quotes_are_named_in_one_note():
+    scanner = demo_scanner()
+    real = scanner.market.option_chain
+    scanner.market.option_chain = lambda symbol, **window: [] if symbol in ("ACME", "BOLT") else real(symbol, **window)
+    result = scanner.scan(ScanRequest(symbols=["BOLT", "ACME", "FLUX"]))
+    # A live discovery scan turns up several of these at once (warrants, tiny companies).
+    assert "No two-sided option quotes in range for ACME, BOLT." in result.warnings
+    assert {c.underlying for c in result.ideas} == {"FLUX"}
+
+
 def test_live_mode_needs_alpaca_keys():
     with pytest.raises(ConfigError, match="--demo"):
         build_scanner(Settings())

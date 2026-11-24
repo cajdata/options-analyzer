@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from datetime import date, datetime, time as clock, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -24,6 +24,8 @@ MAX_CHAIN_PAGES = 15  # 1,000 contracts a page
 _RETRIES = 3
 # Today's daily bar is final a little after the 4 p.m. close.
 BAR_FINAL = clock(16, 20)
+# A quote stamped before the open belongs to no trading session yet.
+SESSION_OPEN = clock(9, 30)
 IEX_BARS_NOTE = (
     "Price history comes from the IEX exchange only, because this Alpaca "
     "plan does not include consolidated (SIP) history."
@@ -204,12 +206,25 @@ class AlpacaData:
         if truncated:
             self.notes.append(f"{symbol}: the option chain was cut off at {MAX_CHAIN_PAGES * 1000:,} contracts.")
         root = symbol.replace(".", "")
+        parsed = [
+            (quote, snap)
+            for page in pages
+            for contract, snap in (page.get("snapshots") or {}).items()
+            if (quote := _option_quote(symbol, root, contract, snap or {}))
+        ]
+        session = _session_day(q.quote_time for q, _ in parsed if q.quote_time)
         quotes: list[OptionQuote] = []
-        for page in pages:
-            for contract, snap in (page.get("snapshots") or {}).items():
-                quote = _option_quote(symbol, root, contract, snap or {})
-                if quote:
-                    quotes.append(quote)
+        for quote, snap in parsed:
+            if session and quote.quote_time and quote.quote_time.astimezone(ET).date() < session:
+                continue  # not quoted in the latest session: see _session_day
+            traded = _bar_day(snap)
+            if session and traded and traded < session:
+                quote.volume = 0  # the daily bar is the last day it traded, which was not this one
+            quotes.append(quote)
+        old = len(parsed) - len(quotes)
+        if old:
+            what = "1 contract was" if old == 1 else f"{old} contracts were"
+            self.notes.append(f"{symbol}: {what} left out because the latest quote is from an earlier day.")
         return quotes
 
     def open_interest(
@@ -245,6 +260,34 @@ class AlpacaData:
         data = self._get(f"{DATA_URL}/v1beta1/screener/stocks/movers", {"top": top})
         rows = (data.get("gainers") or []) + (data.get("losers") or [])
         return [row["symbol"] for row in rows if row.get("symbol")]
+
+
+def _session_day(times: Iterable[datetime]) -> date | None:
+    """The day of the latest trading session a chain has quotes from.
+
+    A snapshot holds the last quote and the last daily bar Alpaca saw for a
+    contract. For a contract that was not quoted or traded in the latest session
+    those are an earlier day's. Seen live: when a special dividend or a split
+    changes a stock's strikes, the contracts that stopped existing go on
+    answering with their final quote, a day old or a year old. Priced against
+    today's stock, such a quote can look like a bargain.
+
+    The newest quote in the chain says which day is current, so the answer is the
+    same after the close and at a weekend, and the clock is not needed. A quote
+    stamped before the 9:30 open does not move the day on: until trading starts,
+    the session that counts is still the one before.
+    """
+    local = (t.astimezone(ET) for t in times)
+    return max((t.date() for t in local if t.time() >= SESSION_OPEN), default=None)
+
+
+def _bar_day(snap: dict | None) -> date | None:
+    """The day a snapshot's daily bar belongs to: the last day the contract traded."""
+    stamp = (snap or {}).get("dailyBar") or {}
+    try:
+        return date.fromisoformat(str(stamp.get("t"))[:10])
+    except ValueError:
+        return None
 
 
 def _option_quote(underlying: str, root: str, contract: str, snap: dict) -> OptionQuote | None:

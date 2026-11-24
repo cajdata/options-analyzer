@@ -151,6 +151,7 @@ class Scanner:
         scored: list[ContractAnalysis] = []
         cheapest: tuple[float, str] | None = None  # least outlay seen, before the budget was applied
         left_out: dict[str, list[str]] = {"unknown": [], "all open": []}
+        no_quotes: list[str] = []
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(analyze, selected):
                 if isinstance(outcome, str):
@@ -164,8 +165,12 @@ class Scanner:
                 if outcome.left_out:
                     left_out[outcome.left_out].append(ctx.symbol)
                 if ctx.contracts_scanned == 0:
-                    warnings.append(f"{ctx.symbol}: no two-sided option quotes in range.")
+                    no_quotes.append(ctx.symbol)
 
+        if no_quotes:
+            # One note for all of them. The day's top movers include warrants and tiny
+            # companies with no options at all, so a discovery scan can have several.
+            warnings.append(f"No two-sided option quotes in range for {_names(no_quotes)}.")
         warnings.extend(self._earnings_warnings(req, underlyings, left_out))
         if self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
