@@ -29,7 +29,7 @@ One scan flows in a straight line:
 
 1. **Providers** (`app/providers/`) fetch data. `MarketData` is the protocol; `AlpacaData` is the real one and `DemoMarket` the synthetic one. `EarningsService` combines earnings sources (SEC EDGAR, Alpha Vantage), caches them on disk, and estimates a missing date.
 2. **`Scanner`** (`app/scanner.py`) picks symbols (given ones, or discovery from the watchlist, screeners and `data/universe.txt`), then analyzes each on a small thread pool.
-3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk` (history-based volatility, then risk/reward) → `scoring` (score and rank).
+3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols.
 4. **Surfaces** read the resulting `ScanResult`: `app/server.py` (FastAPI plus `public/index.html`), `app/__main__.py` (command line), `app/ai.py` (optional Claude write-up).
 
 Things that are not obvious from any one file:
@@ -45,7 +45,7 @@ Things that are not obvious from any one file:
 
 These came out of two rounds of outside code review. Each has a test; do not regress them.
 
-- **Risk/reward is in present value, priced at the fill.** `risk.assess` uses the ask to buy and the bid to sell, and discounts the payoff. A fairly priced option must show zero edge at any expiry, and "most you can lose" must equal the cost shown. Display metrics on `ContractAnalysis` (breakeven, `pop`, annualized yield) stay at the mid.
+- **Risk/reward is in present value, priced at the fill.** `risk.assess` uses the ask to buy and the bid to sell, and discounts the payoff. A fairly priced option must show zero edge at any expiry, and a buyer's "most you can lose" must equal the cost shown. (A seller's outlay is collateral, a different number: the most a short put can lose is the strike less the bid, and a short call has no cap on its own.) Display metrics on `ContractAnalysis` (breakeven, `pop`, annualized yield) stay at the mid.
 - **A quote below exercise value is rejected**, using plain `max(S-K, 0)` or `max(K-S, 0)` whether or not the feed supplies a volatility. Do not swap in a discounted European floor: it drops legitimate deep in-the-money calls on dividend stocks.
 - **Earnings math.** `TRADING_DAY = 1/252`; a report replaces one trading day. `risk.event_variance` uses log returns and takes `(sessions - 1)` ordinary days out of a two-session reaction. `earnings.spans` treats unknown timing as possibly before the open, and `earnings.implied_move` leaves a report-day expiry of unknown timing out of both sides (`_ambiguous`).
 - **"No reports" and "cannot tell" are different.** A company that files 6-K, 20-F or 40-F raises `Unsupported` in `EdgarEarnings`, which sets `earnings_unknown`. Never let it look like an ETF, which has no reports at all.
