@@ -3,7 +3,7 @@
 import json
 import math
 import re
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -16,7 +16,7 @@ from app.cache import NullCache
 from app.config import Settings
 from app.providers.demo import SPECS, DemoMarket
 from app.providers.earnings import EarningsService
-from app.scanner import ConfigError, Scanner, ScanRequest, build_scanner
+from app.scanner import PRESETS, ConfigError, Scanner, ScanRequest, build_scanner
 from app.server import ScanBody, create_app
 
 TODAY = date(2026, 11, 24)
@@ -561,3 +561,120 @@ def test_a_blank_credential_does_not_turn_the_brief_on(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
     assert ai.available() is False
+
+
+# -- Exit plan and the premium-selling preset ------------------------------------------
+
+
+def test_every_idea_gets_an_exit_plan(discovery):
+    assert set(discovery.exit_plans) == {c.symbol for c in discovery.ideas}
+    for c in discovery.ideas:
+        plan = discovery.exit_plans[c.symbol]
+        assert plan.lens == "buy" and plan.entry_price == c.ask
+        assert plan.checkpoints[-1].label == "at expiry" and plan.checkpoints[-1].day == c.expiry
+        assert [k.day for k in plan.checkpoints] == sorted(k.day for k in plan.checkpoints)
+        assert plan.target_price is None  # a seller's rule
+        # Standing still, a buyer only loses; and selling early never beats the price paid.
+        assert all(k.pnl < 0 for k in plan.checkpoints)
+
+    spanning = [c for c in discovery.ideas if c.underlying == "ACME" and c.spans_earnings]
+    assert spanning
+    for c in spanning:
+        step = discovery.exit_plans[c.symbol].earnings
+        assert step is not None and step.crush_pct < 0
+        assert step.report_day == date(2026, 12, 4)  # ACME reports after the close on 3 December
+    quiet = [c for c in discovery.ideas if c.underlying == "EMBR"]
+    assert quiet and all(discovery.exit_plans[c.symbol].earnings is None for c in quiet)
+
+
+def test_context_carries_what_a_later_repricing_needs(discovery):
+    acme = discovery.underlyings["ACME"]
+    assert acme.ordinary_vol == pytest.approx(SPECS["ACME"]["vol"], rel=0.25)  # realized, with earnings days removed
+    squares = [math.log1p(m.move_pct) ** 2 for m in acme.reactions]
+    assert acme.event_var == pytest.approx(sum(squares) / len(squares))  # variance of past report-day moves
+    assert acme.implied_move.event_var > 0
+    points = acme.term_structure
+    assert [p.expiry for p in points] == sorted(p.expiry for p in points) and len(points) >= 5
+    assert all(7 <= p.dte <= 60 and 0.1 < p.atm_iv < 1.5 for p in points)
+    # The report lifts every expiry that holds it, the nearest ones most.
+    assert points[0].spans_earnings and points[0].atm_iv > points[-1].atm_iv
+
+
+def test_premium_selling_preset():
+    settings = PRESETS["sell-premium"]["settings"]
+    result = demo_scanner().scan(ScanRequest(**settings))
+    assert result.lens == "sell" and result.ideas
+    for c in result.ideas:
+        assert 30 <= c.dte <= 45
+        assert 0.16 <= abs(c.delta) <= 0.30
+        assert not c.spans_earnings
+        plan = result.exit_plans[c.symbol]
+        assert plan.target_price == pytest.approx(c.bid / 2)
+        assert plan.time_stop_day == c.expiry - timedelta(days=21)
+    # Stocks reporting inside the window have nothing left to offer under this preset.
+    assert not {"ACME", "BOLT", "FLUX"} & {c.underlying for c in result.ideas}
+
+
+def test_delta_and_earnings_filters_work_on_their_own():
+    scanner = demo_scanner()
+    narrow = scanner.scan(ScanRequest(symbols=["ACME"], delta_min=0.40, delta_max=0.50, top_n=50))
+    assert narrow.ideas and all(0.40 <= abs(c.delta) <= 0.50 for c in narrow.ideas)
+
+    everything = scanner.scan(ScanRequest(symbols=["ACME"], dte_min=1, top_n=50, per_side=50))
+    quiet = scanner.scan(ScanRequest(symbols=["ACME"], dte_min=1, top_n=50, per_side=50, avoid_earnings=True))
+    assert any(c.spans_earnings for c in everything.ideas)
+    assert quiet.ideas and not any(c.spans_earnings for c in quiet.ideas)
+    assert all(c.dte <= 9 for c in quiet.ideas)  # only what expires before the report in nine days
+
+
+def test_exit_plan_and_preset_reach_the_api(client):
+    status = client.get("/api/status").json()
+    assert status["exit_rules"] == {"profit_target": 0.5, "time_stop_dte": 21}
+    preset = status["presets"]["sell-premium"]
+    assert preset["settings"]["avoid_earnings"] is True and preset["label"] and preset["about"]
+
+    body = client.post("/api/scan", json=preset["settings"]).json()
+    assert body["ideas"] and set(body["exit_plans"]) == {i["symbol"] for i in body["ideas"]}
+    plan = body["exit_plans"][body["ideas"][0]["symbol"]]
+    assert plan["lens"] == "sell" and plan["target_price"] > 0 and plan["checkpoints"][-1]["label"] == "at expiry"
+    assert all(0.16 <= abs(i["delta"]) <= 0.30 for i in body["ideas"])
+
+    assert client.post("/api/scan", json={"delta_min": 0.5, "delta_max": 0.2}).status_code == 422
+    assert client.post("/api/scan", json={"delta_max": 1.5}).status_code == 422
+
+
+def test_exit_plan_and_preset_on_the_command_line(capsys):
+    from app.__main__ import main
+
+    assert main(["scan", "--demo", "--preset", "sell-premium", "--top", "3", "--exits"]) == 0
+    out = capsys.readouterr().out
+    assert "Lens: sell premium" in out and "Exit plan, if the stock stands still" in out
+    assert "buy back at $" in out and "time stop" in out and "They are not probabilities" in out
+
+    # An option given alongside a preset overrides it.
+    assert main(["scan", "--demo", "--preset", "sell-premium", "--dte-min", "20", "--dte-max", "29", "--json"]) == 0
+    ideas = json.loads(capsys.readouterr().out)["ideas"]
+    assert ideas and all(20 <= i["dte"] <= 29 and i["lens"] == "sell" for i in ideas)
+
+    assert main(["scan", "ACME", "--demo", "--top", "2", "--exits"]) == 0
+    out = capsys.readouterr().out
+    assert "half the time value is gone by" in out and "earnings Dec 04" in out
+
+    for flags in (["--delta-min", "0.5", "--delta-max", "0.2"], ["--delta-max", "1.5"]):
+        with pytest.raises(SystemExit):
+            main(["scan", "--demo", *flags])
+    capsys.readouterr()
+
+
+def test_the_brief_is_given_the_exit_plan(discovery):
+    payload = json.loads(json.dumps(ai.scan_payload(discovery)))
+    plan = payload["ranked_contracts"][0]["exit_plan"]
+    assert plan["if_the_stock_stands_still"][-1]["when"] == "at expiry"
+    assert "time_stop_date" in plan and "strike_vs_stock_pct" in plan
+    spanning = next(c for c in payload["ranked_contracts"] if c["expires_after_next_earnings"])
+    assert spanning["exit_plan"]["across_the_earnings_report"]["price_change_with_stock_unchanged_pct"] < 0
+    assert "exit_plan" in ai.SYSTEM and "never the chance of getting there" in ai.SYSTEM
+
+    sold = demo_scanner().scan(ScanRequest(**PRESETS["sell-premium"]["settings"]))
+    plan = ai.scan_payload(sold)["ranked_contracts"][0]["exit_plan"]
+    assert plan["profit_target_buy_back_at_or_below"] > 0 and "decay_alone_reaches_target_on" in plan

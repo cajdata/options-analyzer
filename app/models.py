@@ -87,6 +87,7 @@ class ImpliedMove:
     event_move_pct: float | None  # one-day move attributed to the report itself
     baseline_vol: float
     baseline_source: str  # where ordinary volatility was taken from, as a phrase
+    event_var: float | None = None  # variance the options attribute to the report itself
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,58 @@ class ContractAnalysis:
     components: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class TermPoint:
+    """At-the-money implied volatility for one expiration."""
+
+    expiry: date
+    dte: int
+    atm_iv: float
+    spans_earnings: bool
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """A contract on a later date, with the stock where it is today."""
+
+    day: date
+    days_held: int
+    label: str
+    value: float  # modelled mid price per share
+    close_price: float  # what closing fetches (the bid, for a holder) or costs (the ask, to buy back)
+    pnl: float  # dollars per contract against the entry price
+    pnl_pct: float  # as a share of the premium paid or collected
+
+
+@dataclass(frozen=True)
+class EarningsExit:
+    """The step in a contract's price across an earnings report, stock unchanged."""
+
+    report_day: date  # first session that reflects the report
+    value_before: float
+    value_after: float
+    crush_pct: float  # value_after / value_before - 1
+    # Stock move the session after, in the direction that raises the option's value,
+    # at which closing is back to the entry price. None if no plausible move gets there.
+    move_to_breakeven_pct: float | None
+
+
+@dataclass
+class ExitPlan:
+    """What time does to one contract if the stock stands still. Built by analysis/exits.py."""
+
+    lens: str
+    entry_price: float  # the ask for a buyer, the bid for a seller, per share
+    checkpoints: list[Checkpoint]
+    earnings: EarningsExit | None
+    strike_distance_pct: float  # strike / stock price - 1
+    time_stop_day: date | None  # the time-stop rule's date, if still ahead
+    notes: list[str] = field(default_factory=list)
+    half_life_day: date | None = None  # buyer: when half the time value is gone
+    target_price: float | None = None  # seller: buy back at or below this to hit the profit target
+    target_day: date | None = None  # seller: when decay alone gets there, if it does before expiry
+
+
 @dataclass
 class UnderlyingContext:
     symbol: str
@@ -171,6 +224,10 @@ class UnderlyingContext:
     # ratings for it cannot account for a report.
     earnings_unknown: bool = False
     contracts_scanned: int = 0
+    # Inputs for repricing a contract on a later date (see analysis/exits.py).
+    term_structure: list[TermPoint] = field(default_factory=list)
+    ordinary_vol: float | None = None  # realized volatility with earnings days removed
+    event_var: float | None = None  # variance of past report-day moves
 
 
 @dataclass
@@ -184,3 +241,4 @@ class ScanResult:
     underlyings: dict[str, UnderlyingContext]
     warnings: list[str] = field(default_factory=list)
     budget: float | None = None  # per-contract limit the scan was run with
+    exit_plans: dict[str, ExitPlan] = field(default_factory=dict)  # by contract symbol

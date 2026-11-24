@@ -9,8 +9,9 @@ from dataclasses import asdict
 
 from app import ai
 from app.config import ConfigError, load_settings
-from app.models import ContractAnalysis, ScanResult, UnderlyingContext
-from app.scanner import ScanRequest, build_scanner
+from app.analysis import exits
+from app.models import ContractAnalysis, ExitPlan, ScanResult, UnderlyingContext
+from app.scanner import PRESETS, ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
 
@@ -81,6 +82,45 @@ def print_scan(result: ScanResult) -> None:
     print("Not a forecast and not advice.")
 
 
+def _exit_line(c: ContractAnalysis, plan: ExitPlan, ctx: UnderlyingContext) -> str:
+    """One contract's exit plan in a line or two."""
+    name = f"{c.underlying} {c.expiry:%b %d} {c.strike:g} {c.kind}"
+    parts = []
+    if plan.lens == "sell":
+        when = f"decay alone gets there about {plan.target_day:%b %d}" if plan.target_day else "decay alone does not get there before expiry"
+        parts.append(f"buy back at ${plan.target_price:.2f} or less to keep {exits.PROFIT_TARGET:.0%} ({when})")
+    elif plan.half_life_day:
+        parts.append(f"half the time value is gone by {plan.half_life_day:%b %d}")
+    if plan.time_stop_day:
+        parts.append(f"time stop {plan.time_stop_day:%b %d}")
+    for k in plan.checkpoints:
+        if k.label.startswith("in ") or k.label == "at expiry":
+            parts.append(f"{k.label} {k.pnl:+,.0f} ({k.pnl_pct:+.0%})")
+    text = f"  {name}: " + "; ".join(parts)
+    report = plan.earnings
+    if report:
+        move = report.move_to_breakeven_pct
+        back = "no plausible move gets back to the entry price" if move is None else f"{move:+.1%} in the stock gets back to the entry price"
+        text += f"\n      earnings {report.report_day:%b %d}: {report.crush_pct:+.0%} with the stock unchanged; {back}"
+        if ctx.earnings_stats:
+            text += f" (past reports averaged {ctx.earnings_stats.mean_abs:.1%})"
+    for note in plan.notes:
+        text += f"\n      note: {note}"
+    return text
+
+
+def print_exits(result: ScanResult) -> None:
+    if not result.exit_plans:
+        return
+    print("\nExit plan, if the stock stands still (dollars per contract, closing at the bid or ask)")
+    for c in result.ideas:
+        plan = result.exit_plans.get(c.symbol)
+        if plan:
+            print(_exit_line(c, plan, result.underlyings[c.underlying]))
+    print("  These dates are where time alone takes the price. They are not probabilities, and the")
+    print(f"  {exits.PROFIT_TARGET:.0%} target and {exits.TIME_STOP_DTE}-day time stop are rules of thumb, not signals.")
+
+
 def _print_brief(brief: ai.BriefResult) -> None:
     print(f"\nAI brief ({brief.model or 'no model call'})\n{brief.summary}")
     for pick in brief.picks:
@@ -96,10 +136,15 @@ def main(argv: list[str] | None = None) -> int:
 
     scan = sub.add_parser("scan", help="scan symbols, or discover candidates when none are given")
     scan.add_argument("symbols", nargs="*", help="tickers to scan; leave empty to discover")
-    scan.add_argument("--lens", choices=["buy", "sell"], default="buy", help="rank contracts to buy or to sell")
+    scan.add_argument("--preset", choices=sorted(PRESETS), help="start from a named setup; other options override it")
+    scan.add_argument("--lens", choices=["buy", "sell"], help="rank contracts to buy (default) or to sell")
     scan.add_argument("--type", dest="kind", choices=["call", "put", "both"], default="both")
-    scan.add_argument("--dte-min", type=int, default=7)
-    scan.add_argument("--dte-max", type=int, default=60)
+    scan.add_argument("--dte-min", type=int, help="fewest days to expiry (default 7)")
+    scan.add_argument("--dte-max", type=int, help="most days to expiry (default 60)")
+    scan.add_argument("--delta-min", type=float, help="smallest delta, ignoring its sign")
+    scan.add_argument("--delta-max", type=float, help="largest delta, ignoring its sign")
+    scan.add_argument("--avoid-earnings", action="store_true", default=None, help="skip contracts open over the next report")
+    scan.add_argument("--exits", action="store_true", help="print an exit plan for each contract")
     scan.add_argument("--top", type=int, default=20)
     scan.add_argument("--budget", type=float, help="most cash to put into one contract, in dollars")
     scan.add_argument("--brief", action="store_true", help="add an AI write-up (uses the Claude API)")
@@ -112,12 +157,23 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "scan":
+        # A preset fills in whatever was not given on the command line.
+        chosen = {"lens": "buy", "dte_min": 7, "dte_max": 60, "delta_min": None, "delta_max": None, "avoid_earnings": False}
+        chosen.update(PRESETS[args.preset]["settings"] if args.preset else {})
+        for name in chosen:
+            if getattr(args, name) is None:
+                setattr(args, name, chosen[name])
         if args.top < 1:
             parser.error("--top must be at least 1")
         if args.dte_min < 0 or args.dte_max < args.dte_min:
             parser.error("--dte-min must be 0 or more, and no greater than --dte-max")
         if args.budget is not None and args.budget <= 0:
             parser.error("--budget must be more than 0")
+        for value in (args.delta_min, args.delta_max):
+            if value is not None and not 0 <= value <= 1:
+                parser.error("--delta-min and --delta-max must be between 0 and 1")
+        if args.delta_min is not None and args.delta_max is not None and args.delta_max < args.delta_min:
+            parser.error("--delta-min must be no greater than --delta-max")
 
     try:
         settings = load_settings()
@@ -147,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         dte_max=args.dte_max,
         top_n=args.top,
         budget=args.budget,
+        delta_min=args.delta_min,
+        delta_max=args.delta_max,
+        avoid_earnings=args.avoid_earnings,
     )
     result = scanner.scan(request)
 
@@ -168,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(document, default=str, indent=2))
     else:
         print_scan(result)
+        if args.exits:
+            print_exits(result)
         if brief:
             _print_brief(brief)
     return 1 if brief_error else 0
