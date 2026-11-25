@@ -90,6 +90,8 @@ _MOVES = (
     r"|step(?:s|ping)? down|depart\w*|transition"
 )
 _RATINGS = r"buy|sell|hold|neutral|outperform|underperform|overweight|underweight|perform|weight|accumulate|reduce"
+# Words that make "positive data" a medicine's and not a benchmark's.
+_CLINICAL = r"trials?|stud(?:y|ies)|patients?|therap\w+|treatment|vaccine|cancer|disease|dos(?:e|ing)|candidate|investigational"
 
 # Headline rules, checked in this order: the first that matches decides the type.
 # The order matters. "Raises price target" is an analyst note and not guidance, and
@@ -192,7 +194,10 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         _rule(
             r"(?:public|secondary|registered direct|follow-on|notes?|debt|equity|bond|stock|share|unit) offering",
             r"offering of\b",
-            r"prices? (?:\$|its\b|an?\b|upsized|offering)",
+            # A company prices a product too ("Prices Its New Headset at $3,499"), so the
+            # thing priced has to be named as a security.
+            r"prices? (?:upsized )?offering",
+            r"prices? (?:\$|its\b|an?\b|upsized\b).*\b(?:offering|notes|bonds|debentures|placement)\b",
             r"private placement",
             r"at-the-market",
             r"convertible",
@@ -234,7 +239,12 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"restatement",
             r"restat\w+ .*\b(?:results|financial|earnings|statements)\b",
             r"non-?compliance",
-            r"default(?:s|ed)?\b",
+            # A default on something owed. The default search engine on a phone is not one.
+            r"defaults? on (?:\S+ ){0,4}?(?:debt|loans?|bonds?|notes|payments?|obligations?|credit|agreement|lease|mortgage)\b",
+            r"defaulted\b",
+            r"in default\b",
+            r"(?:debt|loan|bond|credit|payment|covenant|mortgage) defaults?\b",
+            r"(?:event|notice) of default\b",
             r"deficiency (?:notice|letter)",
             r"material weakness",
             r"receivership",
@@ -261,7 +271,7 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"fda\b",
             r"ema\b",
             r"chmp\b",
-            r"phase (?:[123]|i{1,3})\b",
+            r"phase (?:[123]|i{1,3})[ab]?\b",
             r"clinical",
             r"top-?line",
             r"pdufa",
@@ -273,7 +283,9 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"label expansion",
             r"(?:trial|study) (?:results|data|meets|shows|fails|misses)\b",
             r"(?:primary|secondary) endpoint",
-            r"positive (?:\S+ ){0,2}(?:data|results)\b",
+            # "Positive benchmark data" for a chip is not a drug, so a clinical word has to be there too.
+            rf"positive (?:\S+ ){{0,2}}(?:data|results)\b.*\b(?:{_CLINICAL})\b",
+            rf"(?:{_CLINICAL})\b.*\bpositive (?:\S+ ){{0,2}}(?:data|results)\b",
             r"efficacy",
         ),
     ),
@@ -466,43 +478,85 @@ FILING_ITEMS: dict[str, tuple[str, str]] = {
 }
 
 
-# Words that put the company named next in the position of the one being bought.
-_BUYING = (
-    r"to acquire|acquires?|acquiring|to buy|buys|to purchase|to take over|takeover of|buyout of|acquisition of"
-    r"|purchase of|bid for|offer for|offer to buy|deal for|deal to buy|to merge with|merger with|to take private"
+# Phrases a company is bought with. After one of these, the company's name is enough.
+_TAKING = (
+    r"to acquire|acquires?|acquiring|acquisition of|to take over|takeover of|buyout of|to take private"
+    r"|to merge with|merger with|bid for|offer for|(?:offer|deal|agrees?|agreement) to buy"
 )
+# Shares, chips and aircraft are bought with these too, so here the price has to come next.
+_PAYING = r"to buy|buys|to purchase|purchase of|deal for"
+# How a headline goes on once it has named the company being bought: it ends, or it
+# turns to the price and the terms. Anything else after the name is something of the
+# company's, not the company ("Nvidia servers", "Pfizer brands", "Insmed's lung unit").
+_THEN = r"(?=\s*$|\s*[,.;:!?()]|\s+[-–—]|\s+(?:for|in|at|to|by|from|as|after|amid|with|and|following|valued|worth)\b)"
+_PRICED = r"(?=\s+(?:for|in|at)\s+(?:\S+\s+){0,3}?(?:[$€£]\d|\d[\d.,]*\s+(?:million|billion|trillion)|deal\b))"
+# A legal ending a headline may leave on the name. "Company" is not one: "target company" is anybody.
+_ENDING = r"(?:,?\s+(?:inc|incorporated|corp|corporation|co|ltd|limited|plc|llc|holdings|group)\b\.?)?"
 # First words too common to stand for one company ("General", "American").
 _COMMON = frozenset(
-    "advanced american applied bank china digital eastern energy first general global great international "
+    "advanced american applied bank china digital eastern energy first general global great home international "
     "national new northern pacific royal southern the united us western".split()
 )
+# A name is never cut short on one of these ("Bank of America", not "Bank of").
+_JOINING = frozenset({"of", "and", "the", "de", "la"})
 _LEGAL_ENDING = re.compile(r"[\s,]+(?:inc|corp|corporation|co|company|ltd|limited|plc|llc|lp|sa|nv|ag|se)\.?$", re.IGNORECASE)
+MAX_NAME_WORDS = 5
 
 
 def aliases(symbol: str, name: str | None = None) -> tuple[str, ...]:
-    """What a headline may call a company: its ticker, and the first word of its name.
+    """What a headline may call a company: its ticker, and its name without the legal ending.
 
     An entry in capitals is a ticker and has to match exactly, so COST is not
-    "cost". Anything else matches in any case. A one- or two-letter ticker is
-    left out, and a name that opens with a common word keeps its second word
-    too ("general motors").
+    "cost". A one- or two-letter ticker is left out. The name is in lower case
+    and matches in any case. How much of it a headline has to give is settled
+    where it is matched (`_spelled`).
     """
     out = [symbol.upper()] if len(symbol) >= 3 and symbol.isalpha() else []
-    words = re.findall(r"[a-z0-9][a-z0-9'-]*", _LEGAL_ENDING.sub("", (name or "").split("/")[0].strip()).lower())
+    words = re.findall(r"[a-z0-9][a-z0-9'&-]*", _LEGAL_ENDING.sub("", (name or "").split("/")[0].strip()).lower())
+    if words[:1] == ["the"]:
+        words = words[1:]
     if words:
-        short = " ".join(words[:2] if words[0] in _COMMON else words[:1])
-        if len(short) >= 3:
-            out.append(short)
+        out.append(" ".join(words[:MAX_NAME_WORDS]))
     return tuple(out)
+
+
+def _spelled(name: str) -> str | None:
+    """A pattern for a company's name as a headline gives it, or None if no part of it is safe to go by.
+
+    The first word has to be there and the rest may follow ("Pioneer", or
+    "Pioneer Natural Resources"). A common first word needs the second as well
+    ("General Motors", "Home Depot"), and a name is never cut short on a
+    joining word ("Bank of America"). A name that is one common word names
+    nobody.
+    """
+    words = name.split()
+    need = 2 if words[0] in _COMMON else 1
+    while need <= len(words) and words[need - 1] in _JOINING:
+        need += 1
+    if need > len(words) or len(" ".join(words[:need])) < 3:
+        return None
+    gap = r"(?:\s+&)?\s+"  # "Procter & Gamble" is on file as two words
+    rest = ""
+    for word in reversed(words[need:]):
+        rest = rf"(?:{gap}{re.escape(word)}{rest})?"
+    return gap.join(re.escape(word) for word in words[:need]) + rest
 
 
 @lru_cache(maxsize=512)
 def _bought(names: tuple[str, ...]) -> re.Pattern[str] | None:
-    """Matches a headline in which one of `names` is the company being bought."""
-    if not names:
+    """Matches a headline in which one of `names` is the company being bought.
+
+    The name has to come straight after the buying phrase, and the headline
+    then has to end or turn to the terms. That is what tells "to Acquire Insmed
+    for $41 Billion" from "to Acquire NVIDIA GPU Servers", which the same
+    words would otherwise make a takeover of NVIDIA.
+    """
+    called = [n if n.isupper() else _spelled(n) for n in names]
+    who = "|".join(re.escape(n) if n.isupper() else f"(?i:{n})" for n in called if n)
+    if not who:
         return None
-    who = "|".join(re.escape(n) if n.isupper() else f"(?i:{re.escape(n)})" for n in names)
-    return re.compile(rf"\b(?i:{_BUYING})\s+(?i:all of\s+|the\s+)?(?:{who})\b")
+    bought = rf"\s+(?:all of\s+|the\s+)?(?-i:{who})\b{_ENDING}"
+    return re.compile(rf"\b(?:(?:{_TAKING}){bought}{_THEN}|(?:{_PAYING}){bought}{_PRICED})", re.IGNORECASE)
 
 
 def headline_type(text: str, names: tuple[str, ...] = ()) -> str:
@@ -513,6 +567,10 @@ def headline_type(text: str, names: tuple[str, ...] = ()) -> str:
     company's own name to go on, "Sanofi to Acquire Insmed" is a takeover for
     Insmed and an acquisition for everyone else, which matters because a
     buyout is the case where the scan's rating stops meaning anything.
+
+    This check comes ahead of the table on purpose. A buyout headline often
+    ends "... Shares Jump", which the table would read as someone trading
+    shares.
     """
     bought = _bought(names)
     if bought is not None and bought.search(text):
@@ -557,7 +615,9 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
     session over the same stretch, earnings days left out, because a 3% day
     means little for a stock that often moves 3%. The same is done for the
     `FOLLOW_SESSIONS` sessions after each event, against every span of that
-    length in the stretch.
+    length in the stretch. A span with an earnings reaction in it is left out
+    on both sides, like the day itself: an event three sessions before a
+    report would otherwise be credited with the report's jump.
 
     "Any session" includes the event days themselves. Leaving them out would
     make a cleaner contrast for a rare event, but for a company in the news
@@ -566,6 +626,14 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
     """
     days = [b.day for b in bars]
     closes = [b.close for b in bars]
+
+    def followed_by(i: int) -> float | None:
+        """The move over the sessions after session `i`, if they are on record and hold no report."""
+        later = i + FOLLOW_SESSIONS
+        if later >= len(closes) or any(day in earnings_days for day in days[i + 1 : later + 1]):
+            return None
+        return closes[later] / closes[i] - 1.0
+
     out: dict[str, EventStudy] = {}
     for kind in dict.fromkeys(kinds):
         if kind in NOT_STUDIED:
@@ -581,13 +649,12 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
 
         moves = []
         for after, (before, item) in sorted(sessions.items(), reverse=True):
-            later = after + FOLLOW_SESSIONS
             moves.append(
                 EventMove(
                     day=days[after],
                     title=item.title,
                     move_pct=closes[after] / closes[before] - 1.0,
-                    after_pct=closes[later] / closes[after] - 1.0 if later < len(closes) else None,
+                    after_pct=followed_by(after),
                 )
             )
         start = max(1, min(min(sessions), len(days) - BASELINE_SESSIONS))
@@ -595,7 +662,7 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
             closes[i] / closes[i - 1] - 1.0 for i in range(start, len(days)) if days[i] not in earnings_days
         )
         followed = [m.after_pct for m in moves if m.after_pct is not None]
-        spans = range(start, len(days) - FOLLOW_SESSIONS)
+        spans = [span for span in map(followed_by, range(start, len(days))) if span is not None]
         out[kind] = EventStudy(
             event=kind,
             label=EVENT_TYPES[kind],
@@ -607,10 +674,26 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
             ordinary_abs=ordinary,
             after_count=len(followed),
             mean_abs_after=_mean_abs(followed),
-            ordinary_abs_after=_mean_abs(closes[i + FOLLOW_SESSIONS] / closes[i] - 1.0 for i in spans) if followed else None,
+            ordinary_abs_after=_mean_abs(spans) if followed else None,
             moves=moves[:MAX_MOVES],
         )
     return out
+
+
+def shortlist(items: Iterable[NewsItem], limit: int) -> list[NewsItem]:
+    """Up to `limit` of `items`, newest first, for a surface with room for only a few.
+
+    The newest item of each type that carries a caution is taken first, then
+    the newest of each other flagged type, then whatever is newest. So a
+    caution is never shown without the headline behind it, however many newer
+    items there are and whatever their types.
+    """
+    newest = sorted(items, key=lambda i: i.when, reverse=True)
+    first = [*CAUTIONS, *(kind for kind in EVENT_TYPES if kind in FLAGGED and kind not in CAUTIONS)]
+    lead = [item for item in (next((i for i in newest if i.event == kind), None) for kind in first) if item is not None]
+    taken = {id(item) for item in lead[:limit]}
+    rest = [item for item in newest if id(item) not in taken]
+    return sorted(lead[:limit] + rest[: max(0, limit - len(taken))], key=lambda i: i.when, reverse=True)
 
 
 def context(

@@ -76,6 +76,7 @@
   .history.news td:first-child, .history.news td.n { white-space: nowrap; }
   .history.news th:nth-child(2), .history.news td:nth-child(2) { text-align: left; }
   .history.news th:nth-child(2) { width: 100%; }
+  .history.news th.n, .history.news td.n { text-align: right; }
   .caution { margin: 6px 0; padding: 6px 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; font-size: 13px; }
   details { border-top: 1px solid var(--line); padding: 6px 0; }
   summary { cursor: pointer; }
@@ -389,7 +390,8 @@ function studyBlock(study) {
     const max = Math.max(study.mean_abs, study.ordinary_abs || 0, study.mean_abs_after || 0, study.ordinary_abs_after || 0);
     body.push(el("p", { class: "sub" }, "Average size of the move, up or down, across " + study.count + " events since "
       + shortDate(study.since) + " (" + study.up + " up, " + study.down + " down), beside the stock's average move on any day "
-      + "over the same stretch. Days that carried an earnings report are left out of both."));
+      + "over the same stretch. Days that carried an earnings report are left out of both, and so is any stretch of "
+      + n + " sessions with a report in it."));
     body.push(compareBar("That day", study.mean_abs, max));
     if (study.ordinary_abs !== null) body.push(compareBar("Any day", study.ordinary_abs, max));
     if (study.after_count >= rules.min_events) {
@@ -400,7 +402,7 @@ function studyBlock(study) {
       + ", which is too few to compare with the stock's usual day."));
   }
   body.push(el("table", { class: "history news" },
-    el("thead", {}, el("tr", {}, el("th", {}, "Session"), el("th", {}, "Event"), el("th", {}, "That day"), el("th", {}, "Next " + n))),
+    el("thead", {}, el("tr", {}, el("th", {}, "Session"), el("th", {}, "Event"), el("th", { class: "n" }, "That day"), el("th", { class: "n" }, "Next " + n))),
     el("tbody", {}, study.moves.map((m) => el("tr", {},
       el("td", {}, shortDate(m.day)),
       el("td", {}, m.title),

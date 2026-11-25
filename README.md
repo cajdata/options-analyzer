@@ -95,8 +95,9 @@ something material happens) over the last 14 days.
   earlier events of that type and measures the size of the move on the day the news was
   first felt, and over the five sessions after it. Each goes beside the stock's average
   move on any day over the same stretch, because a 3% day means little for a stock that
-  often moves 3%. Days that carried an earnings report are left out, and with fewer than
-  three events it says there are too few to compare.
+  often moves 3%. Days that carried an earnings report are left out, and so is any
+  five-session stretch with a report in it. With fewer than three events it says there are
+  too few to compare.
 - **A few types are pointed out in the list of results** (guidance, takeover, split or
   special dividend, offering, distress, drug news), since they tend to move a stock in one
   jump. Two come with a caution, because the scan's own numbers mislead after them: a
@@ -171,7 +172,8 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 - **A buyout breaks the rating.** Once a cash takeover is agreed, the stock sits at the
   deal price and its options price almost no movement. Next to a volatile history every
   option then looks cheap and the rating says "favorable". The news section flags a
-  takeover when a headline names the stock as the company being bought, and only then, so
+  takeover when a headline names the stock as the company being bought ("to Acquire
+  Insmed for $41 Billion", but not "to Acquire NVIDIA GPU Servers"), and only then, so
   still be wary of a stock that jumped and whose implied volatility is far below its
   realized volatility.
 - **Event types are keyword guesses.** About a quarter of headlines fit no rule, and some

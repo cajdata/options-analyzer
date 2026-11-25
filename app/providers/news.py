@@ -49,6 +49,10 @@ class NewsService:
     REFRESH = timedelta(minutes=15)  # how long a stock's record is reused before asking again
     LOOKBACK = timedelta(days=400)  # how far back the first request for a stock's headlines reaches
     KEEP = timedelta(days=1200)  # a study cannot use an item older than the price history
+    # Each request starts this long before the newest headline on file, in case the feed
+    # adds one stamped a little earlier than one it already had. It costs no extra
+    # request, and items are merged by the feed's id, so nothing comes back twice.
+    OVERLAP = timedelta(hours=1)
 
     def __init__(
         self,
@@ -105,7 +109,7 @@ class NewsService:
             return on_disk, None, False
         kept = on_disk or []
         oldest = datetime.combine(today - self.LOOKBACK, clock.min, tzinfo=timezone.utc)
-        since = max((i.when for i in kept), default=oldest)
+        since = max(i.when for i in kept) - self.OVERLAP if kept else oldest
         try:
             fresh = source.headlines(symbol, since)
         except _FAILURES as err:
@@ -148,11 +152,15 @@ def _plain(item: NewsItem) -> dict:
 
 
 def _items(rows: Any) -> list[NewsItem] | None:
-    """Items as stored on disk. None for a copy that does not parse, which is then fetched again."""
+    """Items as stored on disk. None for a copy that does not parse, which is then fetched again.
+
+    A time with no zone does not parse either. It cannot be compared with the
+    times a source returns, and left in place it would fail every later scan.
+    """
     if not isinstance(rows, list):
         return None
     try:
-        return [
+        found = [
             NewsItem(
                 when=datetime.fromisoformat(row["when"]),
                 kind=row["kind"],
@@ -166,3 +174,4 @@ def _items(rows: Any) -> list[NewsItem] | None:
         ]
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
+    return None if any(item.when.tzinfo is None for item in found) else found
