@@ -245,6 +245,13 @@ def test_brief_sends_the_scan_and_keeps_only_real_contracts(discovery):
     assert brief.summary == "Two setups stand out." and brief.model == "claude-opus-5-5"
     assert [p["contract"] for p in brief.picks] == [real]  # the invented contract is dropped
 
+    # A contract the model names twice is listed once, with what it said first.
+    other = discovery.ideas[1].symbol
+    again = ai.Pick(contract=real, headline="again", rationale="r", risks="k", check_first="c")
+    twice = FakeClaude(ai.Brief(summary="s", picks=[pick(real), pick(other), again]))
+    picks = ai.write_brief(discovery, client=twice).picks
+    assert [(p["contract"], p["headline"]) for p in picks] == [(real, "h"), (other, "h")]
+
     request = fake.requests[0]
     assert request["model"] == "claude-opus-5-5" and request["output_format"] is ai.Brief
     assert request["fallbacks"] == "default" and request["betas"] == [ai.FALLBACK_BETA]
@@ -909,6 +916,50 @@ def test_a_buyout_of_the_stock_is_flagged_with_what_it_does_to_the_rating(capsys
     out = " ".join(capsys.readouterr().out.split())  # the caution is wrapped over several lines
     assert out.count("Takeover bid or sale of the company: If this company is being bought for cash") == 1
     assert "the rating means little" in out
+
+
+def test_a_caution_is_never_shown_without_its_headline(capsys):
+    deal = "Tidewell Systems to Acquire Acme for $41 Billion"
+
+    class Feed:
+        name = "test"
+
+        def headlines(self, symbol, since):
+            def at(day, hour, title):
+                when = datetime(2026, 11, day, hour, 0, tzinfo=ZoneInfo("America/New_York"))
+                return NewsItem(when, "headline", title, "test", ref=f"{day}-{hour}")
+
+            # The deal, then a week of law firms' notices and guidance, all newer and all classified.
+            notices = [at(18 + n, 9, f"Marrowgate LLP Investigates the Sale of Acme, Notice {n}") for n in range(4)]
+            guidance = [at(18 + n, 11, f"Acme Raises Full-Year Revenue Guidance, Update {n}") for n in range(6)]
+            return [at(17, 10, deal), *notices, *guidance]
+
+    class NoFilings:
+        name = "test"
+
+        def filings(self, symbol):
+            return []
+
+    result = news_scanner(headlines=Feed(), filings=NoFilings()).scan(ScanRequest(symbols=["ACME"]))
+    acme = result.underlyings["ACME"]
+    assert acme.recent_events == {"guidance": 6, "takeover": 1, "legal": 4}
+
+    from app.__main__ import NEWS_LINES, print_scan
+
+    print_scan(result)
+    out = capsys.readouterr().out
+    assert "being bought for cash" in " ".join(out.split())
+    # Ten newer headlines, three lines, and the deal is one of them.
+    section = out.split("News and filings")[1].split("Types come from")[0]
+    listed = [line for line in section.splitlines() if re.match(r"\s+(?:ACME\s+)?Nov \d\d  ", line)]
+    assert len(listed) == NEWS_LINES == 3 and sum(deal in line for line in listed) == 1
+
+    # The brief as well: six newer items of a flagged type do not use up its six places.
+    news = ai.scan_payload(result)["underlyings"]["ACME"]["recent_news"]
+    assert news["cautions"] == [events.CAUTIONS["takeover"]]
+    assert len(news["items"]) == ai.NEWS_ITEMS == 6
+    assert news["items"][-1]["text"] == deal
+    assert [i["date"] for i in news["items"]] == sorted((i["date"] for i in news["items"]), reverse=True)
 
 
 def test_the_brief_is_given_the_news_as_data(discovery):

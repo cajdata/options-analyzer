@@ -93,21 +93,71 @@ def test_the_order_of_the_rules_settles_a_headline_that_fits_two(headline, kind)
 
 
 @pytest.mark.parametrize(
+    "headline, kind",
+    [
+        # The default search engine on a phone is not a default on a debt.
+        ("Tidewell Pays Acme to Remain Default Search Engine on Its Phones", "other"),
+        ("Acme Defaults on $40 Million Bond Payment", "distress"),
+        ("Tidewell Resolves Alleged Default on Acme Offtake Agreement", "distress"),
+        ("Acme Receives Notice of Default from Its Lenders", "distress"),
+        # A company prices a product as well as an offering.
+        ("Acme Prices Its New Headset at $3,499", "other"),
+        ("Acme Prices $500,000 in Callable Fixed-to-Floating Notes", "financing"),
+        ("Acme Prices Upsized Offering", "financing"),
+        ("Acme Prices Its Initial Public Offering at $21 a Share", "financing"),
+        # Positive data for a chip is not a drug trial.
+        ("Acme Reports Positive Benchmark Data for Its New Processor", "other"),
+        ("Acme Announces Positive 12-Month Data from Open-Label Extension Study of Its Inhaler", "drug"),
+        ("Acme Reports Positive Seven-Year Follow-up Data in Lung Cancer Trial", "drug"),
+        ("Acme Announces Positive Phase 1b Results for AC-102", "drug"),
+        # A test programme has phases too.
+        ("Acme Receives FAA Approval for Phase 4B Certification Testing", "legal"),
+    ],
+)
+def test_a_flagged_type_needs_more_than_one_loose_word(headline, kind):
+    assert events.headline_type(headline) == kind
+
+
+@pytest.mark.parametrize(
     "symbol, name, expected",
     [
         ("INSM", "INSMED Inc", ("INSM", "insmed")),
-        ("JPM", "JPMORGAN CHASE & CO", ("JPM", "jpmorgan")),
-        ("COST", "COSTCO WHOLESALE CORP /NEW", ("COST", "costco")),
+        ("JPM", "JPMORGAN CHASE & CO", ("JPM", "jpmorgan chase")),
+        ("COST", "COSTCO WHOLESALE CORP /NEW", ("COST", "costco wholesale")),
         ("CRM", "Salesforce, Inc.", ("CRM", "salesforce")),
-        ("F", "Ford Motor Co", ("ford",)),  # a one-letter ticker would match far too much
-        ("GM", "General Motors Co", ("general motors",)),  # "general" alone names nobody
-        ("BRK.B", "BERKSHIRE HATHAWAY INC", ("berkshire",)),
+        ("F", "Ford Motor Co", ("ford motor",)),  # a one-letter ticker would match far too much
+        ("BAC", "BANK OF AMERICA CORP /DE/", ("BAC", "bank of america")),
+        ("CI", "The Cigna Group", ("cigna group",)),
+        ("BRK.B", "BERKSHIRE HATHAWAY INC", ("berkshire hathaway",)),
         ("ZZZZ", None, ("ZZZZ",)),
         ("T", "", ()),
     ],
 )
-def test_a_company_goes_by_its_ticker_and_the_first_word_of_its_name(symbol, name, expected):
+def test_a_company_goes_by_its_ticker_and_its_name(symbol, name, expected):
     assert events.aliases(symbol, name) == expected
+
+
+@pytest.mark.parametrize(
+    "name, said, not_said",
+    [
+        # The first word is enough, and the rest of the name may follow it.
+        ("pioneer natural resources", ["Pioneer", "Pioneer Natural", "Pioneer Natural Resources"], ["Natural Resources"]),
+        # A common first word needs the second as well.
+        ("general motors", ["General Motors"], ["General"]),
+        ("home depot", ["Home Depot"], ["Home"]),
+        # A name is never cut short on a joining word.
+        ("bank of america", ["Bank of America"], ["Bank of", "Bank"]),
+        ("procter gamble", ["Procter & Gamble", "Procter"], ["Gamble"]),
+    ],
+)
+def test_how_much_of_a_name_a_headline_has_to_give(name, said, not_said):
+    import re
+
+    pattern = re.compile(events._spelled(name), re.IGNORECASE)
+    assert all(pattern.fullmatch(text) for text in said)
+    assert not any(pattern.fullmatch(text) for text in not_said)
+    # One common word names nobody, and nor does a word of one or two letters.
+    assert events._spelled("united") is None and events._spelled("x") is None
 
 
 def test_the_company_being_bought_is_told_from_the_buyer_by_name():
@@ -129,6 +179,58 @@ def test_the_company_being_bought_is_told_from_the_buyer_by_name():
     assert events.headline_type("Tidewell Systems Wins Deal for Cost Monitoring Software", costco) == "agreement"
     assert events.headline_type("Tidewell Systems to Buy COST in $400 Billion Deal", costco) == "takeover"
     assert events.classify(headline(1, NOON, deal), insmed).event == "takeover"
+
+
+@pytest.mark.parametrize(
+    "symbol, name, text",
+    [
+        # Seen live: all seven were typed as a takeover of the company named.
+        ("NVDA", "NVIDIA CORP", "Quantum Cyber Acquires NVIDIA-Powered AI Compute Cluster"),
+        ("NVDA", "NVIDIA CORP", "GMO Internet Board Approves 10 Billion Yen Deal to Acquire NVIDIA GPU Servers"),
+        ("NVDA", "NVIDIA CORP", "Digi Power X Commits $35 Million to Acquire NVIDIA Vera Rubin Systems"),
+        ("PFE", "PFIZER INC", "Novartis India Acquires Pfizer Brands for $132 Million"),
+        ("BA", "BOEING CO", "China Advances on Commitment to Purchase Boeing Jets"),
+        ("BA", "BOEING CO", "Archer Aviation to Acquire Boeing Subsidiaries Wisk Aero, SkyGrid, and Insitu"),
+        # Its shares, its products or one of its units is not the company.
+        ("NVDA", "NVIDIA CORP", "Tidewell to Buy Nvidia Chips in $10 Billion Deal"),
+        ("BA", "BOEING CO", "Tidewell Air Agrees to Buy Boeing 737 MAX Jets"),
+        ("AAPL", "Apple Inc.", "Longview Partners Buys Apple Shares in Third Quarter"),
+        ("TSLA", "Tesla, Inc.", "Longview Partners Buys Tesla Stock After Dip"),
+        ("MSFT", "MICROSOFT CORP", "Director Reports Purchase of Microsoft Shares"),
+        ("INSM", "INSMED Inc", "Sanofi to Acquire Insmed's Lung Division"),
+        # Advice to buy the stock is not an offer for the company.
+        ("NVDA", "NVIDIA CORP", "Why Investors Should Look to Buy NVDA Ahead of Earnings"),
+        ("AMZN", "AMAZON COM INC", "Marrowgate Capital Reiterates Outperform, Tells Clients to Buy Amazon"),
+        ("AMZN", "AMAZON COM INC", "Three Reasons to Buy Amazon for the Long Term"),
+        # Another company whose name starts the same way.
+        ("BAC", "BANK OF AMERICA CORP /DE/", "Tidewell Capital to Acquire Bank of Hawaii"),
+        ("HD", "HOME DEPOT, INC.", "Tidewell to Acquire Home Services Startup"),
+        ("TGT", "TARGET CORP", "Tidewell to Acquire Target Company in All-Cash Deal"),
+        ("TXN", "TEXAS INSTRUMENTS INC", "Tidewell to Acquire Texas Capital Bank for $2 Billion"),
+    ],
+)
+def test_buying_something_of_a_company_is_not_buying_the_company(symbol, name, text):
+    assert events.headline_type(text, events.aliases(symbol, name)) != "takeover"
+
+
+@pytest.mark.parametrize(
+    "symbol, name, text",
+    [
+        ("HES", "HESS CORP", "Tidewell to Buy Hess for $53 Billion"),
+        ("HES", "HESS CORP", "Tidewell to Buy Hess in All-Stock Deal"),
+        ("HES", "HESS CORP", "Tidewell Agrees to Buy Hess"),
+        ("HES", "HESS CORP", "Tidewell Completes Acquisition of Hess Corp."),
+        ("HES", "HESS CORP", "Tidewell to Acquire Hess, Expanding in Guyana"),
+        ("HES", "HESS CORP", "Tidewell Raises Bid for Hess to $171 a Share"),
+        ("PXD", "PIONEER NATURAL RESOURCES CO", "Tidewell to Acquire Pioneer Natural Resources for $60 Billion"),
+        ("PXD", "PIONEER NATURAL RESOURCES CO", "Tidewell to Acquire Pioneer in $60 Billion Deal"),
+        ("BAC", "BANK OF AMERICA CORP /DE/", "Tidewell Capital Makes Offer for Bank of America"),
+        ("HD", "HOME DEPOT, INC.", "Tidewell to Take Private Home Depot Inc. for $400 Billion"),
+        ("LLY", "ELI LILLY & Co", "Tidewell to Acquire Eli Lilly (LLY) at $900 a Share"),
+    ],
+)
+def test_a_takeover_is_still_caught_however_the_headline_goes_on(symbol, name, text):
+    assert events.headline_type(text, events.aliases(symbol, name)) == "takeover"
 
 
 def test_every_rule_points_at_a_type_with_a_label():
@@ -252,6 +354,27 @@ def test_a_day_that_carries_an_earnings_report_is_left_out():
     assert days[60] not in {m.day for m in study.moves}
 
 
+def test_a_stretch_with_an_earnings_report_in_it_is_left_out_too():
+    # Quiet but for a 20% report on session 60. One event comes three sessions before it.
+    returns = [0.01 if n % 2 else -0.01 for n in range(100)]
+    returns[59] = 0.20
+    bars = bars_from(returns)
+    days, closes = [b.day for b in bars], [b.close for b in bars]
+    items = [news(days[n], clock(10, 0), "guidance", f"event {n}") for n in (20, 30, 40, 57)]
+
+    study = events.study(items, bars, {days[60]}, ["guidance"])["guidance"]
+    after = {m.title: m.after_pct for m in study.moves}
+    # The event counts for its own day. What followed it was the report, so nothing is said of that.
+    assert study.count == 4 and after["event 57"] is None and after["event 40"] is not None
+    assert study.after_count == 3
+    assert study.mean_abs_after == pytest.approx(sum(abs(closes[n + 5] / closes[n] - 1) for n in (20, 30, 40)) / 3)
+    # The usual five sessions leave out the five spans that take in session 60.
+    spans = [abs(closes[i + 5] / closes[i] - 1) for i in range(20, len(closes) - 5) if not i < 60 <= i + 5]
+    assert len(spans) == len(closes) - 5 - 20 - 5
+    assert study.ordinary_abs_after == pytest.approx(sum(spans) / len(spans))
+    assert study.ordinary_abs_after < 0.011  # the report would have made it more than twice that
+
+
 def test_several_items_on_one_session_are_one_event():
     bars = bars_from([0.01] * 30)
     days = [b.day for b in bars]
@@ -356,6 +479,25 @@ def test_a_flagged_item_stays_on_the_list_when_a_busy_week_pushes_it_out():
     assert len(shown) == events.MAX_RECENT + 2 and shown == sorted(shown, key=lambda i: i.when, reverse=True)
     assert [i.ref for i in shown[-2:]] == ["100", "101"]
     assert counts == {"guidance": 2, "financing": 1, "management": 1, "product": 12}
+
+
+def test_a_short_list_always_has_the_headline_behind_a_caution():
+    day = date(2026, 11, 20)
+    deal, split = news(day, clock(8, 0), "takeover", "the deal"), news(day, clock(7, 0), "split", "the split")
+    kinds = ["legal", "analyst", "legal", "guidance", "guidance", "guidance"]
+    newer = [news(day, clock(10 + n, 0), kind, f"{kind} at {10 + n}") for n, kind in enumerate(kinds)]
+
+    # Three newer items of other types: the deal keeps a place, and the list is still newest first.
+    assert events.shortlist([deal, *newer[:3]], 3) == [newer[2], newer[1], deal]
+    # A run of another flagged type cannot crowd it out either: one of each flagged type goes in first.
+    assert events.shortlist([deal, *newer], 3) == [newer[5], newer[4], deal]
+    assert events.shortlist([deal, split, *newer], 6) == [newer[5], newer[4], newer[3], newer[2], deal, split]
+    # With less room than flagged types, the ones that carry a caution come first.
+    assert set(events.CAUTIONS) == {"takeover", "split"}
+    assert events.shortlist([deal, split, *newer], 2) == [deal, split]
+    # With nothing flagged it is simply the newest.
+    assert events.shortlist(newer[:3], 2) == [newer[2], newer[1]]
+    assert events.shortlist([], 3) == []
 
 
 # -- Alpaca headlines -------------------------------------------------------------
@@ -551,7 +693,14 @@ def test_the_record_on_disk_keeps_growing_and_only_newer_headlines_are_asked_for
     age(tmp_path, 20)
     items, note, failed = service.items("ACME", TODAY)
     assert (items, note, failed) == ([new, mid, old], None, False)  # nothing lost, nothing twice
-    assert feed.asked[1] == mid.when  # only from the newest one on file
+    # Only from the newest one on file, less an hour in case the feed adds one stamped just before it.
+    assert feed.asked[1] == mid.when - timedelta(hours=1)
+
+    # Such a late arrival is picked up, and the one already on file does not come back twice.
+    late = headline(4, NOON - timedelta(minutes=20))
+    feed.items = [mid, late, new]
+    age(tmp_path, 20)
+    assert service.items("ACME", TODAY)[0] == [new, late, mid, old]
 
 
 def test_a_failed_lookup_keeps_the_old_record_and_says_so(tmp_path):
@@ -599,6 +748,16 @@ def test_news_with_no_source_or_a_spoiled_cache_is_harmless(tmp_path):
     cache.set("news_filings_ACME", ["not what is expected"])
     service = NewsService(cache, headline_source=feed, filing_source=Filings())
     assert service.items("ACME", TODAY) == ([headline(1, NOON)], None, False)  # fetched afresh, not an error
+
+    # A time with no zone cannot be set beside the times a source returns. Left on
+    # disk it would fail every scan from then on, so it counts as spoiled too.
+    row = {"when": "2026-11-20T10:00:00", "kind": "headline", "title": "no zone", "source": "test"}
+    cache.set("news_headlines_ACME", [row])
+    cache.set("news_filings_ACME", {"items": [row | {"kind": "filing"}], "note": None})
+    report = filing(["2.02"], ref="0002")
+    service = NewsService(cache, headline_source=feed, filing_source=Filings([report]))
+    assert service.items("ACME", TODAY) == ([report, headline(1, NOON)], None, False)
+    assert service.items("ACME", TODAY)[0] == [report, headline(1, NOON)]  # and the copy on disk is good again
 
 
 def test_a_company_name_is_an_extra_that_may_be_missing():

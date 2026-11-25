@@ -42,15 +42,22 @@ def _study_line(study: EventStudy) -> str:
     text += f", {study.up} up {study.down} down"
     if study.after_count >= events.MIN_EVENTS:
         text += (
-            f"; {study.mean_abs_after:.1%} over the next {events.FOLLOW_SESSIONS} sessions "
-            f"({study.ordinary_abs_after:.1%} over any {events.FOLLOW_SESSIONS})"
+            f"; {_pct(study.mean_abs_after)} over the next {events.FOLLOW_SESSIONS} sessions "
+            f"({_pct(study.ordinary_abs_after)} over any {events.FOLLOW_SESSIONS})"
         )
     return text
 
 
+NEWS_LINES = 3  # headlines printed for one stock
+
+
 def _news_lines(symbol: str, ctx: UnderlyingContext) -> list[str]:
-    """A stock's latest classified news, and what followed its past events of those types."""
-    telling = [item for item in ctx.news if item.event not in events.NOT_STUDIED][:3]
+    """A stock's latest classified news, and what followed its past events of those types.
+
+    There is room for a few lines, and a headline behind a caution is always
+    one of them (`events.shortlist`).
+    """
+    telling = events.shortlist((item for item in ctx.news if item.event not in events.NOT_STUDIED), NEWS_LINES)
     lines = []
     for n, item in enumerate(telling):
         when = item.when.astimezone(events.ET)

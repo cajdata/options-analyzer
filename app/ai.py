@@ -230,11 +230,12 @@ def _news(u: UnderlyingContext) -> dict[str, Any] | None:
     """A stock's recent news for the model: a few items, what followed their types, and any caution.
 
     Unlike the keyword rules, the model can read a headline no rule matched, so
-    unclassified items are included. A notice of a date is not. Items of a
-    flagged type come first, so a busy week cannot crowd one out.
+    unclassified items are included. A notice of a date is not. The newest
+    item of each flagged type goes in first (`events.shortlist`), so neither a
+    busy week nor a run of one flagged type can crowd out the headline behind
+    a caution.
     """
-    readable = [i for i in u.news if i.event != "calendar"]
-    chosen = sorted(readable, key=lambda i: i.event not in events.FLAGGED)[:NEWS_ITEMS]  # stable: newest first within each
+    chosen = events.shortlist((i for i in u.news if i.event != "calendar"), NEWS_ITEMS)
     if not chosen and not u.news_note:
         return None
     out: dict[str, Any] = {
@@ -247,7 +248,7 @@ def _news(u: UnderlyingContext) -> dict[str, Any] | None:
                 "kind": "SEC 8-K filing" if item.kind == "filing" else "headline",
                 "text": item.title[:HEADLINE_CHARS],
             }
-            for item in sorted(chosen, key=lambda i: i.when, reverse=True)
+            for item in chosen
         ],
     }
     studies = [_study(u.event_studies[kind]) for kind in dict.fromkeys(i.event for i in chosen) if kind in u.event_studies]
@@ -385,7 +386,11 @@ def write_brief(
     if response.stop_reason == "max_tokens" or brief is None:
         raise BriefError("The model's answer was cut off before it finished.")
 
-    # Keep only picks that name a contract from this scan.
+    # Keep only picks that name a contract from this scan, and each contract once.
     known = {c.symbol for c in result.ideas}
-    picks = [p.model_dump() for p in brief.picks if p.contract in known][:MAX_PICKS]
+    named: dict[str, Any] = {}
+    for pick in brief.picks:
+        if pick.contract in known:
+            named.setdefault(pick.contract, pick)
+    picks = [pick.model_dump() for pick in named.values()][:MAX_PICKS]
     return BriefResult(summary=brief.summary, picks=picks, model=response.model)
