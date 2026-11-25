@@ -9,6 +9,8 @@ type. An optional AI brief has Claude write up the setups worth a closer look.
 It only reads market data. It cannot place orders. The ranking is a screen, not a
 forecast and not financial advice.
 
+Website: [strikecheck.app](https://strikecheck.app)
+
 ## Try it without any keys
 
 ```powershell
