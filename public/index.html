@@ -77,6 +77,8 @@
   .history.news th:nth-child(2), .history.news td:nth-child(2) { text-align: left; }
   .history.news th:nth-child(2) { width: 100%; }
   .history.news th.n, .history.news td.n { text-align: right; }
+  .history.pool th, .history.pool td, .history.pool th:last-child, .history.pool td:last-child { text-align: right; }
+  .history.pool th:first-child, .history.pool td:first-child { text-align: left; white-space: normal; }
   .caution { margin: 6px 0; padding: 6px 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; font-size: 13px; }
   details { border-top: 1px solid var(--line); padding: 6px 0; }
   summary { cursor: pointer; }
@@ -435,6 +437,30 @@ function elsewhereBlock(ctx) {
     newsTable(items))];
 }
 
+// One type of event across the stocks on record that are covered about as much as this one.
+// Each stock's days are measured against its own usual day, so they can be counted together.
+function pooledBlock(ctx) {
+  const rules = status.events.pool;
+  const rows = Object.values(ctx.pooled_studies || {});
+  if (!rows.length) return [];
+  const share = (part, whole) => (whole ? pct(part / whole, 0) : "–");
+  const big = "Over " + rules.big_move + "× usual";
+  return [
+    el("p", { class: "sub" }, "The same types across the " + rows[0].group_stocks + " " + rules.groups[rows[0].group]
+      + " stocks on record. A day counts as big when it moved more than " + rules.big_move
+      + " times that stock's own usual day, and the last column is how often any day did."),
+    el("table", { class: "history pool" },
+      el("thead", {}, el("tr", {}, el("th", {}, "Type"), el("th", {}, "Days"), el("th", {}, big), el("th", {}, "Up / down"), el("th", {}, "Any day"))),
+      el("tbody", {}, rows.map((row) => row.events < rules.min_events
+        ? el("tr", {}, el("td", {}, row.label), el("td", {}, String(row.events)), el("td", { class: "sub" }, "too few"), el("td", {}, ""), el("td", {}, ""))
+        : el("tr", {}, el("td", {}, row.label), el("td", {}, row.events + " in " + row.stocks + " stocks"),
+          el("td", {}, share(row.big, row.events)), el("td", {}, row.up + " / " + row.down), el("td", {}, share(row.big_sessions, row.sessions)))))),
+    el("p", { class: "sub" }, "A stock is " + rules.groups.heavy + " when the feed carried " + rules.heavy_headlines + " or more headlines of its own in the last "
+      + rules.coverage_days + " days, and " + rules.groups.light + " otherwise. The two are kept apart because they behave differently. "
+      + "Earnings days are left out. The pool grows as stocks are scanned, and \"python -m app pool\" adds more."),
+  ];
+}
+
 function newsBlock(ctx) {
   const rules = status.events;
   const parts = [el("h3", {}, "News and filings")];
@@ -455,6 +481,7 @@ function newsBlock(ctx) {
     parts.push(el("p", { class: "sub" }, "What followed this stock's past events of the same types:"));
     studies.forEach((study) => parts.push(studyBlock(study)));
   }
+  pooledBlock(ctx).forEach((part) => parts.push(part));
   elsewhereBlock(ctx).forEach((part) => parts.push(part));
   parts.push(el("p", { class: "sub" }, "Times are New York time. Types come from keyword rules on the headline and from the item codes on an 8-K filing, "
     + "so some are wrong, and a headline can be about another company that only mentions this one. What followed past events describes this stock's "

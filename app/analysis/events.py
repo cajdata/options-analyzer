@@ -15,11 +15,11 @@ from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime, time as clock, timedelta
 from functools import lru_cache
-from typing import Iterable
+from typing import Iterable, NamedTuple
 from zoneinfo import ZoneInfo
 
 from app.analysis.earnings import window
-from app.models import Bar, EventMove, EventStudy, NewsItem
+from app.models import Bar, EventMove, EventStudy, NewsItem, PooledStudy
 
 ET = ZoneInfo("America/New_York")
 MARKET_CLOSE = clock(16, 0)
@@ -32,6 +32,15 @@ MAX_MOVES = 8  # past events listed in a study
 # The stock's usual move is measured from the first event on, but over at least this
 # many sessions, so two events last week are not compared with a handful of days.
 BASELINE_SESSIONS = 60
+
+# Pooling a type of event across stocks.
+BIG_MOVE = 2.0  # a day is big at more than this many times the stock's own usual day
+MIN_POOLED = 20  # below this many pooled events nothing is compared
+COVERAGE_DAYS = 180  # how far back a stock's headlines are counted to say how much it is covered
+HEAVY_HEADLINES = 90  # that many of its own in that time, about one every other day, is heavy coverage
+GROUPS: dict[str, str] = {"light": "lightly covered", "heavy": "heavily covered"}
+# What a stock adds to a pool for one type of event, in this order.
+TALLY = ("events", "big", "up", "down", "sessions", "big_sessions")
 
 # Event types, each with the label a person sees.
 EVENT_TYPES: dict[str, str] = {
@@ -736,6 +745,27 @@ def _mean_abs(values: Iterable[float]) -> float | None:
     return statistics.fmean(sizes) if sizes else None
 
 
+def _placed(items: list[NewsItem], days: list[date], earnings_days: set[date], kind: str) -> dict[int, tuple[int, NewsItem]]:
+    """One type's events as sessions: the session that reflects each, with the session before it and the earliest item."""
+    sessions: dict[int, tuple[int, NewsItem]] = {}
+    for item in sorted((i for i in items if i.event == kind), key=lambda i: i.when):
+        found = window(*_felt(item.when), days)
+        if found is None or days[found[1]] in earnings_days:
+            continue
+        sessions.setdefault(found[1], (found[0], item))
+    return sessions
+
+
+def _stretch(sessions: dict[int, tuple[int, NewsItem]], days: list[date]) -> int:
+    """The session a type's usual day is measured from: its first event, or `BASELINE_SESSIONS` back if that is earlier."""
+    return max(1, min(min(sessions), len(days) - BASELINE_SESSIONS))
+
+
+def _usual(start: int, days: list[date], closes: list[float], earnings_days: set[date]) -> list[float]:
+    """The move on every session from `start` on, earnings days left out."""
+    return [closes[i] / closes[i - 1] - 1.0 for i in range(start, len(days)) if days[i] not in earnings_days]
+
+
 def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kinds: Iterable[str]) -> dict[str, EventStudy]:
     """What followed this stock's past events of each type in `kinds`.
 
@@ -771,12 +801,7 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
     for kind in dict.fromkeys(kinds):
         if kind in NOT_STUDIED:
             continue
-        sessions: dict[int, tuple[int, NewsItem]] = {}  # reaction session: (session before, earliest item)
-        for item in sorted((i for i in items if i.event == kind), key=lambda i: i.when):
-            found = window(*_felt(item.when), days)
-            if found is None or days[found[1]] in earnings_days:
-                continue
-            sessions.setdefault(found[1], (found[0], item))
+        sessions = _placed(items, days, earnings_days, kind)
         if not sessions:
             continue
 
@@ -790,10 +815,8 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
                     after_pct=followed_by(after),
                 )
             )
-        start = max(1, min(min(sessions), len(days) - BASELINE_SESSIONS))
-        ordinary = _mean_abs(
-            closes[i] / closes[i - 1] - 1.0 for i in range(start, len(days)) if days[i] not in earnings_days
-        )
+        start = _stretch(sessions, days)
+        ordinary = _mean_abs(_usual(start, days, closes, earnings_days))
         followed = [m.after_pct for m in moves if m.after_pct is not None]
         spans = [span for span in map(followed_by, range(start, len(days))) if span is not None]
         out[kind] = EventStudy(
@@ -809,6 +832,83 @@ def study(items: list[NewsItem], bars: list[Bar], earnings_days: set[date], kind
             mean_abs_after=_mean_abs(followed),
             ordinary_abs_after=_mean_abs(spans) if followed else None,
             moves=moves[:MAX_MOVES],
+        )
+    return out
+
+
+def coverage(items: Iterable[NewsItem], today: date) -> str:
+    """Which stocks a stock is compared with: "heavy" if the feed carries news of its own most days, else "light".
+
+    The cut matters more than anything else in a pooled study. Measured on 73
+    stocks: for a heavily covered one no type of headline was followed by a
+    bigger day than usual, while for a lightly covered one an offering or a
+    reverse split was. Pooled together the two cancel out. `items` are
+    classified, so another company's news is not counted towards coverage.
+    """
+    cutoff = today - timedelta(days=COVERAGE_DAYS)
+    own = sum(1 for i in items if i.kind == "headline" and i.event != ELSEWHERE and _felt(i.when)[0] >= cutoff)
+    return "heavy" if own >= HEAVY_HEADLINES else "light"
+
+
+def tally(items: list[NewsItem], bars: list[Bar], earnings_days: set[date]) -> dict[str, list[int]]:
+    """What one stock adds to a pool, by event type: `TALLY` counts for each type it has events of.
+
+    A day is big when it moved more than `BIG_MOVE` times the stock's usual
+    day, which is measured as in `study`: over the stretch the type's events
+    span, earnings days left out. Counting against each stock's own usual day
+    is what lets a volatile stock and a quiet one be added together.
+    """
+    days = [b.day for b in bars]
+    closes = [b.close for b in bars]
+    out: dict[str, list[int]] = {}
+    for kind in dict.fromkeys(i.event for i in items):
+        if kind in NOT_STUDIED:
+            continue
+        sessions = _placed(items, days, earnings_days, kind)
+        if not sessions:
+            continue
+        usual = _usual(_stretch(sessions, days), days, closes, earnings_days)
+        size = _mean_abs(usual)
+        if not size:
+            continue  # a stock that never moved has no usual day to measure against
+        moves = [closes[after] / closes[before] - 1.0 for after, (before, _) in sessions.items()]
+        out[kind] = [
+            len(moves),
+            sum(1 for m in moves if abs(m) > BIG_MOVE * size),
+            sum(1 for m in moves if m > 0),
+            sum(1 for m in moves if m < 0),
+            len(usual),
+            sum(1 for m in usual if abs(m) > BIG_MOVE * size),
+        ]
+    return out
+
+
+def pooled(totals: dict[str, dict], group: str, kinds: Iterable[str]) -> dict[str, PooledStudy]:
+    """Pooled studies for one group of stocks, for each type in `kinds` that the pool has any event of.
+
+    `totals` is what `EventPool.totals` returns: for each group, how many
+    stocks are on record and, by type, the summed `TALLY` counts and how many
+    stocks they came from.
+    """
+    found = totals.get(group) or {}
+    out: dict[str, PooledStudy] = {}
+    for kind in dict.fromkeys(kinds):
+        row = (found.get("kinds") or {}).get(kind)
+        if kind in NOT_STUDIED or not row or not row["counts"][0]:
+            continue
+        events, big, up, down, sessions, big_sessions = row["counts"]
+        out[kind] = PooledStudy(
+            event=kind,
+            label=EVENT_TYPES[kind],
+            group=group,
+            group_stocks=found.get("stocks", 0),
+            stocks=row["stocks"],
+            events=events,
+            big=big,
+            up=up,
+            down=down,
+            sessions=sessions,
+            big_sessions=big_sessions,
         )
     return out
 
@@ -829,11 +929,22 @@ def shortlist(items: Iterable[NewsItem], limit: int) -> list[NewsItem]:
     return sorted(lead[:limit] + rest[: max(0, limit - len(taken))], key=lambda i: i.when, reverse=True)
 
 
+class NewsContext(NamedTuple):
+    """What `context` works out for one stock."""
+
+    shown: list[NewsItem]  # the latest items of its own, newest first
+    counts: dict[str, int]  # recent items by event type
+    studies: dict[str, EventStudy]  # what followed its past events, by type
+    elsewhere: list[NewsItem]  # recent items that are another company's news
+    coverage: str  # "light" or "heavy": which stocks it is pooled with
+    tally: dict[str, list[int]]  # what it adds to that pool, by type
+
+
 def context(
     items: list[NewsItem], bars: list[Bar], earnings_days: set[date], today: date, names: tuple[str, ...] = ()
-) -> tuple[list[NewsItem], dict[str, int], dict[str, EventStudy], list[NewsItem]]:
+) -> NewsContext:
     """One stock's news for a scan: the latest items, a count of recent ones by type, the studies,
-    and the recent items that are another company's news.
+    the recent items that are another company's news, and its place in a pool.
 
     `items` are everything on record for the stock, classified or not, and
     `names` are what a headline may call the company. A study is built for
@@ -846,6 +957,9 @@ def context(
     Another company's news takes none of those places. It is counted, so the
     page can say how much of it there is, and the newest `MAX_ELSEWHERE` are
     handed back apart, to be looked at by anyone who doubts the rule.
+
+    The tally is over the whole record and every type in it, not only the
+    recent ones: it is this stock's share of a pool that other stocks draw on.
     """
     classified = sorted((classify(i, names) for i in items), key=lambda i: i.when, reverse=True)
     cutoff = today - timedelta(days=RECENT_DAYS)
@@ -858,4 +972,11 @@ def context(
     shown += [next(i for i in own if i.event == kind) for kind in order if kind in FLAGGED and kind not in listed]
     shown.sort(key=lambda i: i.when, reverse=True)
     elsewhere = [i for i in recent if i.event == ELSEWHERE][:MAX_ELSEWHERE]
-    return shown, {kind: counts[kind] for kind in order}, study(classified, bars, earnings_days, order), elsewhere
+    return NewsContext(
+        shown=shown,
+        counts={kind: counts[kind] for kind in order},
+        studies=study(classified, bars, earnings_days, order),
+        elsewhere=elsewhere,
+        coverage=coverage(classified, today),
+        tally=tally(classified, bars, earnings_days),
+    )

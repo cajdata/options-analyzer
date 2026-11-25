@@ -11,7 +11,7 @@ from dataclasses import asdict
 from app import ai
 from app.config import ConfigError, load_settings
 from app.analysis import events, exits
-from app.models import ContractAnalysis, EventStudy, ExitPlan, ScanResult, UnderlyingContext
+from app.models import ContractAnalysis, EventStudy, ExitPlan, PooledStudy, ScanResult, UnderlyingContext
 from app.scanner import PRESETS, ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
@@ -48,6 +48,35 @@ def _study_line(study: EventStudy) -> str:
     return text
 
 
+def _pooled_line(pooled: PooledStudy, lead: bool = True) -> str:
+    """One type of event across the stocks covered about as much as this one, in a line."""
+    what = f'{pooled.events} "{pooled.event}" days'
+    if lead:
+        what = f"across {pooled.group_stocks} {events.GROUPS[pooled.group]} stocks, {what}"
+    if pooled.events < events.MIN_POOLED:
+        return f"{what}: too few to compare"
+    return (
+        f"{what}: {pooled.big / pooled.events:.0%} moved over {events.BIG_MOVE:g}x the stock's usual day "
+        f"({pooled.big_sessions / pooled.sessions:.0%} of all days), {pooled.up} up {pooled.down} down"
+    )
+
+
+def print_pool(found: dict) -> None:
+    """What `Scanner.widen_pool` did, and what the pool now holds for the types that are pointed out."""
+    added = found["added"]
+    print(f"\nAsked for {found['asked']} stocks. Added " + ", ".join(f"{n} {events.GROUPS[g]}" for g, n in added.items()) + ".")
+    if found["passed_over"]:
+        print("Passed over: " + ", ".join(f"{n} with {why}" for why, n in found["passed_over"].items()) + ".")
+    for group, label in events.GROUPS.items():
+        totals = found["totals"][group]
+        print(f"\n{label.capitalize()}: {totals['stocks']} stocks on record")
+        pooled = events.pooled(found["totals"], group, [kind for kind in events.EVENT_TYPES if kind in events.FLAGGED])
+        for study in pooled.values():
+            print(f"  {_pooled_line(study, lead=False)}")
+    print("\nA day is counted against the stock's own usual day, earnings days left out. Types are keyword")
+    print("guesses, and this describes the past: it is not a forecast.")
+
+
 NEWS_LINES = 3  # headlines printed for one stock
 
 
@@ -65,6 +94,8 @@ def _news_lines(symbol: str, ctx: UnderlyingContext) -> list[str]:
     for kind in dict.fromkeys(item.event for item in telling):
         if kind in ctx.event_studies:
             lines.append(f"        {_study_line(ctx.event_studies[kind])}")
+        if kind in ctx.pooled_studies:
+            lines.append(f"        {_pooled_line(ctx.pooled_studies[kind])}")
     for kind in ctx.recent_events:
         if kind in events.CAUTIONS:
             caution = f"{events.EVENT_TYPES[kind]}: {events.CAUTIONS[kind]}"
@@ -228,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
 
+    pool = sub.add_parser("pool", help="add stocks to the pool that news events are compared across")
+    pool.add_argument("symbols", nargs="*", help="tickers to add; leave empty for the universe and the day's most active stocks and movers")
+    pool.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
+
     args = parser.parse_args(argv)
     if args.command == "scan":
         # A preset fills in whatever was not given on the command line.
@@ -268,6 +303,18 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as err:
         print(err, file=sys.stderr)
         return 2
+    if args.command == "pool":
+        def progress(n: int, of: int, symbol: str) -> None:
+            if n == 1 or n % 25 == 0 or n == of:
+                print(f"  reading news: {n} of {of} ({symbol})", file=sys.stderr)
+
+        try:
+            found = scanner.widen_pool(args.symbols, progress=progress)
+        except ConfigError as err:
+            print(err, file=sys.stderr)
+            return 2
+        print_pool(found)
+        return 0
     request = ScanRequest(
         symbols=args.symbols,
         lens=args.lens,
