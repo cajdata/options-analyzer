@@ -23,6 +23,7 @@ ET = ZoneInfo("America/New_York")
 MAX_CHAIN_PAGES = 15  # 1,000 contracts a page
 NEWS_PAGE = 50  # the most headlines the news endpoint returns at once
 MAX_NEWS_PAGES = 40
+SUMMARY_CHARS = 400  # a headline's summary is one sentence; the longest seen was 281 characters
 _RETRIES = 3
 # Today's daily bar is final a little after the 4 p.m. close.
 BAR_FINAL = clock(16, 20)
@@ -342,6 +343,7 @@ def _headline(row: Any) -> NewsItem | None:
         # The link comes from a third party and ends up on a page, so only a web address is kept.
         url=link if link.lower().startswith(("https://", "http://")) else None,
         ref=str(row.get("id") or ""),
+        summary=" ".join(str(row.get("summary") or "").split())[:SUMMARY_CHARS],
     )
 
 

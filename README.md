@@ -91,6 +91,13 @@ something material happens) over the last 14 days.
   the item codes the SEC makes every 8-K carry. Both tables are in
   `app/analysis/events.py`. Nothing reads the story, and nothing judges whether the news
   is good or bad.
+- **Whose news it is.** The feed tags a stock with any headline that mentions it. A type
+  counts for a company only where the headline puts the company: a stock offering or a
+  change of guidance when the company's name opens the headline, a takeover when the
+  company is the one being bought and not the bidder. A headline that never names the
+  company, or in which it only wrote the analyst's note or holds the other company's
+  shares, is set aside as another company's news. The dashboard keeps those in a folded
+  section, so the rule can be checked.
 - **What followed.** For each type seen lately, the app looks back at the same stock's
   earlier events of that type and measures the size of the move on the day the news was
   first felt, and over the five sessions after it. Each goes beside the stock's average
@@ -178,8 +185,9 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   realized volatility.
 - **Event types are keyword guesses.** About a quarter of headlines fit no rule, and some
   fit the wrong one. A headline tagged with a stock can be about another company that only
-  mentions it: a bank's notes on other stocks, its loans and its holdings are all tagged
-  with the bank. Read the headline before trusting its label.
+  mentions it. A bank's notes on other stocks and its holdings in them are set aside, but a
+  partner's press release that name-drops the stock still counts as the stock's. Read the
+  headline before trusting its label.
 - **What followed past events is a description of a small sample.** The news feed reaches
   back about seven months (the app keeps what it has seen, so the record grows), a study
   often rests on a handful of days, and the move is measured close to close, so it includes
@@ -222,8 +230,8 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
    a premium-selling preset.
 2. **Started:** news layer. Headlines and 8-K filings are typed by event, each stock
    shows what followed its own earlier events of the same type, and the AI brief reads
-   the recent ones. Still to do: pool similar events across stocks so a study rests on
-   more than a handful of days, and tell which company a headline is about.
+   the recent ones. Rules decide whose news a headline is. Still to do: pool similar
+   events across stocks so a study rests on more than a handful of days.
 3. A positions page that checks what you hold against the exit rules, then paper trading
    on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.

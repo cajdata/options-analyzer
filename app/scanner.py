@@ -257,7 +257,7 @@ class Scanner:
             try:
                 items, ctx.news_note, failed = self.news.items(symbol, today)
                 names = events.aliases(symbol, self.news.name(symbol))
-                ctx.news, ctx.recent_events, ctx.event_studies = events.context(
+                ctx.news, ctx.recent_events, ctx.event_studies, ctx.news_elsewhere = events.context(
                     items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, names
                 )
             except Exception as err:  # news is an extra: it must not sink the scan

@@ -83,6 +83,7 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
                 "labels": events.EVENT_TYPES,
                 "flagged": sorted(events.FLAGGED),
                 "cautions": events.CAUTIONS,
+                "elsewhere": events.ELSEWHERE,
                 "recent_days": events.RECENT_DAYS,
                 "follow_sessions": events.FOLLOW_SESSIONS,
                 "min_events": events.MIN_EVENTS,

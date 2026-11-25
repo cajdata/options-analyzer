@@ -411,30 +411,51 @@ function studyBlock(study) {
   return el("details", {}, el("summary", {}, summary), body);
 }
 
+function newsTable(items) {
+  const rules = status.events;
+  return el("table", { class: "history news" }, el("tbody", {}, items.map((item) => el("tr", {},
+    el("td", { class: "sub" }, newsTime(item.when)),
+    el("td", {},
+      // The link is a third party's. Only a web address is ever made clickable.
+      /^https?:\/\//i.test(item.url || "") ? el("a", { href: item.url, target: "_blank", rel: "noopener noreferrer" }, item.title) : item.title,
+      el("div", { class: "sub" }, rules.labels[item.event] || item.event))))));
+}
+
+// Headlines the feed tags with this stock that are another company's news. They count towards
+// nothing, and are folded away here so that the rule which set them aside can be checked.
+function elsewhereBlock(ctx) {
+  const rules = status.events;
+  const items = ctx.news_elsewhere || [];
+  if (!items.length) return [];
+  const count = ctx.recent_events[rules.elsewhere] || items.length;
+  return [el("details", {}, el("summary", {}, "About other companies · " + count + " in the last " + rules.recent_days + " days"),
+    el("p", { class: "sub" }, "The feed tags these with " + ctx.symbol + ", but the news is someone else's: the headline never names the company, "
+      + "or the company is the one writing an analyst's note or reporting a stake in another company. They are not counted above and are in no study."
+      + (count > items.length ? " The newest " + items.length + " are listed." : "")),
+    newsTable(items))];
+}
+
 function newsBlock(ctx) {
   const rules = status.events;
   const parts = [el("h3", {}, "News and filings")];
   if (!status.news_sources.length) return parts.concat(el("p", { class: "sub" }, "No news source is configured."));
   if (ctx.news_note) parts.push(el("p", { class: "sub" }, ctx.news_note));
   if (!ctx.news.length) {
-    return parts.concat(el("p", { class: "sub" }, "Nothing in the last " + rules.recent_days + " days. An exchange-traded fund usually has none."));
+    const none = (ctx.news_elsewhere || []).length ? "Nothing of this company's own in the last " : "Nothing in the last ";
+    return parts.concat(el("p", { class: "sub" }, none + rules.recent_days + " days. An exchange-traded fund usually has none."), elsewhereBlock(ctx));
   }
-  const kinds = Object.entries(ctx.recent_events);
+  const kinds = Object.entries(ctx.recent_events).filter(([kind]) => kind !== rules.elsewhere);
   parts.push(el("p", { class: "sub" }, "Last " + rules.recent_days + " days, by type: ", kinds.map(([kind, count]) =>
     el("span", { class: "chip" + (rules.flagged.includes(kind) ? " hot" : "") }, rules.labels[kind] + (count > 1 ? " × " + count : "")))));
   kinds.filter(([kind]) => rules.cautions[kind]).forEach(([kind]) =>
     parts.push(el("p", { class: "caution" }, rules.labels[kind] + ". " + rules.cautions[kind])));
-  parts.push(el("table", { class: "history news" }, el("tbody", {}, ctx.news.map((item) => el("tr", {},
-    el("td", { class: "sub" }, newsTime(item.when)),
-    el("td", {},
-      // The link is a third party's. Only a web address is ever made clickable.
-      /^https?:\/\//i.test(item.url || "") ? el("a", { href: item.url, target: "_blank", rel: "noopener noreferrer" }, item.title) : item.title,
-      el("div", { class: "sub" }, rules.labels[item.event] || item.event)))))));
+  parts.push(newsTable(ctx.news));
   const studies = Object.values(ctx.event_studies);
   if (studies.length) {
     parts.push(el("p", { class: "sub" }, "What followed this stock's past events of the same types:"));
     studies.forEach((study) => parts.push(studyBlock(study)));
   }
+  elsewhereBlock(ctx).forEach((part) => parts.push(part));
   parts.push(el("p", { class: "sub" }, "Times are New York time. Types come from keyword rules on the headline and from the item codes on an 8-K filing, "
     + "so some are wrong, and a headline can be about another company that only mentions this one. What followed past events describes this stock's "
     + "history. It is not a forecast."));

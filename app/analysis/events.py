@@ -54,12 +54,25 @@ EVENT_TYPES: dict[str, str] = {
     "agreement": "Partnership, contract or order",
     "product": "Product or business update",
     "disclosure": "Other company disclosure",
+    "another": "Another company's news",
     "calendar": "Scheduled call or presentation",
     "other": "Not classified",
 }
+# A headline the feed tags with a stock though the news is someone else's: it never
+# names the company, or the company is the one writing the analyst's note or holding
+# the shares. Such an item is kept to be looked at, and counts towards nothing.
+ELSEWHERE = "another"
+MAX_ELSEWHERE = 10  # how many of them are kept for one stock
 # Not studied: earnings have their own section built from report dates, a notice of
-# a date is not the event, and unclassified items have nothing in common.
-NOT_STUDIED = frozenset({"earnings", "calendar", "other"})
+# a date is not the event, and neither unclassified items nor other companies' news
+# have anything in common.
+NOT_STUDIED = frozenset({"earnings", "calendar", "other", ELSEWHERE})
+# These happen to the company that announces them, so they count for a company only
+# when its name opens the headline. "IREN Secures $3.6 Billion Financing for NVIDIA GPU
+# Acquisition" is IREN raising money, and "Morgan Stanley Raises Tesla Q2 Delivery
+# Estimate" is not Tesla's guidance. Drug news is left out of this on purpose: "FDA
+# Approves Eli Lilly's Mounjaro" is the usual wording for the company's own news.
+IN_FRONT = frozenset({"guidance", "split", "financing", "distress"})
 # Types that tend to move a stock in one jump. A recent one is pointed out in the
 # list of results, so it is seen before a contract is opened.
 FLAGGED = frozenset({"guidance", "takeover", "split", "financing", "distress", "drug"})
@@ -182,11 +195,16 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         _rule(r"(?:stock|share) split", r"reverse (?:stock )?split", r"\d+-for-\d+", r"special (?:cash )?dividend"),
     ),
     (
-        # The company is the lender or the investor here, not the one raising money.
+        # The company is the lender, the investor or the banker here, not the one raising money.
         "agreement",
         _rule(
             r"(?:leads?|to lead|provides?|participates? in|underwrit\w+|to underwrite|arranges?|backs?|invests? in)\b.*"
             r"\b(?:financing|credit facility|funding round|loan|series [a-f])\b",
+            r"(?:selected|chosen|hired|tapped|picked) (?:to|as|for)\b.*\b(?:ipo|offering|listing)\b",
+            r"to lead\b.*\b(?:ipo|offering|listing)\b",
+            r"working with\b.*\bon\b.*\b(?:ipo|offering|listing)\b",
+            r"(?:participat\w+ in|pledges?|commits?|(?:expresses?|indicates?) interest in|pitch(?:es|ing)?)\b.*"
+            r"\b(?:ipo|offering|funding round|financing)\b",
         ),
     ),
     (
@@ -520,6 +538,14 @@ def aliases(symbol: str, name: str | None = None) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _needed(words: list[str]) -> int | None:
+    """How many words of a company's name a headline has to give. None if no part of it is safe to go by."""
+    need = 2 if words[0] in _COMMON else 1
+    while need <= len(words) and words[need - 1] in _JOINING:
+        need += 1
+    return None if need > len(words) or len(" ".join(words[:need])) < 3 else need
+
+
 def _spelled(name: str) -> str | None:
     """A pattern for a company's name as a headline gives it, or None if no part of it is safe to go by.
 
@@ -530,10 +556,8 @@ def _spelled(name: str) -> str | None:
     nobody.
     """
     words = name.split()
-    need = 2 if words[0] in _COMMON else 1
-    while need <= len(words) and words[need - 1] in _JOINING:
-        need += 1
-    if need > len(words) or len(" ".join(words[:need])) < 3:
+    need = _needed(words)
+    if need is None:
         return None
     gap = r"(?:\s+&)?\s+"  # "Procter & Gamble" is on file as two words
     rest = ""
@@ -559,7 +583,82 @@ def _bought(names: tuple[str, ...]) -> re.Pattern[str] | None:
     return re.compile(rf"\b(?:(?:{_TAKING}){bought}{_THEN}|(?:{_PAYING}){bought}{_PRICED})", re.IGNORECASE)
 
 
-def headline_type(text: str, names: tuple[str, ...] = ()) -> str:
+# Words in a company's name that name nobody by themselves ("Palantir Technologies",
+# "Costco Wholesale"), so a headline that has only that word does not name the company.
+_PLAIN_WORDS = frozenset(
+    "airlines america brands capital communications company corporation devices electric electronics enterprises "
+    "express financial foods global group health healthcare holdings industries instruments international labs lines "
+    "materials medical micro motor motors networks partners pharmaceuticals platforms resources sciences services "
+    "software solutions stores systems technologies technology therapeutics wholesale".split()
+)
+# After the name these make someone else the subject: "Apple Supplier Foxconn Cuts Outlook".
+_OF_ANOTHER = r"supplier|rival|competitor|partner|backer|investor|customer|peer|spin-?off"
+
+
+@lru_cache(maxsize=512)
+def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | None:
+    """Two patterns for a company: its name opening a headline, and its name anywhere in a text.
+
+    None when no name is known, only a ticker. Headlines rarely give the
+    ticker, so with nothing else to go by every headline would look like
+    someone else's.
+
+    Both are looser than the spelling a takeover needs (`_spelled`). They take
+    the name with its dots and spaces moved ("J.P. Morgan" and "JPMorganChase"
+    for "jpmorgan chase") and a later word of the name alone ("Lilly",
+    "Chase"), unless that word is a plain one. Looser is the safe side here:
+    a headline wrongly taken to name the company is typed as it always was.
+    """
+    ways = []
+    for name in names:
+        words = name.split()
+        need = None if name.isupper() else _needed(words)
+        if need is None:
+            continue
+        gap = r"[\s&.,]*"
+        loosely = [r"[.\s]*".join(map(re.escape, word)) if len(word) >= 6 else re.escape(word) for word in words]
+        rest = ""
+        for word in reversed(loosely[need:]):
+            rest = rf"(?:{gap}{word}{rest})?"
+        ways.append(gap.join(loosely[:need]) + rest)
+        ways += [re.escape(w) for w in words[need:] if len(w) >= 5 and w not in _COMMON and w not in _PLAIN_WORDS]
+    if not ways:
+        return None
+    tickers = [re.escape(n) for n in names if n.isupper()]
+    who = "|".join([f"(?i:{way})" for way in ways] + tickers)
+    opens = re.compile(rf"(?:(?i:the)\s+)?(?:{who})(?![A-Za-z0-9-])(?!\s+(?i:{_OF_ANOTHER})\b)")
+    anywhere = re.compile(rf"(?<![A-Za-z0-9])(?:{who})(?![A-Za-z0-9])")
+    return opens, anywhere
+
+
+# What puts the company that opens a headline on the receiving end of a deal. Without one of
+# these it may be the bidder: "GameStop Makes Unsolicited $56 Billion Takeover Bid for eBay".
+_RECEIVING = re.compile(
+    r"\b(?:to be (?:acquired|bought|taken private|sold)|agrees? to be|(?:acquired|bought out|taken private) by"
+    r"|receiv\w+ (?:(?!approv)\S+ ){0,4}?(?:offer|bid|proposal|approach|interest)\b"
+    r"|reject\w+ (?:(?!approv)\S+ ){0,6}?(?:offer|bid|proposal|approach)\b"
+    r"|(?:offer|bid|proposal|approach|interest) from\b"
+    r"|go(?:es|ing)? private|to go private|take[- ]private|buyout by\b"
+    r"|strategic (?:alternatives|review)|explor\w+ (?:a |potential )?sale|sale of the company"
+    r"|to (?:merge|combine) with|merger (?:agreement|with)\b|agrees? to merge)",
+    re.IGNORECASE,
+)
+# What may stand between a company's name and its verb: "JPMorgan Chase & Co. Adjusts ...".
+_UNIT = r"(?:\s*&\s*co\b\.?|,?\s+(?:inc|corp|co|ltd|plc|llc|group|holdings|securities|research)\b\.?)*"
+# The verbs an analyst's note opens with. Straight after the company's own name they make
+# it the writer of the note, and the news is about the company it rates.
+_WRITES = re.compile(
+    _UNIT + r"\s+(?:maintains?|reiterates?|reaffirms?|raises?|lowers?|cuts?|adjusts?|initiates?|resumes?|starts?"
+    r"|upgrades?|downgrades?|updates?|assigns?|sets?|boosts?|trims?|keeps?)\b",
+    re.IGNORECASE,
+)
+# A holding in a company. When the company that opens the headline holds it in someone
+# else, the trade is in that other company's shares.
+_HOLDS = re.compile(r"\b(?:stake|holdings?|shareholding|voting rights)\s+in\s+(.*)", re.IGNORECASE)
+_ITSELF = re.compile(r"(?:the company|itself|its own)\b", re.IGNORECASE)
+
+
+def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> str:
     """A headline's event type. `names` are what the company may be called (see `aliases`).
 
     The feed tags the buyer, its bankers and the company being bought with the
@@ -571,20 +670,54 @@ def headline_type(text: str, names: tuple[str, ...] = ()) -> str:
     This check comes ahead of the table on purpose. A buyout headline often
     ends "... Shares Jump", which the table would read as someone trading
     shares.
+
+    With a name to go by, a type counts for the company only when the headline
+    puts the company where that event happens:
+
+    - A headline that names the company nowhere, and whose `summary` does not
+      either, is another company's news. With no summary on hand nothing is
+      concluded, because a headline often names only a product.
+    - The company holding a stake in someone else, or writing an analyst's
+      note about someone else, is another company's news too.
+    - A type in `IN_FRONT` needs the company's name to open the headline.
+    - A takeover by the table's keywords needs the company to open the
+      headline and be on the receiving end (`_RECEIVING`).
+
+    Where one of the last two does not hold, the rest of the table decides.
     """
     bought = _bought(names)
     if bought is not None and bought.search(text):
         return "takeover"
+    known = _named(names)
+    lead = None
+    if known is not None:
+        opens, anywhere = known
+        if anywhere.search(text):
+            lead = opens.match(text)
+        elif summary and not anywhere.search(summary):
+            return ELSEWHERE
+        if lead:
+            held = _HOLDS.search(text, lead.end())
+            if held and not anywhere.search(held.group(1)) and not _ITSELF.match(held.group(1)):
+                return ELSEWHERE
     for kind, pattern in HEADLINE_RULES:
-        if pattern.search(text):
-            return kind
+        if not pattern.search(text):
+            continue
+        if known is not None:
+            if kind in IN_FRONT and lead is None:
+                continue
+            if kind == "takeover" and not (lead and _RECEIVING.search(text, lead.end())):
+                continue
+            if kind == "analyst" and lead and _WRITES.match(text, lead.end()):
+                return ELSEWHERE
+        return kind
     return "other"
 
 
 def classify(item: NewsItem, names: tuple[str, ...] = ()) -> NewsItem:
     """The item with its event type set. A filing also gets a title that spells out its items."""
     if item.kind != "filing":
-        return replace(item, event=headline_type(item.title, names))
+        return replace(item, event=headline_type(item.title, names, item.summary))
     carried = [FILING_ITEMS[code] for code in FILING_ITEMS if code in item.items]
     if not carried:
         return replace(item, event="other")
@@ -698,8 +831,9 @@ def shortlist(items: Iterable[NewsItem], limit: int) -> list[NewsItem]:
 
 def context(
     items: list[NewsItem], bars: list[Bar], earnings_days: set[date], today: date, names: tuple[str, ...] = ()
-) -> tuple[list[NewsItem], dict[str, int], dict[str, EventStudy]]:
-    """One stock's news for a scan: the latest items, a count of recent ones by type, and the studies.
+) -> tuple[list[NewsItem], dict[str, int], dict[str, EventStudy], list[NewsItem]]:
+    """One stock's news for a scan: the latest items, a count of recent ones by type, the studies,
+    and the recent items that are another company's news.
 
     `items` are everything on record for the stock, classified or not, and
     `names` are what a headline may call the company. A study is built for
@@ -708,14 +842,20 @@ def context(
     The list holds the newest `MAX_RECENT` items, plus the newest item of each
     flagged type that a busy week pushed out of them. A chip that says
     "takeover" is no use if the headline behind it is not there to read.
+
+    Another company's news takes none of those places. It is counted, so the
+    page can say how much of it there is, and the newest `MAX_ELSEWHERE` are
+    handed back apart, to be looked at by anyone who doubts the rule.
     """
     classified = sorted((classify(i, names) for i in items), key=lambda i: i.when, reverse=True)
     cutoff = today - timedelta(days=RECENT_DAYS)
     recent = [i for i in classified if _felt(i.when)[0] >= cutoff]
     counts = Counter(i.event for i in recent)
     order = [kind for kind in EVENT_TYPES if kind in counts]
-    shown = recent[:MAX_RECENT]
+    own = [i for i in recent if i.event != ELSEWHERE]
+    shown = own[:MAX_RECENT]
     listed = {i.event for i in shown}
-    shown += [next(i for i in recent if i.event == kind) for kind in order if kind in FLAGGED and kind not in listed]
+    shown += [next(i for i in own if i.event == kind) for kind in order if kind in FLAGGED and kind not in listed]
     shown.sort(key=lambda i: i.when, reverse=True)
-    return shown, {kind: counts[kind] for kind in order}, study(classified, bars, earnings_days, order)
+    elsewhere = [i for i in recent if i.event == ELSEWHERE][:MAX_ELSEWHERE]
+    return shown, {kind: counts[kind] for kind in order}, study(classified, bars, earnings_days, order), elsewhere

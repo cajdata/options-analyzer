@@ -110,6 +110,15 @@ class DemoMarket:
             target = round(SPECS[symbol]["price"] * rng.uniform(0.9, 1.3))
             title = rng.choice(HEADLINES).format(name=NAMES[symbol], target=target)
             out.append(NewsItem(when=when, kind="headline", title=title, source=self.name, ref=f"{symbol}-news-{n}"))
+        # Two that a feed would tag with this stock though the news is someone else's: the
+        # company as the holder of another's shares, and a company with a name like its ticker.
+        name, lookalike = NAMES[symbol], f"{NAMES[symbol]}ain Group PLC"
+        for back, title, summary in (
+            (3, f"{name} Increases Stake in Tidewell Systems to 6.4%", f"{name} reported a larger holding in Tidewell Systems."),
+            (6, f"{lookalike} Announces Total Voting Rights", f"{lookalike} reported its total voting rights and capital."),
+        ):
+            when = datetime.combine(self.today - timedelta(days=back), NEWS_TIMES[1], tzinfo=ET)
+            out.append(NewsItem(when=when, kind="headline", title=title, source=self.name, ref=f"{symbol}-other-{back}", summary=summary))
         return sorted((i for i in out if i.when >= since), key=lambda i: i.when, reverse=True)
 
     def filings(self, symbol: str) -> list[NewsItem]:
