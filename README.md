@@ -1,4 +1,4 @@
-# Options Analyzer
+# Strike Check
 
 A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by
 visible rules, and puts each stock's earnings history next to what the options are

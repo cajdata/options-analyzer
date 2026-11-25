@@ -21,7 +21,7 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
-- `.claude/launch.json` defines two dashboards for the preview tools: `options-analyzer-demo` on port 8765 (synthetic data) and `options-analyzer-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
+- `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
 - With `ANTHROPIC_API_KEY` set, the live dashboard shows a "Write brief" button and `scan --brief` works. Each use is a billed call: ask before making one.
 
 ## Architecture
@@ -38,7 +38,7 @@ Things that are not obvious from any one file:
 - **The lens decides late.** `contracts.analyze_contract` produces lens-independent metrics priced at the mid. Only afterwards, in `Scanner._analyze`, does the lens ("buy" or "sell") set `pop`, `outlay`, `score` and `risk_reward`. A `ContractAnalysis` is therefore filled in across several modules.
 - **`history_vol` is the shared yardstick.** `risk.history_vol` blends ex-earnings realized volatility with past report-day variance. The score's volatility component and the risk/reward rating both start from it, which is why the rating is shown beside the score and never added into it.
 - **Provider caveats travel as notes.** A provider appends to `market.notes`; the scanner drains them into `ScanResult.warnings`, which every surface displays. Use this for anything the person should know (a feed fallback, missing open interest).
-- **Time is injected.** `Scanner(today=)`, `EarningsService(today=, clock=)`, `AlpacaData(now=, sleep=)` and `EdgarEarnings(sleep=)` exist so tests never depend on the wall clock. Tests pin `TODAY = date(2026, 11, 24)`.
+- **Time is injected.** `Scanner(today=)`, `EarningsService(today=, clock=)`, `AlpacaData(now=, sleep=)` and `EdgarEarnings(sleep=)` exist so tests never depend on the wall clock. Tests pin `TODAY = date(2026, 11, 24)`. `--demo` and the demo dashboard are the exception: `build_scanner` starts their market from the wall clock, so `tests/test_scanner.py` holds it at `TODAY` with the `demo_day_is_pinned` fixture. Without it the command-line tests pass only on that one day.
 - **Tunable numbers live in two places.** Score weights and thresholds are in `scoring.LENSES`; rating thresholds are constants at the top of `risk.py`.
 - **Shared data types live in `app/models.py`**, including the exit-plan dataclasses, so they can be imported anywhere without a cycle. `exits.py` holds only the logic. Exit plans are kept in `ScanResult.exit_plans`, keyed by contract symbol, and not on `ContractAnalysis`.
 - **Presets are data.** `scanner.PRESETS` maps a name to `ScanRequest` fields. The API serves it, the dashboard builds its buttons from it, and the command line reads it, so a preset is defined once.

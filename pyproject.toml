@@ -1,5 +1,5 @@
 [project]
-name = "options-analyzer"
+name = "strike-check"
 version = "0.2.0"
 description = "Read-only options scanner with earnings context"
 readme = "README.md"
