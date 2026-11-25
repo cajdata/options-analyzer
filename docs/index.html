@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strike Check: a read-only options scanner</title>
+<meta name="description" content="Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and shows each stock's past earnings moves next to what the options are pricing in. It runs on your own computer and can't place orders.">
+<link rel="canonical" href="https://strikecheck.app/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Strike Check: a read-only options scanner">
+<meta property="og:description" content="Ranks option contracts by rules you can see, with each stock's past earnings moves next to what the options are pricing in. It can't place orders.">
+<meta property="og:url" content="https://strikecheck.app/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5fbf'/%3E%3Cpath d='M9 16.5l5 5 9-11' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #16202b; --muted: #5b6876; --line: #dfe4ea;
+    --accent: #1f5fbf; --accent-soft: #e4edfb; --good: #1c7c4a; --bad: #b3372b; --warn-bg: #fff6dd; --warn-line: #e6c764;
+    --bar: #c9d6ea; --code-bg: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10151b; --panel: #18202a; --text: #e6ebf1; --muted: #93a1b0; --line: #2a3542;
+      --accent: #6fa5f5; --accent-soft: #1d2c44; --good: #58c48a; --bad: #f08477; --warn-bg: #2d2714; --warn-line: #6d5c1f;
+      --bar: #33465f; --code-bg: #121920;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 system-ui, "Segoe UI", sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 16px; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 20px 0; }
+  .name { font-weight: 700; font-size: 18px; color: var(--text); text-decoration: none; }
+  .hero { padding: 28px 0 8px; }
+  h1 { font-size: clamp(28px, 5vw, 40px); line-height: 1.15; margin: 0 0 14px; letter-spacing: -.01em; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 46em; margin: 0 0 22px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .button { display: inline-block; padding: 9px 16px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); text-decoration: none; font-weight: 600; font-size: 15px; }
+  .button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  @media (prefers-color-scheme: dark) { .button.primary { color: #0c1420; } }
+  h2 { font-size: 22px; margin: 44px 0 12px; }
+  h3 { font-size: 16px; margin: 0 0 4px; }
+  p { margin: 0 0 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .sample { margin-top: 32px; }
+  .sample-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .sample-head strong { font-size: 15px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  th:nth-child(2), td:nth-child(2), th:nth-child(9), td:nth-child(9) { text-align: left; }
+  .unfavorable { color: var(--bad); }
+  .compare-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+  .stock { display: grid; grid-template-columns: 56px 1fr; gap: 4px 12px; align-items: center; margin: 10px 0; font-size: 14px; }
+  .stock b { grid-row: span 2; }
+  .row { display: grid; grid-template-columns: 150px 1fr 44px; gap: 8px; align-items: center; }
+  .row span:first-child { color: var(--muted); font-size: 13px; }
+  .row span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .track { height: 10px; border-radius: 5px; background: var(--bar); overflow: hidden; }
+  .fill { height: 100%; background: var(--accent); }
+  .fill.past { background: var(--muted); }
+  .note { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .grid p { margin: 0; color: var(--muted); font-size: 15px; }
+  .grid .wide { grid-column: 1 / -1; }
+  ul { margin: 0; padding-left: 20px; }
+  li { margin: 6px 0; }
+  pre { margin: 0 0 12px; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; font: 13.5px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  code { font: 0.92em ui-monospace, "Cascadia Mono", Consolas, monospace; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  footer { color: var(--muted); font-size: 14px; padding: 36px 0 44px; margin-top: 44px; border-top: 1px solid var(--line); }
+  @media (max-width: 640px) {
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    .row { grid-template-columns: 112px 1fr 44px; }
+    .stock { grid-template-columns: 48px 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <a class="name" href="/">Strike Check</a>
+  <a href="https://github.com/cajdata/strike-check">GitHub</a>
+</header>
+
+<section class="hero">
+  <h1>A read-only options scanner</h1>
+  <p class="lede">Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and puts each stock's past earnings moves next to what the options are pricing in for the next report. It runs on your own computer and it can't place orders.</p>
+  <div class="actions">
+    <a class="button primary" href="#try">Try the demo</a>
+    <a class="button" href="https://github.com/cajdata/strike-check">Source on GitHub</a>
+  </div>
+</section>
+
+<section class="sample panel" aria-label="Sample scan">
+  <div class="sample-head">
+    <strong>A sample scan</strong>
+    <span class="badge">Synthetic demo data</span>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr><th>Score</th><th>Contract</th><th>Days</th><th>Outlay</th><th>Spread</th><th>Chance of profit</th><th>Breakeven move</th><th>Reward : risk</th><th>Rating</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>90.2</td><td>CRUX Jan 22 410 call</td><td>59</td><td>$1,967</td><td>2.9%</td><td>34.9%</td><td>+4.2%</td><td>1.96</td><td>balanced</td></tr>
+        <tr><td>90.0</td><td>CRUX Jan 22 415 put</td><td>59</td><td>$1,739</td><td>3.2%</td><td>36.4%</td><td>-3.4%</td><td>1.85</td><td>balanced</td></tr>
+        <tr><td>84.7</td><td>FLUX Jan 22 97.5 put</td><td>59</td><td>$699</td><td>3.9%</td><td>38.0%</td><td>-5.8%</td><td>1.46</td><td>balanced</td></tr>
+        <tr><td>84.5</td><td>FLUX Jan 22 95 call</td><td>59</td><td>$760</td><td>3.9%</td><td>33.9%</td><td>+6.5%</td><td>1.72</td><td class="unfavorable">unfavorable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="compare-title">Earnings: past moves against what the options price</div>
+  <div class="stock">
+    <b>ACME</b>
+    <div class="row"><span>Past 12 reports, average</span><div class="track"><div class="fill past" style="width:67%"></div></div><span>6.7%</span></div>
+    <div class="row"><span>Priced for the next one</span><div class="track"><div class="fill" style="width:34%"></div></div><span>3.4%</span></div>
+  </div>
+  <div class="stock">
+    <b>CRUX</b>
+    <div class="row"><span>Past 12 reports, average</span><div class="track"><div class="fill past" style="width:36%"></div></div><span>3.6%</span></div>
+    <div class="row"><span>Priced for the next one</span><div class="track"><div class="fill" style="width:34%"></div></div><span>3.4%</span></div>
+  </div>
+  <div class="stock">
+    <b>FLUX</b>
+    <div class="row"><span>Past 12 reports, average</span><div class="track"><div class="fill past" style="width:59%"></div></div><span>5.9%</span></div>
+    <div class="row"><span>Priced for the next one</span><div class="track"><div class="fill" style="width:64%"></div></div><span>6.4%</span></div>
+  </div>
+  <p class="note">Four rows and three stocks from one scan of the built-in demo. The tickers, prices and dates are made up.</p>
+</section>
+
+<section>
+  <h2>What a scan gives you</h2>
+  <div class="grid">
+    <div class="panel">
+      <h3>A ranked list, with the rules in view</h3>
+      <p>Each contract gets a score built from five parts: liquidity, breakeven or chance of profit, how volatility is priced, time decay or yield, and delta. Every weight and threshold is in one file you can read and change.</p>
+    </div>
+    <div class="panel">
+      <h3>Earnings history next to the options' price</h3>
+      <p>For each stock you get the next report date, the move on each of the last twelve reports, and the size of move the options price for the next one.</p>
+    </div>
+    <div class="panel">
+      <h3>Risk and reward against the stock's own history</h3>
+      <p>Chance of profit, average win and loss, expected value and the most you can lose. These assume you pay the ask to buy or receive the bid to sell, so a wide spread counts against a contract.</p>
+    </div>
+    <div class="panel">
+      <h3>An exit plan</h3>
+      <p>What the option is worth in one, two and three weeks if the stock stands still, the drop on the day an earnings report lands, and a seller's rules of thumb for closing early.</p>
+    </div>
+    <div class="panel wide">
+      <h3>Recent news, sorted by type</h3>
+      <p>Each stock's recent headlines and SEC filings, labeled by type of event, with how the stock moved after earlier events of the same type. The labels come from tables of keywords and filing codes, so read the headline before trusting one.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>What it doesn't do</h2>
+  <ul>
+    <li><strong>It can't place orders.</strong> It only reads market data and has no way to send an order.</li>
+    <li><strong>It doesn't tell you what to trade.</strong> The ranking is a screen. It isn't a forecast and it isn't financial advice.</li>
+    <li><strong>There's no hosted version.</strong> It runs on your own computer with your own free Alpaca keys.</li>
+    <li><strong>Free quotes aren't live.</strong> Alpaca's free option feed is indicative: quotes are modified and trades are 15 minutes delayed. Screen with it, then check the live quote at your broker.</li>
+  </ul>
+</section>
+
+<section id="try">
+  <h2>Try it without any keys</h2>
+  <p>You need Python 3.11 or newer. Demo mode uses synthetic data, so it needs no account.</p>
+<pre><code>git clone https://github.com/cajdata/strike-check.git
+cd strike-check
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev,ai]"
+.venv\Scripts\python.exe -m app serve --demo</code></pre>
+  <p>Then open <code>http://127.0.0.1:8000</code>. On macOS or Linux, use <code>.venv/bin/python</code> in place of <code>.venv\Scripts\python.exe</code>.</p>
+  <p>To use real data, the <a href="https://github.com/cajdata/strike-check#use-real-data">README</a> covers the Alpaca keys and the earnings sources. It also lists the limits worth knowing before you rely on any number here.</p>
+</section>
+
+<footer>
+  Strike Check is open source under the MIT license. <a href="https://github.com/cajdata/strike-check">Source on GitHub</a>. Not financial advice.
+</footer>
+
+</div>
+</body>
+</html>
