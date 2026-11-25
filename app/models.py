@@ -251,6 +251,27 @@ class EventStudy:
     moves: list[EventMove] = field(default_factory=list)  # newest first
 
 
+@dataclass(frozen=True)
+class PooledStudy:
+    """One type of event across the stocks on record that are covered about as much as this one.
+
+    Each stock's days are measured against its own usual day, so a volatile
+    stock and a quiet one can be counted together. Built by analysis/events.py.
+    """
+
+    event: str
+    label: str
+    group: str  # "light" or "heavy": how much the feed carries about these stocks
+    group_stocks: int  # stocks on record in the group
+    stocks: int  # of them, how many had an event of this type
+    events: int  # sessions that carried one, earnings days left out
+    big: int  # of those, how many moved more than `events.BIG_MOVE` times the stock's usual day
+    up: int
+    down: int
+    sessions: int  # every session over the same stretches, for comparison
+    big_sessions: int  # of those, how many were as big
+
+
 @dataclass
 class UnderlyingContext:
     symbol: str
@@ -281,6 +302,8 @@ class UnderlyingContext:
     # They are kept to be looked at, and count towards nothing.
     news_elsewhere: list[NewsItem] = field(default_factory=list)
     recent_events: dict[str, int] = field(default_factory=dict)  # event type to how many recent items
+    coverage: str | None = None  # "light" or "heavy", once its news has been read (events.coverage)
+    pooled_studies: dict[str, PooledStudy] = field(default_factory=dict)  # by event type, across its group
     event_studies: dict[str, EventStudy] = field(default_factory=dict)  # by event type
     news_note: str | None = None  # set when a source could not answer
 

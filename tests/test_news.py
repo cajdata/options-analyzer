@@ -584,7 +584,7 @@ def test_context_lists_recent_news_and_studies_only_the_types_in_it():
     ]
     extra = [raw(last, "Acme to Present at Lakeshore Technology Conference", 200), filing(["5.02"], when=datetime.combine(last, clock(8, 0), tzinfo=ET))]
 
-    shown, counts, studies, elsewhere = events.context(recent + older + extra, bars, set(), today)
+    shown, counts, studies, elsewhere = events.context(recent + older + extra, bars, set(), today)[:4]
     assert elsewhere == []
     assert len(shown) == events.MAX_RECENT and shown == sorted(shown, key=lambda i: i.when, reverse=True)
     assert all(item.event for item in shown)  # classified on the way through
@@ -610,7 +610,7 @@ def test_a_flagged_item_stays_on_the_list_when_a_busy_week_pushes_it_out():
         raw(last - timedelta(days=11), 10, "Acme Raises Full-Year Revenue Guidance", 102),  # only the newest of a type is kept
         raw(last - timedelta(days=12), 10, "Acme Appoints New Chief Financial Officer", 103),  # not a flagged type
     ]
-    shown, counts, _, _ = events.context(launches + older, bars, set(), today)
+    shown, counts, _, _ = events.context(launches + older, bars, set(), today)[:4]
     assert len(shown) == events.MAX_RECENT + 2 and shown == sorted(shown, key=lambda i: i.when, reverse=True)
     assert [i.ref for i in shown[-2:]] == ["100", "101"]
     assert counts == {"guidance": 2, "financing": 1, "management": 1, "product": 12}
@@ -639,7 +639,7 @@ def test_another_companys_news_takes_no_place_and_counts_towards_nothing():
         raw(days[50 + n], 10, f"Acme Increases Stake in Company {n} PLC", 300 + n) for n in range(5)
     ]
 
-    shown, counts, studies, elsewhere = events.context(holdings + [lookalike] + own + older, bars, set(), today, names)
+    shown, counts, studies, elsewhere = events.context(holdings + [lookalike] + own + older, bars, set(), today, names)[:4]
     # The company's own two items are listed, though fifteen newer ones were tagged with it.
     assert [i.ref for i in shown] == ["100", "101"]
     assert counts == {"guidance": 1, "insider": 1, "another": 15}

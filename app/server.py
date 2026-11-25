@@ -84,6 +84,13 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
                 "flagged": sorted(events.FLAGGED),
                 "cautions": events.CAUTIONS,
                 "elsewhere": events.ELSEWHERE,
+                "pool": {
+                    "groups": events.GROUPS,
+                    "big_move": events.BIG_MOVE,
+                    "min_events": events.MIN_POOLED,
+                    "coverage_days": events.COVERAGE_DAYS,
+                    "heavy_headlines": events.HEAVY_HEADLINES,
+                },
                 "recent_days": events.RECENT_DAYS,
                 "follow_sessions": events.FOLLOW_SESSIONS,
                 "min_events": events.MIN_EVENTS,

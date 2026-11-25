@@ -49,6 +49,7 @@ earnings dates are made up.
 .venv\Scripts\python.exe -m app scan --budget 100         # only contracts that cost $100 or less
 .venv\Scripts\python.exe -m app scan --preset sell-premium --exits   # premium-selling setup, with exit plans
 .venv\Scripts\python.exe -m app scan --brief              # add the AI write-up
+.venv\Scripts\python.exe -m app pool                      # add stocks to compare news events across (about two minutes)
 ```
 
 Add `--demo` to any of these to use synthetic data, or `--json` for the full result.
@@ -105,6 +106,14 @@ something material happens) over the last 14 days.
   often moves 3%. Days that carried an earnings report are left out, and so is any
   five-session stretch with a report in it. With fewer than three events it says there are
   too few to compare.
+- **The same types across other stocks.** One stock rarely has more than a handful of
+  events of a type. So each type is also counted across the stocks on record that the
+  feed covers about as much as this one: how often such a day moved more than twice the
+  stock's own usual day, beside how often any day did. Heavily and lightly covered
+  stocks are kept apart, because measured together they cancel out. For a heavily
+  covered stock no headline type has stood out so far. For a lightly covered one, stock
+  offerings and reverse splits have. The pool grows as you scan, and
+  `python -m app pool` adds the universe and the day's most active stocks and movers.
 - **A few types are pointed out in the list of results** (guidance, takeover, split or
   special dividend, offering, distress, drug news), since they tend to move a stock in one
   jump. Two come with a caution, because the scan's own numbers mislead after them: a
@@ -188,6 +197,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   mentions it. A bank's notes on other stocks and its holdings in them are set aside, but a
   partner's press release that name-drops the stock still counts as the stock's. Read the
   headline before trusting its label.
+- **Pooled figures describe the stocks on record, not the market.** They come from the
+  stocks you have scanned and any you added with `python -m app pool`, which leans
+  towards the day's movers. They compare the size of the move on the day itself, say
+  nothing about direction beyond a count of up and down days, and are not a forecast.
 - **What followed past events is a description of a small sample.** The news feed reaches
   back about seven months (the app keeps what it has seen, so the record grows), a study
   often rests on a handful of days, and the move is measured close to close, so it includes
@@ -228,10 +241,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 
 1. **Done:** read-only scanner with earnings context, discovery, AI brief, exit plans and
    a premium-selling preset.
-2. **Started:** news layer. Headlines and 8-K filings are typed by event, each stock
+2. **Done:** news layer. Headlines and 8-K filings are typed by event, each stock
    shows what followed its own earlier events of the same type, and the AI brief reads
-   the recent ones. Rules decide whose news a headline is. Still to do: pool similar
-   events across stocks so a study rests on more than a handful of days.
+   the recent ones. Rules decide whose news a headline is, and each type is
+   also counted across the stocks covered about as much.
 3. A positions page that checks what you hold against the exit rules, then paper trading
    on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.

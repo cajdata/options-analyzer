@@ -55,6 +55,7 @@ class AlphaVantageEarnings:
     """Free tier allows roughly 25 requests a day, so every call here is cached upstream."""
 
     name = "Alpha Vantage"
+    rate_limited = True  # too few requests a day to spend any on a stock nobody is scanning
     URL = "https://www.alphavantage.co/query"
     COOL_DOWN = 15 * 60.0  # seconds to stay quiet after the service says a limit was hit
     _TIMING = {"pre-market": "pre", "post-market": "post"}
@@ -390,6 +391,24 @@ class EarningsService:
         elif found is not None:
             events = [_event(e) for e in found[0]]  # stale beats nothing
         return events, note if not events else None
+
+    def reports(self, symbol: str) -> list[EarningsEvent]:
+        """Past reports for a stock that is not being scanned, newest first. Empty when none can be had.
+
+        What is on file answers. Otherwise the first source alone is asked,
+        and its answer is kept nowhere: a stock added to a pool must not spend
+        a request at a rate-limited source, and an answer from one source must
+        not stand in later for the fuller one a scan would get.
+        """
+        found = self._cache.entry(f"earnings_history_{symbol}_{self._tag}")
+        if found is not None and found[0]:
+            return [_event(e) for e in found[0]]
+        if not self._history_sources or getattr(self._history_sources[0], "rate_limited", False):
+            return []
+        try:
+            return self._history_sources[0].history(symbol)
+        except (RuntimeError, httpx.HTTPError, ValueError, KeyError):
+            return []
 
     def _stale(self, events: list[EarningsEvent], age: timedelta) -> bool:
         if not events:

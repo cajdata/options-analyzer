@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import os
 import re
@@ -24,6 +25,34 @@ class NullCache:
     def set(self, key: str, value: Any) -> None:
         return None
 
+    def keys(self, prefix: str) -> list[str]:
+        return []
+
+
+class MemoryCache:
+    """Keeps values for as long as the program runs, and nowhere else.
+
+    The demo's pool of stocks lives here: it has to be kept between scans to be
+    of any use, and demo data must never reach the disk.
+    """
+
+    def __init__(self) -> None:
+        self._values: dict[str, tuple[Any, datetime]] = {}
+
+    def entry(self, key: str) -> tuple[Any, timedelta] | None:
+        found = self._values.get(key)
+        return None if found is None else (found[0], datetime.now(timezone.utc) - found[1])
+
+    def get(self, key: str, max_age: timedelta) -> Any | None:
+        found = self.entry(key)
+        return None if found is None or found[1] > max_age else found[0]
+
+    def set(self, key: str, value: Any) -> None:
+        self._values[key] = (value, datetime.now(timezone.utc))
+
+    def keys(self, prefix: str) -> list[str]:
+        return sorted(key for key in self._values if key.startswith(prefix))
+
 
 class DiskCache:
     def __init__(self, root: Path | str) -> None:
@@ -31,6 +60,10 @@ class DiskCache:
 
     def _path(self, key: str) -> Path:
         return self.root / (re.sub(r"[^A-Za-z0-9_.-]", "_", key) + ".json")
+
+    def keys(self, prefix: str) -> list[str]:
+        """Every key stored that starts with `prefix`, as it is spelled on disk."""
+        return sorted(path.stem for path in self.root.glob(glob.escape(prefix) + "*.json"))
 
     def entry(self, key: str) -> tuple[Any, timedelta] | None:
         """Return (value, age) for `key`, or None if it was never stored."""
