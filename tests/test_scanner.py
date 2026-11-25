@@ -28,6 +28,24 @@ def demo_scanner(**settings) -> Scanner:
     return Scanner(market, earnings, Settings(**settings), universe=list(SPECS), today=TODAY)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def demo_day_is_pinned():
+    """Hold the demo market at TODAY for the command line and the dashboard.
+
+    Both build their own demo market, which starts from the wall clock, and several tests
+    read a date or a rating off their output. Module scope puts this in place before the
+    `client` fixture builds its app.
+    """
+    wall_clock = DemoMarket.__init__
+
+    def pinned(self, today=None):
+        wall_clock(self, today or TODAY)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(DemoMarket, "__init__", pinned)
+        yield
+
+
 @pytest.fixture(scope="module")
 def discovery():
     return demo_scanner().scan(ScanRequest())
