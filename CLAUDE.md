@@ -21,7 +21,7 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
-- `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
+- `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code. A third entry, `strike-check-site` on port 8768, serves the landing page in `docs/` with the system `python`.
 - With `ANTHROPIC_API_KEY` set, the live dashboard shows a "Write brief" button and `scan --brief` works. Each use is a billed call: ask before making one.
 
 ## Architecture
@@ -45,6 +45,7 @@ Things that are not obvious from any one file:
 - **The dashboard builds DOM with the `el()` helper.** Never use `innerHTML` with scan data.
 - **News is typed late, like the lens.** A source returns raw `NewsItem`s. `events.classify` sets the event type afterwards, from two tables in `analysis/events.py`: `HEADLINE_RULES` (keywords, first match wins, so the order is part of the rule) and `FILING_ITEMS` (8-K item codes, most telling first). Labels, the flagged types and the cautions are served by `/api/status`, so the dashboard holds no copy of them.
 - **News lives on `UnderlyingContext`** (`news`, `recent_events`, `event_studies`, `news_note`), filled in only for a stock with a ranked contract. `Scanner(news=None)` leaves it out.
+- **`docs/` is the public site for strikecheck.app**, published by GitHub Pages from that folder on `main`. It is one plain HTML file with no scripts, plus `CNAME` and `.nojekyll`. Its sample table and earnings bars were copied from a `scan --demo` run and its claims come from the README, so change them together. The dashboard itself is never hosted there: it has no login and runs on the owner's keys.
 
 ## Invariants
 
