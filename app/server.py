@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app import ai
-from app.analysis import exits, scoring
+from app.analysis import events, exits, scoring
 from app.config import ROOT, ConfigError, Settings, load_settings
 from app.models import ScanResult
 from app.scanner import PRESETS, Scanner, ScanRequest, build_scanner
@@ -78,6 +78,15 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             "lenses": {name: cfg["weights"] for name, cfg in scoring.LENSES.items()},
             "presets": PRESETS,
             "exit_rules": {"profit_target": exits.PROFIT_TARGET, "time_stop_dte": exits.TIME_STOP_DTE},
+            "news_sources": scanner.news.sources if scanner and scanner.news else [],
+            "events": {
+                "labels": events.EVENT_TYPES,
+                "flagged": sorted(events.FLAGGED),
+                "cautions": events.CAUTIONS,
+                "recent_days": events.RECENT_DAYS,
+                "follow_sessions": events.FOLLOW_SESSIONS,
+                "min_events": events.MIN_EVENTS,
+            },
         }
 
     @app.post("/api/scan")

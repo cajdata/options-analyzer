@@ -71,6 +71,14 @@
   .history td, .history th { padding: 4px 6px; font-size: 13px; }
   .history th:nth-child(2), .history td:nth-child(2) { text-align: right; }
   .history th:first-child, .history td:first-child { text-align: left; }
+  a { color: var(--accent); }
+  .history.news td { white-space: normal; vertical-align: top; }
+  .history.news td:first-child, .history.news td.n { white-space: nowrap; }
+  .history.news th:nth-child(2), .history.news td:nth-child(2) { text-align: left; }
+  .history.news th:nth-child(2) { width: 100%; }
+  .caution { margin: 6px 0; padding: 6px 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; font-size: 13px; }
+  details { border-top: 1px solid var(--line); padding: 6px 0; }
+  summary { cursor: pointer; }
   #brief { margin-top: 16px; }
   .pick { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
   .pick p { margin: 4px 0; }
@@ -126,7 +134,7 @@
     <h2 id="results-title">Results</h2>
     <div class="scroll" id="results"><p class="empty">Run a scan to see ranked contracts.</p></div>
   </section>
-  <aside class="panel" id="detail"><p class="empty">Select a contract to see its numbers and the stock's earnings history.</p></aside>
+  <aside class="panel" id="detail"><p class="empty">Select a contract to see its numbers, the stock's earnings history and its recent news.</p></aside>
 </main>
 
 <section id="brief"></section>
@@ -220,6 +228,13 @@ function earningsChips(ctx, idea) {
   return [el("span", { class: "chip" + (idea.spans_earnings ? " hot" : "") }, label + (idea.spans_earnings ? " · spans" : ""))];
 }
 
+// A recent event of a kind that tends to move a stock in one jump, so it is seen in the list.
+function newsChips(ctx) {
+  const days = status.events.recent_days;
+  return Object.keys(ctx.recent_events || {}).filter((kind) => status.events.flagged.includes(kind))
+    .map((kind) => el("span", { class: "chip hot", title: status.events.labels[kind] + ", in the last " + days + " days" }, "news: " + kind));
+}
+
 function renderResults() {
   const limit = !scan.budget ? "" : scan.lens === "buy"
     ? " for " + dollars(scan.budget) + " or less"
@@ -253,6 +268,7 @@ function renderResults() {
         : "–"),
       el("td", {}, earningsChips(ctx, idea),
         ctx.earnings_unknown ? el("span", { class: "chip hot" }, "earnings date unknown") : null,
+        newsChips(ctx),
         ctx.reasons.filter((r) => !r.startsWith("earnings ")).map((r) => el("span", { class: "chip" }, r))),
     );
     row.dataset.symbol = idea.symbol;
@@ -355,6 +371,74 @@ function compareBar(label, value, max) {
     el("span", { class: "track" }, el("span", { class: "fill", style: "width:" + width + "%;display:block" })), pct(value));
 }
 
+// When a headline or filing landed, in New York time, since the 4 p.m. close decides which session reacts.
+const newsTime = (iso) => new Date(iso).toLocaleString(undefined, {
+  month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/New_York",
+});
+
+// What followed this stock's past events of one type, folded away until it is opened.
+function studyBlock(study) {
+  const rules = status.events;
+  const n = rules.follow_sessions;
+  const enough = study.count >= rules.min_events;
+  const summary = study.label + " · " + study.count + " past" + (enough
+    ? " · " + pct(study.mean_abs) + " that day" + (study.ordinary_abs === null ? "" : ", " + pct(study.ordinary_abs) + " on any day")
+    : " · too few to compare");
+  const body = [];
+  if (enough) {
+    const max = Math.max(study.mean_abs, study.ordinary_abs || 0, study.mean_abs_after || 0, study.ordinary_abs_after || 0);
+    body.push(el("p", { class: "sub" }, "Average size of the move, up or down, across " + study.count + " events since "
+      + shortDate(study.since) + " (" + study.up + " up, " + study.down + " down), beside the stock's average move on any day "
+      + "over the same stretch. Days that carried an earnings report are left out of both."));
+    body.push(compareBar("That day", study.mean_abs, max));
+    if (study.ordinary_abs !== null) body.push(compareBar("Any day", study.ordinary_abs, max));
+    if (study.after_count >= rules.min_events) {
+      body.push(compareBar("Next " + n + " sessions", study.mean_abs_after, max), compareBar("Any " + n + " sessions", study.ordinary_abs_after, max));
+    }
+  } else {
+    body.push(el("p", { class: "sub" }, "Only " + study.count + " on record since " + shortDate(study.since)
+      + ", which is too few to compare with the stock's usual day."));
+  }
+  body.push(el("table", { class: "history news" },
+    el("thead", {}, el("tr", {}, el("th", {}, "Session"), el("th", {}, "Event"), el("th", {}, "That day"), el("th", {}, "Next " + n))),
+    el("tbody", {}, study.moves.map((m) => el("tr", {},
+      el("td", {}, shortDate(m.day)),
+      el("td", {}, m.title),
+      el("td", { class: "n " + tone(m.move_pct) }, signedPct(m.move_pct)),
+      el("td", { class: "n " + tone(m.after_pct) }, signedPct(m.after_pct)))))));
+  return el("details", {}, el("summary", {}, summary), body);
+}
+
+function newsBlock(ctx) {
+  const rules = status.events;
+  const parts = [el("h3", {}, "News and filings")];
+  if (!status.news_sources.length) return parts.concat(el("p", { class: "sub" }, "No news source is configured."));
+  if (ctx.news_note) parts.push(el("p", { class: "sub" }, ctx.news_note));
+  if (!ctx.news.length) {
+    return parts.concat(el("p", { class: "sub" }, "Nothing in the last " + rules.recent_days + " days. An exchange-traded fund usually has none."));
+  }
+  const kinds = Object.entries(ctx.recent_events);
+  parts.push(el("p", { class: "sub" }, "Last " + rules.recent_days + " days, by type: ", kinds.map(([kind, count]) =>
+    el("span", { class: "chip" + (rules.flagged.includes(kind) ? " hot" : "") }, rules.labels[kind] + (count > 1 ? " × " + count : "")))));
+  kinds.filter(([kind]) => rules.cautions[kind]).forEach(([kind]) =>
+    parts.push(el("p", { class: "caution" }, rules.labels[kind] + ". " + rules.cautions[kind])));
+  parts.push(el("table", { class: "history news" }, el("tbody", {}, ctx.news.map((item) => el("tr", {},
+    el("td", { class: "sub" }, newsTime(item.when)),
+    el("td", {},
+      // The link is a third party's. Only a web address is ever made clickable.
+      /^https?:\/\//i.test(item.url || "") ? el("a", { href: item.url, target: "_blank", rel: "noopener noreferrer" }, item.title) : item.title,
+      el("div", { class: "sub" }, rules.labels[item.event] || item.event)))))));
+  const studies = Object.values(ctx.event_studies);
+  if (studies.length) {
+    parts.push(el("p", { class: "sub" }, "What followed this stock's past events of the same types:"));
+    studies.forEach((study) => parts.push(studyBlock(study)));
+  }
+  parts.push(el("p", { class: "sub" }, "Times are New York time. Types come from keyword rules on the headline and from the item codes on an 8-K filing, "
+    + "so some are wrong, and a headline can be about another company that only mentions this one. What followed past events describes this stock's "
+    + "history. It is not a forecast."));
+  return parts;
+}
+
 function select(idea) {
   selected = idea;
   document.querySelectorAll("#results tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.symbol === idea.symbol));
@@ -423,6 +507,7 @@ function select(idea) {
   } else if (ctx.next_earnings && ctx.earnings_note) {
     parts.push(el("p", { class: "sub" }, ctx.earnings_note));
   }
+  parts.push(newsBlock(ctx));
   $("detail").replaceChildren(...parts.flat());
 }
 
@@ -477,7 +562,7 @@ $("controls").addEventListener("submit", async (event) => {
     });
     showNotices(scan.warnings);
     renderResults();
-    $("detail").replaceChildren(el("p", { class: "empty" }, "Select a contract to see its numbers and the stock's earnings history."));
+    $("detail").replaceChildren(el("p", { class: "empty" }, "Select a contract to see its numbers, the stock's earnings history and its recent news."));
     if (scan.ideas.length) select(scan.ideas[0]);
     renderBriefButton();
   } catch (err) {
@@ -501,7 +586,10 @@ $("controls").addEventListener("input", () => { $("hint").textContent = ""; });
   const mode = $("mode");
   mode.textContent = status.mode === "demo" ? "Demo data" : status.mode === "live" ? "Alpaca · " + status.options_feed + " quotes" : "Not configured";
   mode.classList.toggle("demo", status.mode !== "live");
-  $("sources").textContent = status.earnings_sources.length ? "Earnings data: " + status.earnings_sources.join(", ") : "";
+  $("sources").textContent = [
+    status.earnings_sources.length ? "Earnings data: " + status.earnings_sources.join(", ") : "",
+    status.news_sources.length ? "News: " + status.news_sources.join(", ") : "",
+  ].filter(Boolean).join(" · ");
   $("scan").disabled = Boolean(status.setup_error);
   // One button per preset. A preset fills in the controls; nothing runs until Scan is pressed.
   $("presets").replaceChildren(...Object.values(status.presets).map((preset) => el("button", {

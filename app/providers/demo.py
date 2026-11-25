@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import math
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, time as clock, timedelta
+from zoneinfo import ZoneInfo
 
 from app import occ, pricing
 from app.analysis.earnings import spans
-from app.models import Bar, EarningsEvent, OptionQuote, StockQuote
+from app.models import Bar, EarningsEvent, NewsItem, OptionQuote, StockQuote
 
 RATE = 0.04
+ET = ZoneInfo("America/New_York")
 
 # vol: ordinary annualized volatility. jump: size of a typical earnings move.
 # pricing: how the options price the next report against that history
@@ -28,6 +30,28 @@ SPECS: dict[str, dict] = {
     "ORBT": dict(price=143.30, change=0.001, vol=0.18, jump=0.030, earnings_in=55, timing="post", pricing=0.90),
 }
 NO_PROVIDER_GREEKS = {"EMBR"}  # exercises the app's own volatility and Greeks math
+
+# Made-up headlines in the wording a news feed uses. Their event types are not set
+# here: they go through the same rules as real ones (analysis/events.py).
+NAMES = {"ACME": "Acme", "BOLT": "Bolt", "CRUX": "Crux", "EMBR": "Ember", "FLUX": "Flux", "ORBT": "Orbit"}
+HEADLINES = (
+    "Quillfeather Research Raises {name} Price Target to ${target}",
+    "Marrowgate Capital Downgrades {name} to Neutral From Buy",
+    "{name} Raises Full-Year Revenue Guidance",
+    "{name} Appoints New Chief Financial Officer",
+    "{name} Announces $500 Million Share Repurchase Program",
+    "{name} and Tidewell Systems Announce Multi-Year Partnership",
+    "{name} Launches Next-Generation Platform",
+    "{name} Faces Class Action Lawsuit Over Product Claims",
+    "{name} Prices $300 Million Offering of Convertible Notes",
+    "{name} Director Sells Shares Worth $2 Million",
+    "{name} Announces 2-for-1 Stock Split",
+    "{name} to Present at Lakeshore Technology Conference",
+    "{name} Publishes Annual Sustainability Report",
+)
+# Item codes on the made-up 8-K filings that are not earnings reports.
+FILING_ITEMS = (("5.02",), ("1.01", "9.01"), ("7.01", "9.01"), ("8.01",), ("5.07",), ("5.02", "9.01"))
+NEWS_TIMES = (clock(8, 30), clock(11, 15), clock(13, 40), clock(16, 30))
 
 
 def _weekday(day: date) -> date:
@@ -72,6 +96,34 @@ class DemoMarket:
         # Like a real calendar, only near-term dates are listed; the rest get estimated.
         events = {symbol: self.next_event(symbol) for symbol in SPECS}
         return {s: e for s, e in events.items() if (e.day - self.today).days <= 45}
+
+    # -- News (also serves as the demo headline and filing source) ----------
+
+    def headlines(self, symbol: str, since: datetime) -> list[NewsItem]:
+        if symbol not in SPECS:
+            return []
+        rng, out = random.Random(f"{symbol}-news"), []
+        for n in range(60):
+            # A few in the last two weeks, the rest spread over the past year.
+            back = rng.randrange(0, 12) if n < 4 else rng.randrange(14, 390)
+            when = datetime.combine(self.today - timedelta(days=back), rng.choice(NEWS_TIMES), tzinfo=ET)
+            target = round(SPECS[symbol]["price"] * rng.uniform(0.9, 1.3))
+            title = rng.choice(HEADLINES).format(name=NAMES[symbol], target=target)
+            out.append(NewsItem(when=when, kind="headline", title=title, source=self.name, ref=f"{symbol}-news-{n}"))
+        return sorted((i for i in out if i.when >= since), key=lambda i: i.when, reverse=True)
+
+    def filings(self, symbol: str) -> list[NewsItem]:
+        if symbol not in SPECS:
+            return []
+        rng, out = random.Random(f"{symbol}-filings"), []
+        for n, report in enumerate(self.history(symbol)):  # each past report came with an 8-K
+            when = datetime.combine(report.day, clock(16, 5) if report.timing == "post" else clock(7, 0), tzinfo=ET)
+            out.append(NewsItem(when, "filing", "8-K", self.name, ref=f"{symbol}-results-{n}", items=("2.02", "9.01")))
+        for n in range(14):
+            back = rng.randrange(2, 12) if n == 0 else rng.randrange(14, 1100)
+            when = datetime.combine(_weekday(self.today - timedelta(days=back)), clock(16, 20), tzinfo=ET)
+            out.append(NewsItem(when, "filing", "8-K", self.name, ref=f"{symbol}-8k-{n}", items=rng.choice(FILING_ITEMS)))
+        return sorted(out, key=lambda i: i.when, reverse=True)
 
     # -- Stocks -------------------------------------------------------------
 

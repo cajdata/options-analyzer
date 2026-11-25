@@ -1,0 +1,91 @@
+{
+  "_about": "Two pages of Alpaca's news endpoint (/v1beta1/news, limit 3, sort desc), captured on 2026-11-24 with paper keys on the free plan. The keys, ids, time stamps, source and page token are as captured. The symbol, headlines, summaries and links are replaced with made-up ones.",
+  "first": {
+    "news": [
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-24T19:02:45Z",
+        "headline": "Acme Director Sells Shares Worth $2 Million",
+        "id": 129880987,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "A director of Acme reported selling shares worth about $2 million, according to a regulatory filing.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-24T19:02:45Z",
+        "url": "https://news.example.com/acme/director-share-sale?source=feed&campaign=1"
+      },
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-24T12:32:27Z",
+        "headline": "Acme and Tidewell Systems Announce Multi-Year Partnership",
+        "id": 129536524,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "Acme and Tidewell Systems said they will work together for several years on shared infrastructure.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-24T12:32:27Z",
+        "url": "https://wire.example.org/releases/2026/11/24/acme-tidewell-partnership.html"
+      },
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-23T19:02:18Z",
+        "headline": "Quillfeather Research Raises Acme Price Target to $229",
+        "id": 129106222,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "Quillfeather Research raised its price target on Acme to $229 and kept its rating.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-23T19:02:18Z",
+        "url": "https://news.example.com/acme/price-target"
+      }
+    ],
+    "next_page_token": "MTc5NTQ2MDUzODAwMDAwMDAwMHwxMjkxMDYyMjI="
+  },
+  "second": {
+    "news": [
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-23T19:02:18Z",
+        "headline": "Acme Opens New Regional Office",
+        "id": 129106221,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "Acme opened a regional office to support customers in the area.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-23T19:02:18Z",
+        "url": "https://news.example.com/acme/regional-office"
+      },
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-19T19:02:11Z",
+        "headline": "Acme Raises Full-Year Revenue Guidance",
+        "id": 126783551,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "Acme raised its revenue guidance for the full year.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-19T19:02:11Z",
+        "url": "https://wire.example.org/releases/2026/11/19/acme-guidance.html"
+      },
+      {
+        "author": "",
+        "content": "",
+        "created_at": "2026-11-10T12:31:50Z",
+        "headline": "Acme Publishes Annual Sustainability Report",
+        "id": 118244349,
+        "images": [],
+        "source": "fiscal.ai",
+        "summary": "Acme published its sustainability report for the year.",
+        "symbols": ["ACME"],
+        "updated_at": "2026-11-10T12:31:50Z",
+        "url": "https://news.example.com/acme/sustainability-report"
+      }
+    ],
+    "next_page_token": null
+  }
+}

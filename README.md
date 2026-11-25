@@ -2,8 +2,9 @@
 
 A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by
 visible rules, and puts each stock's earnings history next to what the options are
-pricing for the next report. An optional AI brief has Claude write up the setups
-worth a closer look.
+pricing for the next report. It also lists each stock's recent headlines and SEC
+filings by type of event, with how the stock moved after earlier events of the same
+type. An optional AI brief has Claude write up the setups worth a closer look.
 
 It only reads market data. It cannot place orders. The ranking is a screen, not a
 forecast and not financial advice.
@@ -29,6 +30,8 @@ earnings dates are made up.
    - `ALPHAVANTAGE_API_KEY` (free key, about 25 requests a day): confirmed upcoming dates.
      Its history, which includes EPS surprises, is used only where EDGAR is not set or has
      too few reports, to stay inside the daily limit.
+   News needs nothing more. Headlines come with the Alpaca keys, and `SEC_USER_AGENT`
+   also brings in each company's 8-K filings.
 4. Optional: `ANTHROPIC_API_KEY` turns on the AI brief.
 
 ```powershell
@@ -76,6 +79,28 @@ twelve reports, and the size of move the options price for the next one. That la
 number takes the first expiration after the report and subtracts ordinary volatility,
 which comes from the last expiration before the report, else from the next expiration
 after it, else from recent realized volatility.
+
+**Adds news context** for each stock that has a contract on the list: its headlines from
+Alpaca's news feed and its 8-K filings from the SEC (the form a US company files when
+something material happens) over the last 14 days.
+
+- **Each item gets an event type**, such as analyst rating, guidance, management change,
+  stock offering or takeover. A headline is typed by a table of keywords, and a filing by
+  the item codes the SEC makes every 8-K carry. Both tables are in
+  `app/analysis/events.py`. Nothing reads the story, and nothing judges whether the news
+  is good or bad.
+- **What followed.** For each type seen lately, the app looks back at the same stock's
+  earlier events of that type and measures the size of the move on the day the news was
+  first felt, and over the five sessions after it. Each goes beside the stock's average
+  move on any day over the same stretch, because a 3% day means little for a stock that
+  often moves 3%. Days that carried an earnings report are left out, and with fewer than
+  three events it says there are too few to compare.
+- **A few types are pointed out in the list of results** (guidance, takeover, split or
+  special dividend, offering, distress, drug news), since they tend to move a stock in one
+  jump. Two come with a caution, because the scan's own numbers mislead after them: a
+  company being bought for cash, and a split or special dividend.
+
+News is shown beside the score and the rating and is never added into either.
 
 **Applies a budget, if you set one.** Only contracts whose outlay is within the budget
 are ranked, and discovery leans toward lower-priced stocks, where contracts in that range
@@ -143,8 +168,21 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   Alpaca's last update. Volume is the latest session's.
 - **A buyout breaks the rating.** Once a cash takeover is agreed, the stock sits at the
   deal price and its options price almost no movement. Next to a volatile history every
-  option then looks cheap and the rating says "favorable". Be wary of a stock that jumped
-  and whose implied volatility is far below its realized volatility.
+  option then looks cheap and the rating says "favorable". The news section flags a
+  takeover when a headline names the stock as the company being bought, and only then, so
+  still be wary of a stock that jumped and whose implied volatility is far below its
+  realized volatility.
+- **Event types are keyword guesses.** About a quarter of headlines fit no rule, and some
+  fit the wrong one. A headline tagged with a stock can be about another company that only
+  mentions it: a bank's notes on other stocks, its loans and its holdings are all tagged
+  with the bank. Read the headline before trusting its label.
+- **What followed past events is a description of a small sample.** The news feed reaches
+  back about seven months (the app keeps what it has seen, so the record grows), a study
+  often rests on a handful of days, and the move is measured close to close, so it includes
+  whatever else happened that day. It is not a forecast.
+- **Some stocks have no news.** The feed carries none for exchange-traded funds or a
+  second share class such as BRK.B. A foreign company files Form 6-K, which has no item
+  codes, so its filings are not classified, and the app says so.
 - **Pricing math is Black-Scholes** with no dividends and a flat rate (`RISK_FREE_RATE`).
   US equity options are American, so deep in-the-money puts and calls just before a
   dividend are approximate.
@@ -161,8 +199,9 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   not know market holidays.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
-- **The AI brief knows only the scan.** It has no news and no view of your account. It
-  calls `claude-opus-5-5` (override with `AI_MODEL`) and is billed to your Anthropic key.
+- **The AI brief knows only the scan's numbers.** It is not given the news section yet,
+  and it has no view of your account. It calls `claude-opus-5-5` (override with
+  `AI_MODEL`) and is billed to your Anthropic key.
 
 ## Tests
 
@@ -174,8 +213,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 
 1. **Done:** read-only scanner with earnings context, discovery, AI brief, exit plans and
    a premium-selling preset.
-2. News layer: classify headlines and filings by event type, and study what followed
-   similar events.
+2. **Started:** news layer. Headlines and 8-K filings are typed by event, and each stock
+   shows what followed its own earlier events of the same type. Still to do: give the
+   news to the AI brief, pool similar events across stocks so a study rests on more than
+   a handful of days, and tell which company a headline is about.
 3. A positions page that checks what you hold against the exit rules, then paper trading
    on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.

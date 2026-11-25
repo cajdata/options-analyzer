@@ -1,4 +1,8 @@
-"""Earnings dates: SEC EDGAR for history, Alpha Vantage for the calendar and history."""
+"""Earnings dates: SEC EDGAR for history, Alpha Vantage for the calendar and history.
+
+SEC EDGAR also lists a company's 8-K filings for the news layer (providers/news.py),
+through the same paced client.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ import httpx
 
 from app.analysis.earnings import estimate_next
 from app.cache import DiskCache
-from app.models import EarningsEvent
+from app.models import EarningsEvent, NewsItem
 
 ET = ZoneInfo("America/New_York")
 MARKET_CLOSE = clock(16, 0)
@@ -153,6 +157,7 @@ class EdgarEarnings:
     name = "SEC EDGAR"
     TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
     SUBMISSIONS_URL = "https://data.sec.gov/submissions/"
+    ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/"
     MAX_OLDER_FILES = 4
     MIN_INTERVAL = 0.12  # the SEC allows ten requests a second across all threads
     RETRIES = 2
@@ -173,7 +178,7 @@ class EdgarEarnings:
         self._lock = threading.Lock()
         self._pace = threading.Lock()
         self._last_call = 0.0
-        self._ciks: dict[str, int] | None = None
+        self._companies: dict[str, list] | None = None  # ticker: [CIK number, company name]
 
     def _get(self, url: str) -> Any:
         for attempt in range(self.RETRIES + 1):
@@ -191,16 +196,26 @@ class EdgarEarnings:
             return resp.json()
         raise AssertionError("unreachable")
 
-    def _cik(self, symbol: str) -> int | None:
+    def _company(self, symbol: str) -> list | None:
+        """The SEC's [CIK number, company name] for a ticker, from its list of every listed company."""
         with self._lock:
-            if self._ciks is None:
-                table = self._cache.get("edgar_tickers", timedelta(days=7))
+            if self._companies is None:
+                table = self._cache.get("edgar_companies", timedelta(days=7))
                 if table is None:
                     rows = self._get(self.TICKERS_URL).values()
-                    table = {str(r["ticker"]).upper(): int(r["cik_str"]) for r in rows}
-                    self._cache.set("edgar_tickers", table)
-                self._ciks = table
-        return self._ciks.get(symbol.upper().replace(".", "-"))
+                    table = {str(r["ticker"]).upper(): [int(r["cik_str"]), str(r.get("title") or "")] for r in rows}
+                    self._cache.set("edgar_companies", table)
+                self._companies = table
+        return self._companies.get(symbol.upper().replace(".", "-"))
+
+    def _cik(self, symbol: str) -> int | None:
+        found = self._company(symbol)
+        return found[0] if found else None
+
+    def company_name(self, symbol: str) -> str | None:
+        """The company's name as the SEC lists it, e.g. "INSMED Inc". None for a ticker it does not list."""
+        found = self._company(symbol)
+        return found[1] or None if found else None
 
     def history(self, symbol: str, want: int = 12) -> list[EarningsEvent]:
         cik = self._cik(symbol)
@@ -227,18 +242,70 @@ class EdgarEarnings:
         forms, items, accepted = table.get("form") or [], table.get("items") or [], table.get("acceptanceDateTime") or []
         out = []
         for form, item, stamp in zip(forms, items, accepted):
-            # Items arrive as "2.02,9.01". Tolerate a list, padding or a missing value.
-            codes = item if isinstance(item, list) else str(item or "").split(",")
-            if form != "8-K" or "2.02" not in {str(code).strip() for code in codes}:
+            if form != "8-K" or "2.02" not in _codes(item):
                 continue
-            try:
-                when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(ET)
-            except ValueError:
+            when = _accepted(stamp)
+            if when is None:
                 continue
             # A release during market hours moves the stock the same day, like a pre-market one.
             timing = "post" if when.time() >= MARKET_CLOSE else "pre"
             out.append(EarningsEvent(day=when.date(), timing=timing, source=self.name))
         return out
+
+    def filings(self, symbol: str) -> list[NewsItem]:
+        """Every 8-K among the company's recent filings, newest first, with its item codes.
+
+        Only the newest part of the filing index is read. That is the last
+        thousand filings or so: about ten years for most companies, and about
+        one for a company that files constantly (a large bank).
+        """
+        cik = self._cik(symbol)
+        if cik is None:
+            return []
+        data = self._get(f"{self.SUBMISSIONS_URL}CIK{cik:010d}.json")
+        recent = (data.get("filings") or {}).get("recent") or {}
+        forms = recent.get("form") or []
+
+        def cell(column: str, row: int) -> Any:
+            values = recent.get(column) or []
+            return values[row] if row < len(values) else None
+
+        out = []
+        for row, form in enumerate(forms):
+            when = _accepted(cell("acceptanceDateTime", row)) if form in ("8-K", "8-K/A") else None
+            if when is None:
+                continue
+            accession = str(cell("accessionNumber", row) or "")
+            folder = f"{self.ARCHIVE_URL}{cik}/{accession.replace('-', '')}/" if accession else None
+            out.append(
+                NewsItem(
+                    when=when,
+                    kind="filing",
+                    title=form,
+                    source=self.name,
+                    url=folder + str(cell("primaryDocument", row) or "") if folder else None,
+                    ref=accession,
+                    items=_codes(cell("items", row)),
+                )
+            )
+        if not out and self.FOREIGN_FORMS.intersection(forms):
+            # As with earnings: a foreign company has filings, but none that say what they are about.
+            raise Unsupported(f"{self.name} filings are not classified for a company that reports on Form 6-K.")
+        return sorted(out, key=lambda f: f.when, reverse=True)
+
+
+def _codes(item: Any) -> tuple[str, ...]:
+    """An 8-K's item codes. They arrive as "2.02,9.01"; tolerate a list, padding or a missing value."""
+    parts = item if isinstance(item, list) else str(item or "").split(",")
+    return tuple(code for code in (str(part).strip() for part in parts) if code)
+
+
+def _accepted(stamp: Any) -> datetime | None:
+    """When the SEC accepted a filing, in New York time."""
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(ET)
+    except ValueError:
+        return None
 
 
 class EarningsService:

@@ -3,8 +3,9 @@
 import json
 import math
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, time as clock, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -12,10 +13,13 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app import ai
+from app.analysis import events
 from app.cache import NullCache
 from app.config import Settings
-from app.providers.demo import SPECS, DemoMarket
+from app.models import NewsItem
+from app.providers.demo import NAMES, SPECS, DemoMarket
 from app.providers.earnings import EarningsService
+from app.providers.news import NewsService
 from app.scanner import PRESETS, ConfigError, Scanner, ScanRequest, build_scanner
 from app.server import ScanBody, create_app
 
@@ -826,6 +830,172 @@ def test_a_date_from_the_calendar_is_known_even_if_the_history_lookup_failed():
     assert acme.next_earnings.confirmed and acme.days_to_earnings == 9
     assert acme.earnings_unknown is False and acme.earnings_note  # the date is known; the note says history is missing
     assert not any("No earnings date is known" in w for w in result.warnings)
+
+
+# -- News -------------------------------------------------------------------------
+
+
+def news_scanner(headlines=None, filings=None) -> Scanner:
+    """The demo scanner with its news turned on, or with stand-in sources."""
+    market = DemoMarket(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    news = NewsService(NullCache(), headline_source=headlines or market, filing_source=filings or market, names=NAMES.get)
+    return Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=news)
+
+
+def test_recent_news_carries_event_types_and_what_followed_them():
+    result = news_scanner().scan(ScanRequest())
+    shown = {c.underlying for c in result.ideas}
+    assert shown and not any("News" in w for w in result.warnings)
+    for symbol in shown:
+        ctx = result.underlyings[symbol]
+        assert ctx.news and len(ctx.news) <= events.MAX_RECENT and ctx.news_note is None
+        assert ctx.news == sorted(ctx.news, key=lambda i: i.when, reverse=True)
+        assert all(i.event in events.EVENT_TYPES for i in ctx.news)
+        assert all((TODAY - i.when.date()).days <= events.RECENT_DAYS for i in ctx.news)
+        assert sum(ctx.recent_events.values()) >= len(ctx.news)
+        # A study only for a type seen lately, and never for earnings, which have their own section.
+        assert ctx.event_studies and set(ctx.event_studies) <= set(ctx.recent_events) - events.NOT_STUDIED
+        for study in ctx.event_studies.values():
+            assert study.count >= len(study.moves) >= 1 and 0 < study.mean_abs < 0.5 and study.ordinary_abs > 0
+            assert study.up + study.down <= study.count
+
+
+def test_the_scan_keeps_report_days_out_of_a_news_study():
+    market = DemoMarket(TODAY)
+    report = market.history("ACME")[0]  # ACME's latest report, out after the close
+    assert report.timing == "post"
+
+    class Feed:
+        name = "test"
+
+        def headlines(self, symbol, since):
+            def guidance(day, at, ref):
+                when = datetime.combine(day, at, tzinfo=ZoneInfo("America/New_York"))
+                return NewsItem(when, "headline", "Acme Raises Full-Year Revenue Guidance", "test", ref=ref)
+
+            return [
+                guidance(date(2026, 11, 20), clock(10, 0), "lately"),
+                guidance(date(2026, 10, 15), clock(10, 0), "last month"),
+                guidance(report.day, clock(17, 0), "with the report"),  # felt the same session as the report
+            ]
+
+    acme = news_scanner(headlines=Feed()).scan(ScanRequest(symbols=["ACME"])).underlyings["ACME"]
+    study = acme.event_studies["guidance"]
+    # The move that day belongs to the report, so it says nothing about guidance.
+    assert [m.day for m in study.moves] == [date(2026, 11, 20), date(2026, 10, 15)]
+    # The demo's made-up filings include each past report's 8-K, typed as earnings by its item code.
+    assert "earnings" not in acme.event_studies
+
+
+def test_a_buyout_of_the_stock_is_flagged_with_what_it_does_to_the_rating(capsys):
+    class Feed:
+        name = "test"
+
+        def headlines(self, symbol, since):
+            when = datetime(2026, 11, 23, 12, 30, tzinfo=ZoneInfo("America/New_York"))
+            return [NewsItem(when, "headline", "Tidewell Systems to Acquire Acme for $41 Billion", "test", ref=symbol)]
+
+    result = news_scanner(headlines=Feed()).scan(ScanRequest(symbols=["ACME", "BOLT"]))
+    assert {c.underlying for c in result.ideas} == {"ACME", "BOLT"}
+    # The same headline is tagged to both. It is a takeover only of the company it names as bought.
+    assert "takeover" in result.underlyings["ACME"].recent_events
+    assert "takeover" not in result.underlyings["BOLT"].recent_events
+    assert "acquisition" in result.underlyings["BOLT"].recent_events
+
+    from app.__main__ import print_scan
+
+    print_scan(result)
+    out = " ".join(capsys.readouterr().out.split())  # the caution is wrapped over several lines
+    assert out.count("Takeover bid or sale of the company: If this company is being bought for cash") == 1
+    assert "the rating means little" in out
+
+
+def test_news_is_fetched_only_for_stocks_that_made_the_list():
+    asked = []
+    scanner = news_scanner()
+    real_chain, real_headlines = scanner.market.option_chain, scanner.market.headlines
+
+    def headlines(symbol, since):
+        asked.append(symbol)
+        return real_headlines(symbol, since)
+
+    scanner.market.option_chain = lambda symbol, **window: [] if symbol == "BOLT" else real_chain(symbol, **window)
+    scanner.market.headlines = headlines
+    result = scanner.scan(ScanRequest(symbols=["ACME", "BOLT"]))
+
+    # BOLT has nothing to rank, so nobody will open it, and it costs no news request.
+    assert asked == ["ACME"]
+    assert result.underlyings["ACME"].news and not result.underlyings["BOLT"].news
+    # Without a news service the scan is as it was before.
+    plain = demo_scanner().scan(ScanRequest(symbols=["ACME"])).underlyings["ACME"]
+    assert (plain.news, plain.recent_events, plain.event_studies, plain.news_note) == ([], {}, {}, None)
+
+
+def test_a_failing_news_source_does_not_sink_the_scan():
+    class Down:
+        name = "Alpaca"
+
+        def __init__(self, error):
+            self.error = error
+
+        def headlines(self, symbol, since):
+            raise self.error
+
+    result = news_scanner(headlines=Down(httpx.ConnectError("down"))).scan(ScanRequest(symbols=["ACME", "BOLT"]))
+    assert result.ideas and all(c.score is not None for c in result.ideas)
+    note = "Alpaca headlines were unavailable (ConnectError)."
+    assert f"News could not be loaded for ACME, BOLT. {note}" in result.warnings
+    acme = result.underlyings["ACME"]
+    assert acme.news_note == note
+    assert acme.news and {i.kind for i in acme.news} == {"filing"}  # what the other source had is still shown
+
+    # Something no source is expected to raise is caught as well, and named.
+    broken = news_scanner(headlines=Down(ZeroDivisionError())).scan(ScanRequest(symbols=["ACME"]))
+    assert broken.ideas and broken.underlyings["ACME"].news_note == "News lookup failed: ZeroDivisionError."
+    assert "News could not be loaded for ACME. News lookup failed: ZeroDivisionError." in broken.warnings
+
+
+def test_a_caveat_raised_while_loading_news_reaches_the_scan():
+    scanner = news_scanner()
+    real = scanner.market.headlines
+
+    def headlines(symbol, since):
+        scanner.market.notes.append(f"{symbol}: only the newest 2,000 headlines were loaded.")
+        return real(symbol, since)
+
+    scanner.market.headlines = headlines
+    result = scanner.scan(ScanRequest(symbols=["ACME"]))
+    assert "ACME: only the newest 2,000 headlines were loaded." in result.warnings
+    assert scanner.market.notes == []  # and it does not leak into the next scan
+
+
+def test_news_reaches_the_api_the_page_and_the_command_line(client, capsys):
+    status = client.get("/api/status").json()
+    assert status["news_sources"] == ["demo data headlines", "demo data 8-K filings"]
+    rules = status["events"]
+    assert rules["labels"]["takeover"] == "Takeover bid or sale of the company" and "takeover" in rules["flagged"]
+    assert (rules["recent_days"], rules["follow_sessions"], rules["min_events"]) == (14, 5, 3)
+    assert set(rules["cautions"]) == {"takeover", "split"}
+
+    body = client.post("/api/scan", json={"symbols": ["ACME"], "top_n": 4}).json()
+    acme = body["underlyings"]["ACME"]
+    item = acme["news"][0]
+    assert item["event"] in rules["labels"] and item["kind"] in ("headline", "filing")
+    assert (TODAY - date.fromisoformat(item["when"][:10])).days <= 14  # a time stamp the page can read
+    study = next(iter(acme["event_studies"].values()))
+    assert study["label"] == rules["labels"][study["event"]] and study["moves"][0]["day"][:2] == "20"
+
+    page = client.get("/").text
+    assert "newsBlock(ctx)" in page and "innerHTML" not in page
+    assert 'rel: "noopener noreferrer"' in page  # a link out is a third party's
+
+    from app.__main__ import main
+
+    assert main(["scan", "ACME", "--demo", "--top", "4"]) == 0
+    out = capsys.readouterr().out
+    assert "News and filings, last 14 days" in out and "  ACME  " in out
+    assert re.search(r'past \d+ "\w+" events?: ', out) and "it is not a forecast" in out
 
 
 def test_cli_exit_line_shows_the_time_stop_result_and_speaks_for_the_seller(capsys):
