@@ -515,7 +515,7 @@ function renderBriefButton() {
   if (!scan || !scan.ideas.length || !status.ai_available) { $("brief").replaceChildren(); return; }
   $("brief").replaceChildren(el("div", { class: "panel" },
     el("h2", {}, "AI brief"),
-    el("p", { class: "sub" }, "Claude reads this scan and writes up the setups worth a closer look. Uses your Anthropic API key and is billed to it."),
+    el("p", { class: "sub" }, "Claude reads this scan, recent headlines included, and writes up the setups worth a closer look. Uses your Anthropic API key and is billed to it."),
     el("button", { id: "write-brief", onclick: writeBrief }, "Write brief")));
 }
 
@@ -534,7 +534,7 @@ async function writeBrief() {
         el("p", {}, pick.rationale),
         el("p", {}, el("strong", {}, "Risks: "), pick.risks),
         el("p", {}, el("strong", {}, "Check first: "), pick.check_first))),
-      el("p", { class: "sub" }, (brief.model ? "Written by " + brief.model + ". " : "") + "Based only on the numbers in this scan. Not advice."));
+      el("p", { class: "sub" }, (brief.model ? "Written by " + brief.model + ". " : "") + "Based only on this scan: its numbers and the headlines in its news sections. Not advice."));
   } catch (err) {
     button.disabled = false;
     button.textContent = "Write brief";

@@ -199,9 +199,12 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   not know market holidays.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
-- **The AI brief knows only the scan's numbers.** It is not given the news section yet,
-  and it has no view of your account. It calls `claude-opus-5-5` (override with
-  `AI_MODEL`) and is billed to your Anthropic key.
+- **The AI brief knows only the scan.** From the news section it gets up to six recent
+  headlines or filings for each stock, the summary of what followed their types, and any
+  caution. A headline is all it knows of a story, and it is told that a headline is data
+  and never an instruction. It has no view of your account. It calls `claude-opus-5-5`
+  (override with `AI_MODEL`) and is billed to your Anthropic key. A brief of twenty
+  contracts cost 28 cents with the headlines in it, against 21 cents without.
 
 ## Tests
 
@@ -213,10 +216,10 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
 
 1. **Done:** read-only scanner with earnings context, discovery, AI brief, exit plans and
    a premium-selling preset.
-2. **Started:** news layer. Headlines and 8-K filings are typed by event, and each stock
-   shows what followed its own earlier events of the same type. Still to do: give the
-   news to the AI brief, pool similar events across stocks so a study rests on more than
-   a handful of days, and tell which company a headline is about.
+2. **Started:** news layer. Headlines and 8-K filings are typed by event, each stock
+   shows what followed its own earlier events of the same type, and the AI brief reads
+   the recent ones. Still to do: pool similar events across stocks so a study rests on
+   more than a handful of days, and tell which company a headline is about.
 3. A positions page that checks what you hold against the exit rules, then paper trading
    on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.
