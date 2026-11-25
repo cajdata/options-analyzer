@@ -1129,6 +1129,40 @@ def test_news_reaches_the_api_the_page_and_the_command_line(client, capsys):
     assert re.search(r'past \d+ "\w+" events?: ', out) and "it is not a forecast" in out
 
 
+def test_another_companys_news_is_set_aside_on_every_surface(client, capsys):
+    rules = client.get("/api/status").json()["events"]
+    assert rules["elsewhere"] == "another" and rules["labels"]["another"] == "Another company's news"
+    assert "another" not in rules["flagged"]
+
+    acme = client.post("/api/scan", json={"symbols": ["ACME"], "top_n": 4}).json()["underlyings"]["ACME"]
+    # The demo tags two such headlines with each stock: the company holding another's shares,
+    # and a company whose name only looks like this one's.
+    assert [i["title"] for i in acme["news_elsewhere"]] == [
+        "Acme Increases Stake in Tidewell Systems to 6.4%",
+        "Acmeain Group PLC Announces Total Voting Rights",
+    ]
+    assert all(i["event"] == "another" for i in acme["news_elsewhere"])
+    # Counted, so the page can say how many there are, and in no list and no study.
+    assert acme["recent_events"]["another"] == 2 and "another" not in acme["event_studies"]
+    assert not any(i["event"] == "another" for i in acme["news"])
+
+    page = client.get("/").text
+    assert "elsewhereBlock(ctx)" in page and "About other companies" in page
+
+    # The command line and the brief leave them out altogether.
+    from app.__main__ import main
+
+    assert main(["scan", "ACME", "--demo", "--top", "4"]) == 0
+    out = capsys.readouterr().out
+    assert "News and filings" in out and "Tidewell Systems to 6.4%" not in out and "Acmeain" not in out
+
+    result = news_scanner().scan(ScanRequest(symbols=["ACME"]))
+    assert len(result.underlyings["ACME"].news_elsewhere) == 2
+    payload = ai.scan_payload(result)
+    assert "Another company's news" not in payload["underlyings"]["ACME"]["recent_news"]["count_by_event_type"]
+    assert "Acmeain" not in json.dumps(payload) and "Tidewell Systems to 6.4%" not in json.dumps(payload)
+
+
 def test_cli_exit_line_shows_the_time_stop_result_and_speaks_for_the_seller(capsys):
     from app.__main__ import _exit_line, main
     from app.analysis import exits

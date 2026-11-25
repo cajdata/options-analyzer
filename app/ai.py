@@ -238,9 +238,11 @@ def _news(u: UnderlyingContext) -> dict[str, Any] | None:
     chosen = events.shortlist((i for i in u.news if i.event != "calendar"), NEWS_ITEMS)
     if not chosen and not u.news_note:
         return None
+    # Another company's news is not the model's to weigh: neither the items nor the count go in.
+    counted = {kind: n for kind, n in u.recent_events.items() if kind != events.ELSEWHERE}
     out: dict[str, Any] = {
         "window_days": events.RECENT_DAYS,
-        "count_by_event_type": {events.EVENT_TYPES.get(kind, kind): n for kind, n in u.recent_events.items()},
+        "count_by_event_type": {events.EVENT_TYPES.get(kind, kind): n for kind, n in counted.items()},
         "items": [
             {
                 "date": item.when.astimezone(events.ET).date().isoformat(),

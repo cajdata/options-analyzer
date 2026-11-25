@@ -102,7 +102,9 @@ class NewsService:
         source = self._headline_source
         if source is None:
             return [], None, False
-        key = f"news_headlines_{symbol}"
+        # "2": a headline is kept with the feed's summary. A record from before that has
+        # none, so it is left where it is and the stock's headlines are asked for afresh.
+        key = f"news_headlines2_{symbol}"
         found = self._cache.entry(key)
         on_disk = _items(found[0]) if found is not None else None
         if on_disk is not None and found[1] <= self.REFRESH:
@@ -148,6 +150,7 @@ def _plain(item: NewsItem) -> dict:
         "url": item.url,
         "ref": item.ref,
         "items": list(item.items),
+        "summary": item.summary,
     }
 
 
@@ -169,6 +172,7 @@ def _items(rows: Any) -> list[NewsItem] | None:
                 url=row.get("url"),
                 ref=row.get("ref", ""),
                 items=tuple(row.get("items") or ()),
+                summary=str(row.get("summary") or ""),
             )
             for row in rows
         ]

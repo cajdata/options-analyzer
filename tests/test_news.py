@@ -1,6 +1,7 @@
 """News layer: event types, what followed past events, and the sources behind them."""
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, time as clock, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,7 +12,7 @@ import pytest
 from app.analysis import events
 from app.cache import DiskCache, NullCache
 from app.models import Bar, NewsItem
-from app.providers.alpaca import MAX_NEWS_PAGES, AlpacaData, AlpacaError
+from app.providers.alpaca import MAX_NEWS_PAGES, SUMMARY_CHARS, AlpacaData, AlpacaError
 from app.providers.earnings import EdgarEarnings, Unsupported
 from app.providers.news import NewsService
 
@@ -233,6 +234,139 @@ def test_a_takeover_is_still_caught_however_the_headline_goes_on(symbol, name, t
     assert events.headline_type(text, events.aliases(symbol, name)) == "takeover"
 
 
+COMPANIES = {
+    "GME": "GameStop Corp.",
+    "EBAY": "eBay Inc.",
+    "COST": "COSTCO WHOLESALE CORP /NEW",
+    "NVDA": "NVIDIA CORP",
+    "TSLA": "Tesla, Inc.",
+    "PLTR": "Palantir Technologies Inc.",
+    "LLY": "ELI LILLY & Co",
+    "JPM": "JPMORGAN CHASE & CO",
+    "AAPL": "Apple Inc.",
+    "PFE": "PFIZER INC",
+    "ACME": "Acme",
+}
+
+
+def typed(symbol: str, text: str, summary: str = "") -> str:
+    return events.headline_type(text, events.aliases(symbol, COMPANIES[symbol]), summary)
+
+
+@pytest.mark.parametrize(
+    "symbol, text, kind",
+    [
+        # Seen live: GameStop bid for eBay, and every one of these marked GameStop as the company being bought.
+        ("GME", "GameStop Makes Unsolicited $56 Billion Takeover Bid for eBay", "other"),
+        ("GME", "GameStop Formally Submits Unsolicited $55.5 Billion Acquisition Proposal for eBay", "acquisition"),
+        ("GME", "GameStop Shareholders Approve Measures Supporting eBay Acquisition Bid", "governance"),
+        ("GME", "eBay Rejects GameStop's $55.5 Billion Acquisition Proposal", "acquisition"),
+        ("GME", "Michael Burry Exits GameStop Position Following eBay Acquisition Bid", "acquisition"),
+        # The same headlines are a takeover for the company on the receiving end.
+        ("EBAY", "GameStop Makes Unsolicited $56 Billion Takeover Bid for eBay", "takeover"),
+        ("EBAY", "eBay Rejects GameStop's $55.5 Billion Acquisition Proposal", "takeover"),
+        ("EBAY", "eBay Board of Directors Rejects GameStop's Unsolicited Acquisition Proposal", "takeover"),
+        ("ACME", "Acme Agrees to Be Acquired by Tidewell Systems for $4 Billion", "takeover"),
+        ("ACME", "Acme Receives Unsolicited Acquisition Proposal", "takeover"),
+        ("ACME", "Acme to Go Private in $2 Billion Deal", "takeover"),
+        ("ACME", "Acme Reviews Strategic Alternatives", "takeover"),
+        # Receiving a vote is not receiving an offer, and a product "takeover" in a shop is not a deal.
+        ("ACME", "Acme Receives Shareholder Approval for Tidewell Acquisition Bid", "acquisition"),
+        ("COST", "Fly By Jing Launches Chili Crisp Takeover at Costco", "product"),
+    ],
+)
+def test_a_takeover_needs_the_company_on_the_receiving_end(symbol, text, kind):
+    assert typed(symbol, text) == kind
+
+
+@pytest.mark.parametrize(
+    "symbol, text, kind",
+    [
+        # Seen live: someone else raising money, with the stock named further on.
+        ("NVDA", "IREN Secures $3.6 Billion Financing for NVIDIA GPU Acquisition", "acquisition"),
+        ("NVDA", "NVIDIA-Backed Iambic Therapeutics Files for US IPO", "other"),
+        ("NVDA", "NVIDIA Customer AM Intelligence Seeks $3 Billion Financing for Processor Order", "agreement"),
+        ("JPM", "Aviation Capital Group Amends Credit Facility with JPMorgan Chase", "other"),
+        ("NVDA", "NVIDIA Raises $25 Billion in Corporate Bond Offering", "financing"),
+        ("JPM", "JPMorgan Chase Prices $3.8 Million in Callable Fixed-Rate Notes", "financing"),
+        # An analyst's forecast for the company is not the company's guidance.
+        ("TSLA", "Morgan Stanley Raises Tesla Q2 Delivery Estimate", "other"),
+        ("AAPL", "Apple Supplier Foxconn Cuts Full-Year Revenue Outlook", "other"),
+        ("PLTR", "Palantir Raises Full-Year 2026 Revenue Outlook Following Strong Q1 Performance", "guidance"),
+        ("NVDA", "NVIDIA Warns of Potential Second-Half Margin Compression", "guidance"),
+        # A later word of the name opens the headline as well as the whole of it.
+        ("LLY", "Lilly Raises Full-Year Revenue Guidance", "guidance"),
+        # Talk of a special dividend is not one, and another company's default is not this one's.
+        ("COST", "Mizuho Analyst Suggests Costco Reinvest Capital Instead of Special Dividend", "payout"),
+        ("COST", "Costco Declares Special Cash Dividend of $15 Per Share", "split"),
+        ("TSLA", "Syrah Resources Resolves Alleged Default on Tesla Offtake Agreement", "agreement"),
+        # Drug news is the exception: the regulator opens the headline, and the news is the company's.
+        ("LLY", "FDA Approves Eli Lilly's Mounjaro to Reduce Cardiovascular Risk in Type 2 Diabetes", "drug"),
+    ],
+)
+def test_some_flagged_types_need_the_company_to_open_the_headline(symbol, text, kind):
+    assert typed(symbol, text) == kind
+    assert events.IN_FRONT == {"guidance", "split", "financing", "distress"} and events.IN_FRONT < events.FLAGGED
+
+
+@pytest.mark.parametrize(
+    "symbol, text, kind",
+    [
+        # Seen live: a third of JPMorgan's headlines. It wrote the note, or it holds the shares.
+        ("JPM", "JPMorgan Chase Maintains Overweight Rating on T-Mobile US", "another"),
+        ("JPM", "JPMorgan Chase & Co. Adjusts Price Target for Truist Financial", "another"),
+        ("JPM", "J.P. Morgan Updates Rating and Price Target for Costco", "another"),
+        ("COST", "J.P. Morgan Updates Rating and Price Target for Costco", "analyst"),
+        ("JPM", "Barclays Adjusts Price Target on JPMorgan Chase to $425 From $420", "analyst"),
+        ("JPM", "JPMorgan Chase Increases Stake in Future PLC to 6.37%", "another"),
+        ("JPM", "JPMorgan Chase Updates Major Holdings in Siltronic AG to 5.21%", "another"),
+        # Someone holding this company's shares, and the company's own people, are still its insider news.
+        ("ACME", "Longview Partners Increases Stake in Acme to 6.8%", "insider"),
+        ("ACME", "Acme Chairman Raises Stake in Acme", "insider"),
+        # A banker to someone else's listing is doing business, not raising money.
+        ("JPM", "JPMorgan Chase Selected to Lead General Atlantic IPO", "agreement"),
+        ("NVDA", "NVIDIA Pledges $10 Billion to OpenAI Funding Round", "agreement"),
+        # Words that only look like the shapes above.
+        ("AAPL", "Apple Updates App Store Age-Rating Requirements for Dating and AI Companion Apps", "other"),
+        ("TSLA", "Tesla Maintains Top Position in South Korea's Imported Car Market", "other"),
+    ],
+)
+def test_a_company_acting_on_another_is_not_having_the_event(symbol, text, kind):
+    assert typed(symbol, text) == kind
+    assert events.ELSEWHERE == "another" and events.ELSEWHERE in events.NOT_STUDIED and events.ELSEWHERE not in events.FLAGGED
+
+
+def test_a_headline_that_never_names_the_company_is_another_companys_news():
+    # Seen live: 52 of Costco's 314 headlines were Costain's, a company whose ticker is COST in London.
+    costain = "Costain Group PLC Announces Total Voting Rights"
+    assert typed("COST", costain, "Costain Group PLC reported its total voting rights and capital.") == "another"
+    # The summary can name the company where the headline has only a product.
+    mounjaro = "Health Canada Approves Mounjaro for Cardiovascular Risk Reduction"
+    assert typed("LLY", mounjaro, "Health Canada approved Eli Lilly's Mounjaro for a new use.") == "other"
+    assert typed("LLY", mounjaro, "Health Canada approved Mounjaro for a new use.") == "another"
+    assert typed("AAPL", "Analysts Project Potential Price Increase for iPhone 18 Series", "Analysts expect Apple to raise prices.") == "other"
+
+    # With no summary on hand nothing is concluded: a headline alone often has only the product.
+    assert typed("COST", costain) == "other"
+    # With only a ticker to go by, nothing is either. Headlines rarely give the ticker.
+    assert events.headline_type(costain, ("COST",), "Costain Group PLC reported its total voting rights.") == "other"
+    assert events._named(("COST",)) is None and events._named(()) is None
+
+    # A name is found with its dots and spaces moved, and by a later word that is not a plain one.
+    said = "The bank's arm announced it."
+    assert typed("JPM", "J.P. Morgan Payments Partners with Mercado Libre for Global Selling Program", said) == "agreement"
+    assert typed("JPM", "JPMorganChase Announces $10 Million Loan to Support Atlanta Small Businesses", said) == "other"
+    assert typed("JPM", "Chase Travel Announces Expansion of 'The Edit' Collection", said) == "other"
+    assert typed("PLTR", "Plus Therapeutics Partners with Ephemeral Technologies for an Oncology Platform", "Two companies partnered.") == "another"
+
+
+def test_with_no_name_to_go_by_the_keyword_table_decides_as_before():
+    # No company named: a takeover word is a takeover, and an offering is an offering, whoever it is.
+    assert events.headline_type("GameStop Makes Unsolicited $56 Billion Takeover Bid for eBay") == "takeover"
+    assert events.headline_type("IREN Secures $3.6 Billion Financing for NVIDIA GPU Acquisition") == "financing"
+    assert events.headline_type("JPMorgan Chase Increases Stake in Future PLC to 6.37%") == "insider"
+
+
 def test_every_rule_points_at_a_type_with_a_label():
     known = set(events.EVENT_TYPES)
     assert {kind for kind, _ in events.HEADLINE_RULES} <= known
@@ -450,7 +584,8 @@ def test_context_lists_recent_news_and_studies_only_the_types_in_it():
     ]
     extra = [raw(last, "Acme to Present at Lakeshore Technology Conference", 200), filing(["5.02"], when=datetime.combine(last, clock(8, 0), tzinfo=ET))]
 
-    shown, counts, studies = events.context(recent + older + extra, bars, set(), today)
+    shown, counts, studies, elsewhere = events.context(recent + older + extra, bars, set(), today)
+    assert elsewhere == []
     assert len(shown) == events.MAX_RECENT and shown == sorted(shown, key=lambda i: i.when, reverse=True)
     assert all(item.event for item in shown)  # classified on the way through
     # Every recent item is counted, not only the ones listed, in the order the types are defined.
@@ -475,10 +610,49 @@ def test_a_flagged_item_stays_on_the_list_when_a_busy_week_pushes_it_out():
         raw(last - timedelta(days=11), 10, "Acme Raises Full-Year Revenue Guidance", 102),  # only the newest of a type is kept
         raw(last - timedelta(days=12), 10, "Acme Appoints New Chief Financial Officer", 103),  # not a flagged type
     ]
-    shown, counts, _ = events.context(launches + older, bars, set(), today)
+    shown, counts, _, _ = events.context(launches + older, bars, set(), today)
     assert len(shown) == events.MAX_RECENT + 2 and shown == sorted(shown, key=lambda i: i.when, reverse=True)
     assert [i.ref for i in shown[-2:]] == ["100", "101"]
     assert counts == {"guidance": 2, "financing": 1, "management": 1, "product": 12}
+
+
+def test_another_companys_news_takes_no_place_and_counts_towards_nothing():
+    bars = bars_from([0.01] * 120, date(2026, 6, 1))
+    days = [b.day for b in bars]
+    last = days[-1]
+    today = last + timedelta(days=1)
+    names = events.aliases("ACME", "Acme")
+
+    def raw(day, hour, title, n, summary=""):
+        when = datetime.combine(day, clock(hour, 0), tzinfo=ET)
+        return NewsItem(when, "headline", title, "test", ref=str(n), summary=summary)
+
+    # A week of the company holding other companies' shares, newer than anything of its own.
+    holdings = [raw(last, 9 + n % 6, f"Acme Updates Major Holdings in Company {n} PLC", n) for n in range(14)]
+    lookalike = raw(last, 15, "Acmeain Group PLC Announces Total Voting Rights", 50, "Acmeain Group PLC reported its voting rights.")
+    own = [
+        raw(last - timedelta(days=2), 10, "Acme Raises Full-Year Revenue Guidance", 100),
+        raw(last - timedelta(days=3), 10, "Longview Partners Increases Stake in Acme to 6.8%", 101),
+    ]
+    # Older ones, for the studies: an insider trade in the company, and holdings of its own in others.
+    older = [raw(days[40], 10, "Acme Director Sells Shares Worth $2 Million", 200)] + [
+        raw(days[50 + n], 10, f"Acme Increases Stake in Company {n} PLC", 300 + n) for n in range(5)
+    ]
+
+    shown, counts, studies, elsewhere = events.context(holdings + [lookalike] + own + older, bars, set(), today, names)
+    # The company's own two items are listed, though fifteen newer ones were tagged with it.
+    assert [i.ref for i in shown] == ["100", "101"]
+    assert counts == {"guidance": 1, "insider": 1, "another": 15}
+    # The newest of the rest are handed back apart, to be looked at.
+    assert len(elsewhere) == events.MAX_ELSEWHERE == 10 and all(i.event == "another" for i in elsewhere)
+    assert elsewhere[0].ref == "50" and elsewhere == sorted(elsewhere, key=lambda i: i.when, reverse=True)
+    # The insider study rests on trades in this company's shares: the two of them, not its five holdings.
+    assert set(studies) == {"guidance", "insider"} and studies["insider"].count == 2
+    assert not any(i.event == "another" for i in shown)
+
+    # Without the company's name, every one of them is typed as it always was.
+    plain = events.context(holdings + [lookalike] + own + older, bars, set(), today)
+    assert plain[3] == [] and "another" not in plain[1] and plain[2]["insider"].count > 2
 
 
 def test_a_short_list_always_has_the_headline_behind_a_caution():
@@ -534,6 +708,8 @@ def test_headlines_parse_a_captured_response_and_follow_its_pages():
         source="fiscal.ai",
         url="https://news.example.com/acme/director-share-sale?source=feed&campaign=1",
         ref="129880987",
+        # The feed's one sentence about the story, kept to tell whose news it is.
+        summary="A director of Acme reported selling shares worth about $2 million, according to a regulatory filing.",
     )
     # Two stories can share a time stamp. Their ids keep them apart.
     assert items[2].when == items[3].when and items[2].ref != items[3].ref
@@ -548,12 +724,17 @@ def test_headline_rows_that_cannot_be_used_are_skipped_and_only_web_links_are_ke
         {"id": 4, "headline": "No zone", "created_at": "2026-11-20T15:00:00"},
         "not a row",
         {"id": 5, "headline": "Plain link", "created_at": "2026-11-19T15:00:00Z", "url": "HTTPS://example.com/a"},
+        {"id": 6, "headline": "With a summary", "created_at": "2026-11-18T15:00:00Z", "summary": "  Acme  said\tso. " + "x" * 900},
+        {"id": 7, "headline": "Summary of the wrong kind", "created_at": "2026-11-17T15:00:00Z", "summary": None},
     ]
     items = alpaca(lambda request: httpx.Response(200, json={"news": rows, "next_page_token": None})).headlines("ACME", datetime(2026, 11, 1, tzinfo=ET))
-    assert [(i.ref, i.title, i.url, i.source) for i in items] == [
+    assert [(i.ref, i.title, i.url, i.source) for i in items[:2]] == [
         ("1", "Acme Opens New Office", None, "Alpaca"),
         ("5", "Plain link", "HTTPS://example.com/a", "Alpaca"),
     ]
+    # The summary is a third party's text too: tidied, and cut to a fixed length.
+    assert [i.summary for i in items[:2]] == ["", ""] and items[3].summary == ""
+    assert items[2].summary.startswith("Acme said so. xxx") and len(items[2].summary) == SUMMARY_CHARS == 400
 
 
 def test_a_very_long_run_of_headlines_is_cut_off_and_the_scan_says_so():
@@ -701,6 +882,21 @@ def test_the_record_on_disk_keeps_growing_and_only_newer_headlines_are_asked_for
     feed.items = [mid, late, new]
     age(tmp_path, 20)
     assert service.items("ACME", TODAY)[0] == [new, late, mid, old]
+
+
+def test_a_headline_is_kept_with_its_summary_and_a_record_without_them_is_asked_for_again(tmp_path):
+    cache = DiskCache(tmp_path)
+    # A record from before summaries were kept, under the name it was stored by then.
+    cache.set("news_headlines_ACME", [{"when": NOON.isoformat(), "kind": "headline", "title": "from before", "source": "t", "ref": "9"}])
+    told = replace(headline(1, NOON), summary="Acme opened a regional office.")
+    feed = Feed([told])
+    service = NewsService(cache, headline_source=feed)
+    # Asked for afresh, from as far back as a first request reaches: the old record has no summaries to go by.
+    assert service.items("ACME", TODAY)[0] == [told]
+    assert feed.asked == [datetime(2025, 10, 20, tzinfo=timezone.utc)]
+    # Read back from disk, the summary is still there.
+    assert NewsService(DiskCache(tmp_path), headline_source=Feed()).items("ACME", TODAY)[0] == [told]
+    assert events.classify(told, events.aliases("ACME", "Acme")).summary == told.summary
 
 
 def test_a_failed_lookup_keeps_the_old_record_and_says_so(tmp_path):

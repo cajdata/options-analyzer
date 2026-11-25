@@ -216,6 +216,9 @@ class NewsItem:
     ref: str = ""  # the source's own id for it, used to drop repeats
     items: tuple[str, ...] = ()  # a filing's 8-K item codes
     event: str = ""  # event type, set by analysis/events.py
+    # The feed's one-sentence summary of a headline. It is not shown: it is read
+    # only to tell whether the headline is about this company at all.
+    summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -274,6 +277,9 @@ class UnderlyingContext:
     event_var: float | None = None  # variance of past report-day moves
     # News, filled in only for a stock with a ranked contract (see analysis/events.py).
     news: list[NewsItem] = field(default_factory=list)  # the latest items, newest first
+    # Recent items tagged with this stock that are another company's news, newest first.
+    # They are kept to be looked at, and count towards nothing.
+    news_elsewhere: list[NewsItem] = field(default_factory=list)
     recent_events: dict[str, int] = field(default_factory=dict)  # event type to how many recent items
     event_studies: dict[str, EventStudy] = field(default_factory=dict)  # by event type
     news_note: str | None = None  # set when a source could not answer
