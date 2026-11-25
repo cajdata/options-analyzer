@@ -51,7 +51,7 @@ class ScanBody(BaseModel):
 
 def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
     settings = settings or load_settings()
-    app = FastAPI(title="Options Analyzer", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Strike Check", docs_url=None, redoc_url=None)
     scans: OrderedDict[str, ScanResult] = OrderedDict()
     scans_lock = threading.Lock()  # request handlers run on several threads
     scanner: Scanner | None = None

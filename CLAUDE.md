@@ -21,7 +21,7 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
-- `.claude/launch.json` defines two dashboards for the preview tools: `options-analyzer-demo` on port 8765 (synthetic data) and `options-analyzer-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
+- `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code.
 - With `ANTHROPIC_API_KEY` set, the live dashboard shows a "Write brief" button and `scan --brief` works. Each use is a billed call: ask before making one.
 
 ## Architecture

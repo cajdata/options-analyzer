@@ -154,7 +154,7 @@ def test_api_status_and_page(client):
     assert status["mode"] == "demo" and status["setup_error"] is None
     assert status["earnings_sources"] == ["demo data"]
     assert set(status["lenses"]) == {"buy", "sell"}
-    assert "Options Analyzer" in client.get("/").text
+    assert "Strike Check" in client.get("/").text
 
 
 def test_api_scan_returns_json_the_page_can_render(client):
