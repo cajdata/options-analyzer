@@ -12,12 +12,13 @@ from zoneinfo import ZoneInfo
 
 from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
-from app.analysis import exits, risk, scoring
+from app.analysis import events, exits, risk, scoring
 from app.cache import DiskCache, NullCache
 from app.config import ConfigError, Settings
 from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, TermPoint, UnderlyingContext
 from app.providers import MarketData
 from app.providers.earnings import AlphaVantageEarnings, EarningsService, EdgarEarnings
+from app.providers.news import NewsService
 
 __all__ = ["ConfigError", "PRESETS", "ScanRequest", "Scanner", "build_scanner"]
 
@@ -88,6 +89,7 @@ class _Found:
     contracts: list[ContractAnalysis]
     least_outlay: float | None  # cheapest contract seen, before any budget was applied
     left_out: str | None = None  # why skip-earnings removed everything: "unknown" or "all open"
+    earnings_days: set[date] = field(default_factory=set)  # sessions that carry an earnings reaction
 
 
 def _names(symbols: list[str], limit: int = 8) -> str:
@@ -106,9 +108,11 @@ class Scanner:
         settings: Settings,
         universe: list[str] | None = None,
         today: date | None = None,
+        news: NewsService | None = None,
     ) -> None:
         self.market = market
         self.earnings = earnings
+        self.news = news  # None leaves the news section out of every scan
         self.settings = settings
         self.universe = universe or []  # symbols a discovery scan always considers
         self._today = today
@@ -152,6 +156,7 @@ class Scanner:
         cheapest: tuple[float, str] | None = None  # least outlay seen, before the budget was applied
         left_out: dict[str, list[str]] = {"unknown": [], "all open": []}
         no_quotes: list[str] = []
+        earnings_days: dict[str, set[date]] = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(analyze, selected):
                 if isinstance(outcome, str):
@@ -159,6 +164,7 @@ class Scanner:
                     continue
                 ctx, least = outcome.ctx, outcome.least_outlay
                 underlyings[ctx.symbol] = ctx
+                earnings_days[ctx.symbol] = outcome.earnings_days
                 scored.extend(outcome.contracts)
                 if least is not None and (cheapest is None or least < cheapest[0]):
                     cheapest = (least, ctx.symbol)
@@ -174,10 +180,14 @@ class Scanner:
         warnings.extend(self._earnings_warnings(req, underlyings, left_out))
         if self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
-        warnings.extend(dict.fromkeys(self.market.notes))
-        self.market.notes.clear()
 
         ideas = scoring.rank(scored, req.per_side or (5 if req.symbols else 1), req.top_n)
+        # News comes last and only for the stocks that made the list, so a stock
+        # nobody will look at costs no request. It runs before the provider's notes
+        # are collected, because loading headlines can add one.
+        warnings.extend(self._add_news(ideas, underlyings, bars, earnings_days, today))
+        warnings.extend(dict.fromkeys(self.market.notes))
+        self.market.notes.clear()
         if req.budget is not None and not ideas:
             note = f"Nothing fits a ${req.budget:,.0f} budget."
             if cheapest:
@@ -229,6 +239,38 @@ class Scanner:
         elif unknown:
             out.append(f"No earnings date is known for {_names(unknown)}, so ratings there do not account for a report.")
         return out
+
+    def _add_news(
+        self,
+        ideas: list[ContractAnalysis],
+        underlyings: dict[str, UnderlyingContext],
+        bars: dict[str, list[Bar]],
+        earnings_days: dict[str, set[date]],
+        today: date,
+    ) -> list[str]:
+        """Give each stock with a ranked contract its recent news and what followed events like it."""
+        if self.news is None:
+            return []
+
+        def load(symbol: str) -> str | None:
+            ctx = underlyings[symbol]
+            try:
+                items, ctx.news_note, failed = self.news.items(symbol, today)
+                names = events.aliases(symbol, self.news.name(symbol))
+                ctx.news, ctx.recent_events, ctx.event_studies = events.context(
+                    items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, names
+                )
+            except Exception as err:  # news is an extra: it must not sink the scan
+                ctx.news_note, failed = f"News lookup failed: {type(err).__name__}.", True
+            return symbol if failed else None
+
+        shown = list(dict.fromkeys(c.underlying for c in ideas))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            failed = [symbol for symbol in pool.map(load, shown) if symbol]
+        if not failed:
+            return []
+        # One note for all of them. A failure is usually the same one for every stock.
+        return [f"News could not be loaded for {_names(failed)}. {underlyings[failed[0]].news_note}"]
 
     # -- Choosing symbols ---------------------------------------------------
 
@@ -431,17 +473,18 @@ class Scanner:
         for c in wanted:
             scoring.score(c, req.lens)
             c.risk_reward = risk.assess(c, spot, rate, req.lens)
-        return _Found(ctx, wanted, least, left_out)
+        return _Found(ctx, wanted, least, left_out, earnings_days)
 
 
 def build_scanner(settings: Settings, demo: bool = False) -> Scanner:
     """Wire up data sources from settings. `demo` uses synthetic data and no keys."""
     if demo:
-        from app.providers.demo import SPECS, DemoMarket
+        from app.providers.demo import NAMES, SPECS, DemoMarket
 
         market = DemoMarket()
         earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=market.today)
-        return Scanner(market, earnings, settings, universe=list(SPECS), today=market.today)
+        news = NewsService(NullCache(), headline_source=market, filing_source=market, names=NAMES.get)
+        return Scanner(market, earnings, settings, universe=list(SPECS), today=market.today, news=news)
 
     if not settings.has_alpaca:
         raise ConfigError(
@@ -459,10 +502,14 @@ def build_scanner(settings: Settings, demo: bool = False) -> Scanner:
     )
     cache = DiskCache(settings.cache_dir)
     history_sources, calendar_source = [], None
-    if settings.sec_user_agent:
-        history_sources.append(EdgarEarnings(settings.sec_user_agent, cache))
+    edgar = EdgarEarnings(settings.sec_user_agent, cache) if settings.sec_user_agent else None
+    if edgar:
+        history_sources.append(edgar)
     if settings.alphavantage_key:
         calendar_source = AlphaVantageEarnings(settings.alphavantage_key)
         history_sources.append(calendar_source)
     earnings = EarningsService(cache, history_sources=history_sources, calendar_source=calendar_source)
-    return Scanner(market, earnings, settings, universe=settings.universe())
+    # Headlines come with the Alpaca keys. Filings, and the company names that tell a
+    # buyer from the company being bought, need the same SEC contact line as earnings history.
+    news = NewsService(cache, headline_source=market, filing_source=edgar, names=edgar.company_name if edgar else None)
+    return Scanner(market, earnings, settings, universe=settings.universe(), news=news)

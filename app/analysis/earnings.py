@@ -15,25 +15,30 @@ _MAX_GAP = timedelta(days=6)  # skip an event if the price history has a hole ar
 NEXT_REPORT_DAYS = 75
 
 
-def _window(event: EarningsEvent, days: list[date]) -> tuple[int, int] | None:
-    """Indexes of the last close before the report takes effect and the first close after.
+def window(day: date, timing: str, days: list[date]) -> tuple[int, int] | None:
+    """Indexes of the last close before news on `day` takes effect and the first close after.
 
-    A report before the open moves the stock that same day; one after the close
-    moves it the next trading day. When the timing is unknown the window runs
-    from the close before the report day to the close after it, which covers
-    both cases.
+    News before the open, or during the session, moves the stock that same day;
+    news after the close moves it the next trading day. When the timing is
+    unknown the window runs from the close before the day to the close after
+    it, which covers both cases. `days` are the trading days on record, oldest
+    first. None when the price history does not reach both sides.
     """
-    if event.timing == "post":
-        before, after = bisect_right(days, event.day) - 1, bisect_right(days, event.day)
-    elif event.timing == "pre":
-        before, after = bisect_left(days, event.day) - 1, bisect_left(days, event.day)
+    if timing == "post":
+        before, after = bisect_right(days, day) - 1, bisect_right(days, day)
+    elif timing == "pre":
+        before, after = bisect_left(days, day) - 1, bisect_left(days, day)
     else:
-        before, after = bisect_left(days, event.day) - 1, bisect_right(days, event.day)
+        before, after = bisect_left(days, day) - 1, bisect_right(days, day)
     if before < 0 or after >= len(days):
         return None
-    if event.day - days[before] > _MAX_GAP or days[after] - event.day > _MAX_GAP:
+    if day - days[before] > _MAX_GAP or days[after] - day > _MAX_GAP:
         return None
     return before, after
+
+
+def _window(event: EarningsEvent, days: list[date]) -> tuple[int, int] | None:
+    return window(event.day, event.timing, days)
 
 
 def reactions(events: list[EarningsEvent], bars: list[Bar]) -> list[Reaction]:

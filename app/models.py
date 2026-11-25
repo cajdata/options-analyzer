@@ -204,6 +204,50 @@ class ExitPlan:
     target_day: date | None = None  # seller: when decay alone gets there, if it does before expiry
 
 
+@dataclass(frozen=True)
+class NewsItem:
+    """A headline or an SEC filing about one stock."""
+
+    when: datetime  # published, or accepted by the SEC
+    kind: str  # "headline" or "filing"
+    title: str
+    source: str
+    url: str | None = None
+    ref: str = ""  # the source's own id for it, used to drop repeats
+    items: tuple[str, ...] = ()  # a filing's 8-K item codes
+    event: str = ""  # event type, set by analysis/events.py
+
+
+@dataclass(frozen=True)
+class EventMove:
+    """How the stock moved across one past event."""
+
+    day: date  # the first session whose close reflects it
+    title: str
+    move_pct: float  # the close before to that session's close
+    after_pct: float | None  # that close to the close some sessions later; None if too recent
+
+
+@dataclass(frozen=True)
+class EventStudy:
+    """What followed one stock's past events of one type. Built by analysis/events.py."""
+
+    event: str
+    label: str
+    count: int  # sessions that carried an event of this type, earnings days left out
+    since: date  # the first of them
+    mean_abs: float  # average size of the move on those sessions
+    up: int
+    down: int
+    # Average size of the move on any session over the same stretch, earnings days
+    # left out. None when there is none to compare with.
+    ordinary_abs: float | None
+    after_count: int  # events old enough to have the sessions after them on record
+    mean_abs_after: float | None  # average size of the move over those following sessions
+    ordinary_abs_after: float | None  # the same measure over every session in the stretch
+    moves: list[EventMove] = field(default_factory=list)  # newest first
+
+
 @dataclass
 class UnderlyingContext:
     symbol: str
@@ -228,6 +272,11 @@ class UnderlyingContext:
     term_structure: list[TermPoint] = field(default_factory=list)
     ordinary_vol: float | None = None  # realized volatility with earnings days removed
     event_var: float | None = None  # variance of past report-day moves
+    # News, filled in only for a stock with a ranked contract (see analysis/events.py).
+    news: list[NewsItem] = field(default_factory=list)  # the latest items, newest first
+    recent_events: dict[str, int] = field(default_factory=dict)  # event type to how many recent items
+    event_studies: dict[str, EventStudy] = field(default_factory=dict)  # by event type
+    news_note: str | None = None  # set when a source could not answer
 
 
 @dataclass

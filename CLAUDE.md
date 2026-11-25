@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It has no order endpoints and must stay that way: it shows rules and numbers, and the person decides.
+A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It also types each stock's recent headlines and SEC filings by event and shows what followed earlier events of the same type. It has no order endpoints and must stay that way: it shows rules and numbers, and the person decides.
 
 ## Commands
 
@@ -28,9 +28,9 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 One scan flows in a straight line:
 
-1. **Providers** (`app/providers/`) fetch data. `MarketData` is the protocol; `AlpacaData` is the real one and `DemoMarket` the synthetic one. `EarningsService` combines earnings sources (SEC EDGAR, Alpha Vantage), caches them on disk, and estimates a missing date.
+1. **Providers** (`app/providers/`) fetch data. `MarketData` is the protocol; `AlpacaData` is the real one and `DemoMarket` the synthetic one. `EarningsService` combines earnings sources (SEC EDGAR, Alpha Vantage), caches them on disk, and estimates a missing date. `NewsService` (`providers/news.py`) combines headlines (`AlpacaData.headlines`) with 8-K filings (`EdgarEarnings.filings`) and keeps both on disk.
 2. **`Scanner`** (`app/scanner.py`) picks symbols (given ones, or discovery from the watchlist, screeners and `data/universe.txt`), then analyzes each on a small thread pool.
-3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols. `exits.build` then draws an exit plan for each ranked contract.
+3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols. `exits.build` then draws an exit plan for each ranked contract, and `Scanner._add_news` loads news and runs `events.context` for each stock that has one.
 4. **Surfaces** read the resulting `ScanResult`: `app/server.py` (FastAPI plus `public/index.html`), `app/__main__.py` (command line), `app/ai.py` (optional Claude write-up).
 
 Things that are not obvious from any one file:
@@ -43,6 +43,8 @@ Things that are not obvious from any one file:
 - **Shared data types live in `app/models.py`**, including the exit-plan dataclasses, so they can be imported anywhere without a cycle. `exits.py` holds only the logic. Exit plans are kept in `ScanResult.exit_plans`, keyed by contract symbol, and not on `ContractAnalysis`.
 - **Presets are data.** `scanner.PRESETS` maps a name to `ScanRequest` fields. The API serves it, the dashboard builds its buttons from it, and the command line reads it, so a preset is defined once.
 - **The dashboard builds DOM with the `el()` helper.** Never use `innerHTML` with scan data.
+- **News is typed late, like the lens.** A source returns raw `NewsItem`s. `events.classify` sets the event type afterwards, from two tables in `analysis/events.py`: `HEADLINE_RULES` (keywords, first match wins, so the order is part of the rule) and `FILING_ITEMS` (8-K item codes, most telling first). Labels, the flagged types and the cautions are served by `/api/status`, so the dashboard holds no copy of them.
+- **News lives on `UnderlyingContext`** (`news`, `recent_events`, `event_studies`, `news_note`), filled in only for a stock with a ranked contract. `Scanner(news=None)` leaves it out.
 
 ## Invariants
 
@@ -68,6 +70,20 @@ These came out of the first run against live data (2026-11-24). Each has a test 
 - **Volume is the latest session's.** A snapshot's daily bar is from the last day the contract traded, which is often not today. Volume from an earlier day's bar is reported as 0.
 - **A stock with nothing to price costs nothing more.** `Scanner._analyze` returns as soon as no quote in the chain can be priced, before the open-interest and earnings lookups. The day's movers include warrants and tiny companies with no options, and an earnings lookup for one can spend an Alpha Vantage request. Such a stock is named in the "no two-sided option quotes" note and in no note about ratings.
 
+These belong to the news layer (phase 2, started 2026-11-24). Each has a test in `tests/test_news.py` or `tests/test_scanner.py`.
+
+- **News is beside the score and the rating, never in them.** An event type is a keyword match, not a judgment: there is no sentiment, and nothing here may feed `scoring.score` or `risk.assess`.
+- **News costs nothing for a stock nobody will open, and never sinks a scan.** It is fetched after `scoring.rank`, only for the underlyings of ranked contracts. `_add_news` catches everything per stock, and failures become one warning naming the stocks. It runs before `market.notes` is drained, because loading headlines can add a note.
+- **An event sits on the first session whose close reflects it.** News at or after 4 p.m. New York time, or on a day with no session, belongs to the next one. This is `earnings.window`, shared with earnings reactions, so the two can never disagree. Several items of one type on one session are one event, and an event whose session has not closed yet is not counted.
+- **Earnings days are left out of a study on both sides**: out of the events (the move belongs to the report) and out of the usual day they are compared with. The `earnings` type itself gets no study, since the earnings section covers it.
+- **The usual day is every session in the stretch, not the days without the event.** For a company in the news most days the complement is a handful of odd days (seen live: NVDA had "agreement" news on 114 of 145 sessions, and the other 31 averaged 3.4% against 2.3% overall). The stretch runs from the first event, over at least `events.BASELINE_SESSIONS`.
+- **Below `events.MIN_EVENTS` a study says "too few" instead of showing averages.** Every surface checks this.
+- **The company being bought is told from the buyer by name.** The feed tags the buyer, its bankers and the target with the same headline. `events.aliases` gives the ticker and the first word of the SEC's company name, and `"to acquire <name>"` then types the headline `takeover` for that company only. A ticker alias matches in capitals only (COST is not "cost"), and a one- or two-letter ticker is not used.
+- **"No filings" and "cannot classify" are different**, as with earnings. A company that files 6-K raises `Unsupported` in `EdgarEarnings.filings`; `NewsService` turns that into a note that is not a failure, and remembers it like any other answer.
+- **The headline record on disk only grows.** The feed reaches back some months, so `NewsService` merges by the feed's id and asks only for headlines since the newest one on file. A copy on disk that does not parse is fetched again, never read as "no news".
+- **A link from the feed is a third party's.** Only an `http` or `https` address is kept (`alpaca._headline`), the page checks again before making it clickable, and it opens with `rel="noopener noreferrer"`.
+- **The AI brief is not given the news**, and its prompt says so. Change the payload and the prompt together or not at all.
+
 ## What live data looks like
 
 Measured on 2026-11-24 after the close, with paper keys on the free plan. Use these when judging whether a result is a bug.
@@ -81,7 +97,18 @@ Measured on 2026-11-24 after the close, with paper keys on the free plan. Use th
 - **The stock price is only as fresh as the last IEX trade.** A stock that rarely trades there can be weeks out of date (a warrant on the movers list last traded five weeks earlier). An IEX daily close differs a little from the official one, and `change_pct` is not adjusted for a dividend or a split.
 - **Alpha Vantage's calendar is short and slow.** It listed 669 companies for three months and had no date yet for the large companies' January reports, so most upcoming dates are still estimates. One history request in ten hung for the full 30-second timeout. A first discovery scan took 48 seconds, 38 of them waiting on Alpha Vantage; with earnings history cached it takes about 3.
 - **Rate limits were never close.** Each Alpaca host allows 200 requests a minute. A discovery scan made 68 requests in all.
-- **A buyout breaks the rating.** Once a cash takeover is agreed the stock sits at the deal price and its options price almost no movement (INSM: 6% implied against a volatile history). Every option then looks cheap next to history and the rating says "favorable". The scan does not detect this.
+- **A buyout breaks the rating.** Once a cash takeover is agreed the stock sits at the deal price and its options price almost no movement (INSM: 6% implied against a volatile history). Every option then looks cheap next to history and the rating says "favorable". The rating itself still does not detect this. The news layer flags it when a headline names the stock as the company being bought ("Sanofi to Acquire Insmed" put a takeover chip and a caution on INSM), which is no help for a deal the feed words another way.
+
+News, measured the same evening:
+
+- **Alpaca's news endpoint is on the free plan** (`/v1beta1/news`, 50 headlines a page). Every headline came from one source, `fiscal.ai`, with a one-sentence summary, a link to a third-party site and no body text.
+- **It reaches back about seven months.** The oldest headline for every stock asked was from 2026-04-29, whatever start date was sent. Whether that window rolls forward is unknown, which is one reason the record is kept on disk.
+- **Volume varies a hundredfold.** Over those seven months: IREN 16, GME 68, INSM 80, F 182, AAPL 466, JPM 652, NVDA 681. SPY and BRK.B had none, under any spelling of the ticker.
+- **The tag is not the subject.** A headline tagged with a stock is often about another company. A bank is tagged on its analysts' notes about other stocks, the loans it arranges and the holdings its funds disclose (most of JPM's). A ticker can collide with another company's name ("Costain Group PLC" under COST, "Oracle Commodity Holding" under ORCL). Law firms' "investigates" notices follow any deal or drop.
+- **The keyword rules typed 72% of 4,791 headlines** from 18 stocks. The largest types were partnership or contract (20%), product (14%), analyst (12%) and legal (7%); 28% fit no rule. No headline repeated for a stock on the same day, and two stories can share a time stamp to the second.
+- **The SEC's filing index holds about the last thousand filings.** That was ten years of 8-Ks for AAPL (104) and INSM (124), but one year for JPM (26 among 26,623 rows, nearly all prospectus supplements). TSM had none: it files 6-K.
+- **Cost.** A first discovery scan made 54 news requests and 10 SEC requests for 13 stocks and took 3.8 seconds in all. For the next 15 minutes the same scan made none. Rate limits (200 a minute at Alpaca) were not approached.
+- **Both known traps showed up as flagged types that day**: INSM's buyout as `takeover`, and COST's special dividend as `split`, beside the note that 64 of its contracts were quoted on an earlier day.
 
 ## Working agreement
 
@@ -97,8 +124,12 @@ The first live run was on 2026-11-24, after the 4 p.m. close, with paper keys on
 
 The AI brief was called once, through `ai.write_brief` with the app's own settings (`claude-opus-5-5`, effort high, the fallback beta). It answered in 57 seconds with a parsed brief of four picks, all contracts from the scan, and it carried the feed and estimated-date caveats. A 20-contract discovery scan sent 26,119 tokens and got 5,492 back: 21 cents. With the 16,000-token cap on the answer, the most one brief can cost is about 43 cents.
 
+The news layer was run live the same evening: the news endpoint with paging, 8-K filings and company names from SEC EDGAR, a foreign filer (TSM) and an ETF (SPY), the command line and the live dashboard.
+
 Not yet verified:
 
+- **News during market hours.** A headline at 10 a.m. is measured from the previous close to that day's close, so the move includes whatever happened before it. How soon a headline appears in the feed after the event is unknown.
+- **A cold scan of twenty heavily covered stocks.** Each can need up to 40 pages of headlines the first time (`alpaca.MAX_NEWS_PAGES`), which together could pass 200 requests a minute. `AlpacaData._get` waits and retries, and a stock that still fails gets a note and is tried again next scan. Not seen live.
 - **Anything during market hours.** How many quotes the exercise-value check drops while the stock is moving, how old the indicative quotes are during the session, and how soon after the open every contract has a quote from that day (until it does, the earlier-day rule leaves it out). Each stock that loses contracts that way adds its own note; if a scan soon after the open shows many, fold them into one as was done for stocks with no quotes.
 - **Before the open.** Whether the feed sends quotes ahead of 9:30. `alpaca._session_day` ignores them when choosing the day, on the assumption that it can.
 - **The morning of a split or special dividend, before the open.** The strikes have changed overnight but the newest quotes are still the day before's, so the contracts that stopped existing are not yet older than anything and are not caught. On 2026-11-24 they were exactly the contracts missing from the active contract list (64 of 64 for COST, 14 of 14 for TQQQ), which `open_interest` already fetches, so that list is the likely remedy. Not done, because it is unknown when Alpaca updates the list and whether a contract listed during the day appears in it at once.
@@ -107,6 +138,15 @@ Not yet verified:
 - **Thinly traded stocks.** The age of the last IEX trade is not checked, so a stock that rarely trades on IEX may be priced from an old trade.
 - **Python 3.11 on live shapes.** Alpaca's nanosecond time stamps parse on 3.13; the captured-response tests have not yet run on 3.11 (CI will).
 - **Live keys and the paid OPRA feed.**
+
+## News layer: what is left (not started)
+
+Phase 2's first slice is in: typed headlines and filings, and a per-stock study of what followed. Ask before building any of these.
+
+- **Give the news to the AI brief.** `ai.scan_payload` leaves it out and the prompt says "you have no news". Headlines are third-party text going into a prompt, so the prompt must treat them as data, and checking the result takes a billed call.
+- **Pool similar events across stocks.** One stock rarely has more than a handful of events of a type. Pooling needs each move scaled by that stock's usual day, and news and price history for stocks outside the scan.
+- **Tell which company a headline is about.** Only the takeover case uses the company's name so far. Analyst notes need it most: a bank's notes on other stocks are tagged with the bank.
+- **Classify with a model instead of keywords.** It would fix much of the 28% that fit no rule, at a cost per headline and with rules nobody can read. Keyword rules were chosen because the scan's rules are meant to be visible.
 
 ## Next step (proposed, not approved)
 
@@ -121,4 +161,4 @@ If it is built:
 - Early assignment around an ex-dividend date matters for short options and needs a dividend data source. The pricing currently assumes no dividends.
 - With free delayed quotes, signals are end-of-day quality, not intraday.
 
-The README roadmap lists this with paper trading as item 3, after the news layer.
+The README roadmap lists this with paper trading as item 3, after the news layer. A positions page could reuse the news layer to say when a held stock has a flagged event.

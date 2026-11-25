@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from dataclasses import asdict
 
 from app import ai
 from app.config import ConfigError, load_settings
-from app.analysis import exits
-from app.models import ContractAnalysis, ExitPlan, ScanResult, UnderlyingContext
+from app.analysis import events, exits
+from app.models import ContractAnalysis, EventStudy, ExitPlan, ScanResult, UnderlyingContext
 from app.scanner import PRESETS, ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
@@ -28,6 +29,40 @@ def _earnings(ctx: UnderlyingContext, c: ContractAnalysis) -> str:
     text = "today" if ctx.days_to_earnings == 0 else f"in {ctx.days_to_earnings}d"
     text += "" if ctx.next_earnings.confirmed else " (est.)"
     return text + (", spans" if c.spans_earnings else "")
+
+
+def _study_line(study: EventStudy) -> str:
+    """What followed a stock's past events of one type, in a line."""
+    what = f'past {study.count} "{study.event}" event{"" if study.count == 1 else "s"}'
+    if study.count < events.MIN_EVENTS:
+        return f"{what}: too few to compare with its usual day"
+    text = f"{what}: {study.mean_abs:.1%} average move that day"
+    if study.ordinary_abs is not None:
+        text += f" ({study.ordinary_abs:.1%} on any day)"
+    text += f", {study.up} up {study.down} down"
+    if study.after_count >= events.MIN_EVENTS:
+        text += (
+            f"; {study.mean_abs_after:.1%} over the next {events.FOLLOW_SESSIONS} sessions "
+            f"({study.ordinary_abs_after:.1%} over any {events.FOLLOW_SESSIONS})"
+        )
+    return text
+
+
+def _news_lines(symbol: str, ctx: UnderlyingContext) -> list[str]:
+    """A stock's latest classified news, and what followed its past events of those types."""
+    telling = [item for item in ctx.news if item.event not in events.NOT_STUDIED][:3]
+    lines = []
+    for n, item in enumerate(telling):
+        when = item.when.astimezone(events.ET)
+        lines.append(f"  {symbol if n == 0 else '':<6}{when:%b %d}  {item.event:<13}  {item.title[:88]}")
+    for kind in dict.fromkeys(item.event for item in telling):
+        if kind in ctx.event_studies:
+            lines.append(f"        {_study_line(ctx.event_studies[kind])}")
+    for kind in ctx.recent_events:
+        if kind in events.CAUTIONS:
+            caution = f"{events.EVENT_TYPES[kind]}: {events.CAUTIONS[kind]}"
+            lines.append(textwrap.fill(caution, 110, initial_indent=" " * 8, subsequent_indent=" " * 8))
+    return lines
 
 
 def print_scan(result: ScanResult) -> None:
@@ -72,6 +107,12 @@ def print_scan(result: ScanResult) -> None:
     if lines:
         print("\nEarnings context")
         print("\n".join(lines))
+    news = [line for symbol in sorted(shown) for line in _news_lines(symbol, result.underlyings[symbol])]
+    if news:
+        print(f"\nNews and filings, last {events.RECENT_DAYS} days")
+        print("\n".join(news))
+        print("  Types come from keyword rules on the headline and from the item codes on an 8-K, so some are")
+        print("  wrong. What followed past events describes the stock's history; it is not a forecast.")
     if result.warnings:
         print("\nNotes")
         for warning in result.warnings:

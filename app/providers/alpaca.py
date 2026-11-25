@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app import occ
-from app.models import Bar, OptionQuote, StockQuote
+from app.models import Bar, NewsItem, OptionQuote, StockQuote
 
 DATA_URL = "https://data.alpaca.markets"
 PAPER_URL = "https://paper-api.alpaca.markets"
@@ -21,6 +21,8 @@ LIVE_URL = "https://api.alpaca.markets"
 ET = ZoneInfo("America/New_York")
 
 MAX_CHAIN_PAGES = 15  # 1,000 contracts a page
+NEWS_PAGE = 50  # the most headlines the news endpoint returns at once
+MAX_NEWS_PAGES = 40
 _RETRIES = 3
 # Today's daily bar is final a little after the 4 p.m. close.
 BAR_FINAL = clock(16, 20)
@@ -52,6 +54,7 @@ def _num(obj: Any, key: str) -> float | None:
 
 class AlpacaData:
     mode = "live"
+    name = "Alpaca"
 
     def __init__(
         self,
@@ -269,6 +272,27 @@ class AlpacaData:
         rows = (data.get("gainers") or []) + (data.get("losers") or [])
         return [row["symbol"] for row in rows if row.get("symbol")]
 
+    # -- News ---------------------------------------------------------------
+
+    def headlines(self, symbol: str, since: datetime) -> list[NewsItem]:
+        """Headlines the feed tags with `symbol`, from `since` on, newest first.
+
+        The tag is the feed's own. A headline can be about another company that
+        only mentions this one, and an exchange-traded fund or a second share
+        class (BRK.B) usually has none.
+        """
+        params = {
+            "symbols": symbol,
+            "start": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": NEWS_PAGE,
+            "sort": "desc",
+            "include_content": "false",
+        }
+        pages, truncated = self._paged(f"{DATA_URL}/v1beta1/news", params, MAX_NEWS_PAGES)
+        if truncated:
+            self.notes.append(f"{symbol}: only the newest {MAX_NEWS_PAGES * NEWS_PAGE:,} headlines were loaded.")
+        return [item for page in pages for row in page.get("news") or [] if (item := _headline(row))]
+
 
 def _session_day(times: Iterable[datetime]) -> date | None:
     """The day of the latest trading session a chain has quotes from.
@@ -296,6 +320,29 @@ def _bar_day(snap: dict | None) -> date | None:
         return date.fromisoformat(str(stamp.get("t"))[:10])
     except ValueError:
         return None
+
+
+def _headline(row: Any) -> NewsItem | None:
+    """One row of the news endpoint. A row with no headline or no usable time is skipped."""
+    if not isinstance(row, dict):
+        return None
+    title = " ".join(str(row.get("headline") or "").split())
+    try:
+        when = datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if not title or when.tzinfo is None:
+        return None
+    link = str(row.get("url") or "").strip()
+    return NewsItem(
+        when=when,
+        kind="headline",
+        title=title,
+        source=str(row.get("source") or "Alpaca"),
+        # The link comes from a third party and ends up on a page, so only a web address is kept.
+        url=link if link.lower().startswith(("https://", "http://")) else None,
+        ref=str(row.get("id") or ""),
+    )
 
 
 def _option_quote(underlying: str, root: str, contract: str, snap: dict) -> OptionQuote | None:
