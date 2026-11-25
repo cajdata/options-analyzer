@@ -25,7 +25,7 @@ ET = ZoneInfo("America/New_York")
 MARKET_CLOSE = clock(16, 0)
 
 RECENT_DAYS = 14  # how far back "recent" news reaches
-MAX_RECENT = 10  # items listed for one stock
+MAX_RECENT = 10  # items listed for one stock, before any flagged one a busy week pushed out
 FOLLOW_SESSIONS = 5  # how long after an event "what followed" looks
 MIN_EVENTS = 3  # below this, a study's averages are not worth comparing
 MAX_MOVES = 8  # past events listed in a study
@@ -621,10 +621,18 @@ def context(
     `items` are everything on record for the stock, classified or not, and
     `names` are what a headline may call the company. A study is built for
     each type seen in the last `RECENT_DAYS` days, from the whole record.
+
+    The list holds the newest `MAX_RECENT` items, plus the newest item of each
+    flagged type that a busy week pushed out of them. A chip that says
+    "takeover" is no use if the headline behind it is not there to read.
     """
     classified = sorted((classify(i, names) for i in items), key=lambda i: i.when, reverse=True)
     cutoff = today - timedelta(days=RECENT_DAYS)
     recent = [i for i in classified if _felt(i.when)[0] >= cutoff]
     counts = Counter(i.event for i in recent)
     order = [kind for kind in EVENT_TYPES if kind in counts]
-    return recent[:MAX_RECENT], {kind: counts[kind] for kind in order}, study(classified, bars, earnings_days, order)
+    shown = recent[:MAX_RECENT]
+    listed = {i.event for i in shown}
+    shown += [next(i for i in recent if i.event == kind) for kind in order if kind in FLAGGED and kind not in listed]
+    shown.sort(key=lambda i: i.when, reverse=True)
+    return shown, {kind: counts[kind] for kind in order}, study(classified, bars, earnings_days, order)

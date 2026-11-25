@@ -337,6 +337,27 @@ def test_context_lists_recent_news_and_studies_only_the_types_in_it():
     assert studies["guidance"].since == days[30]
 
 
+def test_a_flagged_item_stays_on_the_list_when_a_busy_week_pushes_it_out():
+    bars = bars_from([0.01] * 120, date(2026, 6, 1))
+    last = bars[-1].day
+    today = last + timedelta(days=1)
+
+    def raw(day, hour, title, n):
+        return NewsItem(datetime.combine(day, clock(hour, 0), tzinfo=ET), "headline", title, "test", ref=str(n))
+
+    launches = [raw(last, 9 + n % 6, f"Acme Launches Product {n}", n) for n in range(12)]
+    older = [
+        raw(last - timedelta(days=9), 10, "Acme Prices $300 Million Offering of Convertible Notes", 100),
+        raw(last - timedelta(days=10), 10, "Acme Raises Full-Year Revenue Guidance", 101),
+        raw(last - timedelta(days=11), 10, "Acme Raises Full-Year Revenue Guidance", 102),  # only the newest of a type is kept
+        raw(last - timedelta(days=12), 10, "Acme Appoints New Chief Financial Officer", 103),  # not a flagged type
+    ]
+    shown, counts, _ = events.context(launches + older, bars, set(), today)
+    assert len(shown) == events.MAX_RECENT + 2 and shown == sorted(shown, key=lambda i: i.when, reverse=True)
+    assert [i.ref for i in shown[-2:]] == ["100", "101"]
+    assert counts == {"guidance": 2, "financing": 1, "management": 1, "product": 12}
+
+
 # -- Alpaca headlines -------------------------------------------------------------
 
 
