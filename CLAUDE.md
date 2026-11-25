@@ -21,6 +21,7 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
+- `main` is protected on GitHub (since 2026-11-25): a merge needs both checks, "Python 3.11" and "Python 3.13", to have passed, for the owner too, and a push straight to `main` of a commit that has not passed them is refused. The rule names the checks by the workflow's job names. If the matrix or the job name in `tests.yml` changes, change the rule's required checks along with it, or every pull request will wait for a check that never reports. A branch does not have to be level with `main` to merge.
 - `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code. A third entry, `strike-check-site` on port 8768, serves the landing page in `docs/` with the system `python`.
 - With `ANTHROPIC_API_KEY` set, the live dashboard shows a "Write brief" button and `scan --brief` works. Each use is a billed call: ask before making one.
 
@@ -120,6 +121,8 @@ News, measured the same evening:
 ## Working agreement
 
 - Branch off `main` for each change. Commit, push, open a pull request, merge, and delete the branch only when asked for that step. Merge with a merge commit.
+- GitHub deletes a pull request's branch on its side when it merges (a repository setting, on since 2026-11-25). The cleanup step is then the local half: switch to `main`, pull, delete the local branch, prune.
+- Auto-merge is allowed on the repository, and with the rule on `main` it has the two required checks to wait for. It has not been used on a pull request yet. Turn it on only when asked, and with the merge-commit method: the default is squash.
 - Do not place trades, and do not say what to trade. Explanations of the numbers are welcome.
 - There is no screenshot or OCR path, by decision. Do not add one.
 - Keep dependencies minimal, and the dashboard as one vanilla-JS file.
