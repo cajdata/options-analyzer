@@ -56,4 +56,9 @@ class EventPool:
 
 
 def _counts(row: Any) -> bool:
-    return isinstance(row, list) and len(row) == len(events.TALLY) and all(isinstance(n, int) and n >= 0 for n in row)
+    """Whether `row` reads as one type's counts, in `events.TALLY` order, and they agree with each other."""
+    if not isinstance(row, list) or len(row) != len(events.TALLY) or not all(type(n) is int and n >= 0 for n in row):
+        return False
+    days, big, up, down, sessions, big_sessions = row
+    # Event days are among the sessions they are compared with, so a row with events has sessions.
+    return big <= days and up + down <= days and big_sessions <= sessions and days <= sessions

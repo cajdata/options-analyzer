@@ -66,13 +66,18 @@ class DiskCache:
         return sorted(path.stem for path in self.root.glob(glob.escape(prefix) + "*.json"))
 
     def entry(self, key: str) -> tuple[Any, timedelta] | None:
-        """Return (value, age) for `key`, or None if it was never stored."""
+        """Return (value, age) for `key`, or None if it was never stored or does not read as an entry.
+
+        A file of the wrong shape, one with no value, and one stamped with a time
+        that has no zone are all "never stored". Every reader treats None as a
+        miss, so one spoiled file costs a fresh lookup and nothing else.
+        """
         try:
             raw = json.loads(self._path(key).read_text(encoding="utf-8"))
-            stored = datetime.fromisoformat(raw["stored_at"])
-        except (OSError, ValueError, KeyError):
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(raw["stored_at"])
+            return raw["value"], age
+        except (OSError, ValueError, KeyError, TypeError):
             return None
-        return raw["value"], datetime.now(timezone.utc) - stored
 
     def get(self, key: str, max_age: timedelta) -> Any | None:
         found = self.entry(key)

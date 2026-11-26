@@ -5,6 +5,7 @@ Endpoints and field names follow https://docs.alpaca.markets/reference.
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, time as clock, timedelta, timezone
 from typing import Any, Callable, Iterable
@@ -96,13 +97,15 @@ class AlpacaData:
                     wait = float(resp.headers.get("Retry-After", ""))
                 except ValueError:
                     wait = 2.0 * (attempt + 1)
-                self._sleep(min(wait, 30.0))
+                # A header can say anything: a negative wait or "nan" would make the sleep itself fail.
+                self._sleep(min(wait, 30.0) if 0 <= wait < math.inf else 2.0 * (attempt + 1))
                 continue
             if resp.status_code >= 400:
                 try:
-                    message = resp.json().get("message", resp.text)
+                    body = resp.json()
                 except ValueError:
-                    message = resp.text
+                    body = None
+                message = body.get("message", resp.text) if isinstance(body, dict) else resp.text
                 raise AlpacaError(resp.status_code, str(message)[:200])
             return resp.json()
         raise AssertionError("unreachable")
@@ -358,9 +361,11 @@ def _option_quote(underlying: str, root: str, contract: str, snap: dict) -> Opti
     volume = _num(snap.get("dailyBar"), "v")
     stamp = quote.get("t")
     try:
-        quote_time = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else None
+        quote_time = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")) if stamp else None
     except ValueError:
         quote_time = None
+    if quote_time is not None and quote_time.tzinfo is None:
+        quote_time = None  # with no zone it cannot be set beside the other quotes' times
     return OptionQuote(
         symbol=contract,
         underlying=underlying,

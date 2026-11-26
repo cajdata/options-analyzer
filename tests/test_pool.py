@@ -350,3 +350,121 @@ def test_the_brief_is_not_given_the_pooled_studies(demo_day_is_pinned):
     assert result.underlyings["ACME"].pooled_studies
     payload = json.dumps(ai.scan_payload(result))
     assert "pooled" not in payload and "lightly covered" not in payload and "big_sessions" not in payload
+
+
+# -- What may join the pool (found by an outside review) ------------------------------------
+
+
+def test_what_may_join_the_pool_is_one_rule():
+    bars = bars_from([0.01] * 80)
+    day = bars[40].day
+    heads, files = [news(day, "product")], [news(day, "management", item_kind="filing")]
+    assert events.unpoolable(heads + files, bars, {day}) is None
+    assert events.unpoolable(files, bars, {day}) == "no headlines"
+    assert events.unpoolable(heads, bars[:59], {day}) == "too little price history"
+    assert events.unpoolable(heads, bars, set()) == "no report days"
+    assert events.BASELINE_SESSIONS == 60
+
+
+def test_a_failed_lookup_does_not_take_the_place_of_a_stocks_full_tally():
+    class NoFeed(DemoMarket):
+        def headlines(self, symbol, since):
+            raise httpx.ConnectError("down")
+
+    market = NoFeed(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    feed = NewsService(NullCache(), headline_source=market, filing_source=market, names=NAMES.get)
+    pool = EventPool(MemoryCache())
+    full = {"financing": [9, 1, 4, 5, 100, 11]}
+    pool.add("ACME", "heavy", full)
+    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed, pool=pool)
+
+    result = scanner.scan(ScanRequest(symbols=["ACME"]))
+    assert any("News could not be loaded for ACME" in w for w in result.warnings)
+    # Only its filings came through. Pooled from those it would have become a lightly covered stock.
+    assert result.underlyings["ACME"].coverage == "light"
+    assert pool.totals()["heavy"] == {"stocks": 1, "kinds": {"financing": {"counts": full["financing"], "stocks": 1}}}
+    assert pool.totals()["light"]["stocks"] == 0
+
+    # Widening treats it the same way, and says why.
+    found = scanner.widen_pool(["ACME", "BOLT"])
+    assert found["added"] == {"light": 0, "heavy": 0} and found["passed_over"] == {"a news lookup that failed": 2}
+    assert pool.totals()["heavy"]["stocks"] == 1
+
+
+def test_a_stock_with_filings_and_no_headlines_is_pooled_by_neither_a_scan_nor_widening():
+    # A second share class has 8-K filings and report days, and the feed carries nothing for it.
+    class NoHeadlines(DemoMarket):
+        def headlines(self, symbol, since):
+            return []
+
+    market = NoHeadlines(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    feed = NewsService(NullCache(), headline_source=market, filing_source=market, names=NAMES.get)
+    pool = EventPool(MemoryCache())
+    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed, pool=pool)
+    result = scanner.scan(ScanRequest(symbols=["ACME"]))
+    assert result.underlyings["ACME"].news  # its filings are shown as ever
+    assert pool.totals()["light"]["stocks"] == 0
+    assert scanner.widen_pool(["ACME"])["passed_over"] == {"no headlines": 1}
+
+
+def test_reports_that_fall_outside_the_price_history_do_not_qualify_a_stock():
+    class OldReports(DemoMarket):
+        def history(self, symbol):
+            return [EarningsEvent(day=date(2019, 2, 5), timing="post", source="demo")]
+
+    market = OldReports(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    feed = NewsService(NullCache(), headline_source=market, filing_source=market, names=NAMES.get)
+    pool = EventPool(MemoryCache())
+    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed, pool=pool)
+    # It has reports on file, but none within the three years of prices, so no day can be left out.
+    assert scanner.widen_pool(["ACME"])["passed_over"] == {"no report days": 1}
+    assert pool.totals()["light"]["stocks"] == 0
+
+
+def test_the_scan_says_when_most_of_a_stocks_headlines_never_name_it(capsys):
+    from app.__main__ import print_scan
+
+    class Feed:
+        name = "test"
+
+        def headlines(self, symbol, since):
+            def at(n, title, summary):
+                when = datetime.combine(TODAY - timedelta(days=1 + n % 9), clock(10, 0), tzinfo=ET)
+                return NewsItem(when, "headline", title, "test", ref=str(n), summary=summary)
+
+            # Twelve headlines under a name that is not the company's, and three under its own.
+            other = [at(n, f"Brandco Launches Product {n}", "Brandco said it launched a product.") for n in range(12)]
+            own = [at(100 + n, f"Acme Opens Office {n}", "Acme opened an office.") for n in range(3)]
+            return other + own
+
+    class NoFilings:
+        name = "test"
+
+        def filings(self, symbol):
+            return []
+
+    market = DemoMarket(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    feed = NewsService(NullCache(), headline_source=Feed(), filing_source=NoFilings(), names=NAMES.get)
+    result = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed).scan(ScanRequest(symbols=["ACME"]))
+    acme = result.underlyings["ACME"]
+    assert acme.news_note == (
+        "12 of the 15 headlines the feed tags with ACME never name Acme, and are set aside. "
+        "If it goes by another name, add that to data/aliases.txt."
+    )
+    assert acme.recent_events["another"] == 12 and len(acme.news) == 3
+    # It is a note about one stock, not a failed lookup, so it is not among the scan's warnings.
+    assert not any("never name" in w for w in result.warnings)
+    # The command line says it too, as it now does any note about a stock's news.
+    print_scan(result)
+    out = " ".join(capsys.readouterr().out.split())
+    assert "12 of the 15 headlines the feed tags with ACME never name Acme" in out
+
+    # A listed alias settles it: the same headlines are the company's own, and nothing is said.
+    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed)
+    scanner._also = {"ACME": ("Brandco",)}
+    named = scanner.scan(ScanRequest(symbols=["ACME"])).underlyings["ACME"]
+    assert named.news_note is None and "another" not in named.recent_events and len(named.news) == events.MAX_RECENT

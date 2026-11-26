@@ -1139,7 +1139,7 @@ def test_another_companys_news_is_set_aside_on_every_surface(client, capsys):
     # and a company whose name only looks like this one's.
     assert [i["title"] for i in acme["news_elsewhere"]] == [
         "Acme Increases Stake in Tidewell Systems to 6.4%",
-        "Acmeain Group PLC Announces Total Voting Rights",
+        "Acmain Group PLC Announces Total Voting Rights",
     ]
     assert all(i["event"] == "another" for i in acme["news_elsewhere"])
     # Counted, so the page can say how many there are, and in no list and no study.
@@ -1154,13 +1154,13 @@ def test_another_companys_news_is_set_aside_on_every_surface(client, capsys):
 
     assert main(["scan", "ACME", "--demo", "--top", "4"]) == 0
     out = capsys.readouterr().out
-    assert "News and filings" in out and "Tidewell Systems to 6.4%" not in out and "Acmeain" not in out
+    assert "News and filings" in out and "Tidewell Systems to 6.4%" not in out and "Acmain" not in out
 
     result = news_scanner().scan(ScanRequest(symbols=["ACME"]))
     assert len(result.underlyings["ACME"].news_elsewhere) == 2
     payload = ai.scan_payload(result)
     assert "Another company's news" not in payload["underlyings"]["ACME"]["recent_news"]["count_by_event_type"]
-    assert "Acmeain" not in json.dumps(payload) and "Tidewell Systems to 6.4%" not in json.dumps(payload)
+    assert "Acmain" not in json.dumps(payload) and "Tidewell Systems to 6.4%" not in json.dumps(payload)
 
 
 def test_cli_exit_line_shows_the_time_stop_result_and_speaks_for_the_seller(capsys):

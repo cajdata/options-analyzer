@@ -367,6 +367,164 @@ def test_with_no_name_to_go_by_the_keyword_table_decides_as_before():
     assert events.headline_type("JPMorgan Chase Increases Stake in Future PLC to 6.37%") == "insider"
 
 
+COMPANIES.update(
+    {
+        "SHOP": "SHOPIFY INC.",
+        "UBER": "Uber Technologies, Inc",
+        "SNDK": "Sandisk Corp",
+        "GS": "GOLDMAN SACHS GROUP INC",
+        "DIS": "Walt Disney Co",
+        "AMD": "ADVANCED MICRO DEVICES INC",
+        "AVGO": "Broadcom Inc.",
+        "CRWV": "CoreWeave, Inc.",
+        "INSM": "INSMED Inc",
+        "C": "CITIGROUP INC",
+        "SPCX": "SPACE EXPLORATION TECHNOLOGIES CORP",
+        "PHAR": "Pharming Group N.V.",
+        "SLSN": "SOLESENCE, INC.",
+        "GEV": "GE Vernova Inc.",
+        "ORLY": "O REILLY AUTOMOTIVE INC",
+        "GWW": "W.W. GRAINGER, INC.",
+        "BBD": "BANK BRADESCO",
+        "ON": "ON SEMICONDUCTOR CORP",
+    }
+)
+NOBODY = "A summary that names nobody at all."
+
+
+@pytest.mark.parametrize(
+    "symbol, text, kind",
+    [
+        # Seen live in the cache: each of these three raised the buyout caution.
+        ("SHOP", "Shopify Acquires SHOP.COM Domain Name", "acquisition"),
+        ("UBER", "Uber Explores Sale of Delivery Hero Assets to Facilitate Takeover Approval", "acquisition"),
+        ("SNDK", "SanDisk Advises Shareholders to Reject Unsolicited Mini-Tender Offer from Tutanota LLC", "disclosure"),
+        # A full stop that ends a sentence still ends the name, and a sale of the company is still one.
+        ("SHOP", "Tidewell to Acquire SHOP. Shares Jump", "takeover"),
+        ("ACME", "Acme Explores Sale", "takeover"),
+        ("ACME", "Acme Explores Sale of the Company After Approach from Tidewell", "takeover"),
+        ("ACME", "Acme Explores Sale of Its Chip Unit", "acquisition"),
+        # A list of names before the thing bought is not a list of companies bought.
+        ("AAPL", "Longview Partners Acquires Apple, Microsoft, and NVIDIA Shares", "insider"),
+        ("NVDA", "Tidewell Raises Bid for Nvidia and AMD Chips", "other"),
+        ("INSM", "Sanofi to Acquire Insmed, Sending Shares Up 20%", "takeover"),
+        ("INSM", "Sanofi to Acquire Insmed and Curevo in $45 Billion Deal", "takeover"),
+    ],
+)
+def test_a_takeover_by_name_is_not_fooled_by_a_domain_a_list_or_a_sale_of_assets(symbol, text, kind):
+    assert typed(symbol, text, NOBODY) == kind
+
+
+@pytest.mark.parametrize(
+    "symbol, text, kind",
+    [
+        # Seen live: the results rule took these, and results are neither pointed out nor studied.
+        ("AMD", "AMD Provides Fourth Quarter 2026 Revenue Guidance", "guidance"),
+        ("GME", "GameStop Announces Preliminary Second-Quarter 2026 Financial Results", "guidance"),
+        ("CRWV", "CoreWeave Reports Weaker Second-Quarter Revenue Forecast", "guidance"),
+        ("AVGO", "Broadcom Shares Decline as AI Revenue Outlook Fails to Exceed High Expectations", "guidance"),
+        # Results are still results, with or without guidance alongside.
+        ("ACME", "Acme Reports Third Quarter 2026 Financial Results", "earnings"),
+        ("PFE", "Pfizer Reports Q2 Revenue Growth and Raises Full-Year Outlook", "earnings"),
+        ("ACME", "Acme Announces Third Quarter 2026 Revenues Above Market Expectations", "earnings"),
+        ("ACME", "Acme Reports Loss on Plant Closure but Lifts 2026 Financial Forecast", "earnings"),
+        # "Target Price" is a price target, so the bank wrote the note.
+        ("GS", "Goldman Sachs Raises Microsoft Target Price to $640", "another"),
+        # Buying out of someone else's bankruptcy is not being in it.
+        ("DIS", "Disney to Acquire Assets from Character.ai Following Bankruptcy Filing", "acquisition"),
+        ("ACME", "Acme Files for Chapter 11 Bankruptcy Protection", "distress"),
+        # Offerings named by their size or their kind.
+        ("ACME", "Acme Announces Securities Purchase Agreement for $5.4 Million Offering", "financing"),
+        ("ACME", "Acme Announces Pricing of $2.5 Million Underwritten Offering", "financing"),
+        ("ACME", "Acme Files for Potential $100 Million Securities Offering", "financing"),
+        # A bank managing someone else's offering is doing business, and a credit default swap is no default.
+        ("C", "Citi Acts as Underwriter for Amphenol's $1.1 Billion Senior Notes Offering", "agreement"),
+        ("SPCX", "SpaceX 5-Year Credit Default Swaps Widen", "other"),
+        # Someone else after the name, with or without an apostrophe.
+        ("AAPL", "Apple's Supplier Foxconn Cuts Outlook", "other"),
+        ("AAPL", "Apple's Top Chip Supplier Cuts Full-Year Revenue Outlook", "other"),
+        ("AAPL", "Apple's Services Unit Raises Full-Year Revenue Outlook", "guidance"),
+    ],
+)
+def test_rules_the_second_review_found_too_loose_or_too_tight(symbol, text, kind):
+    assert typed(symbol, text, NOBODY) == kind
+
+
+def test_a_notice_filed_with_the_results_keeps_its_own_type():
+    def typed_as(items):
+        found = events.classify(filing(items))
+        return found.event, found.title
+
+    # Seen live in ten filings: a delisting notice, a restatement or a new auditor, filed with the quarter's results.
+    assert typed_as(["2.02", "3.01", "9.01"]) == ("distress", "8-K: Delisting notice, or a listing rule not met; Results of operations")
+    assert typed_as(["2.02", "4.02"])[0] == "distress" and typed_as(["2.02", "4.01", "5.02"])[0] == "distress"
+    assert typed_as(["2.02", "5.01"])[0] == "takeover"
+    # Results still come ahead of everything routine.
+    assert typed_as(["2.02", "7.01", "9.01"])[0] == "earnings" and typed_as(["5.02", "2.02", "1.01"])[0] == "earnings"
+    codes = list(events.FILING_ITEMS)
+    flagged = [code for code in codes if events.FILING_ITEMS[code][0] in ("distress", "takeover")]
+    assert all(codes.index(code) < codes.index("2.02") for code in flagged) and len(flagged) == 6
+
+
+@pytest.mark.parametrize(
+    "symbol, text, named",
+    [
+        # Seen live: each of these companies had most of its own headlines set aside.
+        ("SPCX", "SpaceX to Launch Starship Flight 14", True),  # a word built on the first word of the name
+        ("C", "Citi Launches New Card for Small Businesses", True),  # the first four letters or more of it
+        ("SLSN", "Sol\u00e9sence, Inc. Reports Third Quarter 2026 Financial Results", True),  # an accent
+        ("BBD", "Bradesco Launches New Marketing Campaign", True),  # the telling word after a common one
+        ("GEV", "GE Vernova Wins Turbine Order", True),  # a two-letter first word is not the whole name
+        ("GEV", "Vernova Wins Turbine Order", True),
+        ("ORLY", "O'Reilly Automotive Opens 200th Store", True),
+        ("GWW", "W.W. Grainger Opens Distribution Centre", True),
+        ("GWW", "Grainger Opens Distribution Centre", True),
+        # Other companies whose ticker in London is the same, also seen live: still another company's news.
+        ("COST", "Costain Group PLC Announces Total Voting Rights", False),
+        ("PHAR", "Pharos Energy plc: Form 8.5 (EPT/RI) Disclosure", False),
+        ("C", "Citizens Financial Opens New Branch", False),
+        ("ON", "Tidewell Semiconductor Opens New Fab", False),  # a plain word names nobody
+    ],
+)
+def test_what_counts_as_naming_the_company(symbol, text, named):
+    assert (typed(symbol, text, NOBODY) != "another") is named
+
+
+def test_how_much_of_a_name_is_needed_when_it_opens_with_a_letter_or_two():
+    assert events._needed(["ge", "vernova"]) == 2 and events._needed(["w", "w", "grainger"]) == 3
+    assert events._needed(["o", "reilly", "automotive"]) == 2 and events._needed(["at&t"]) == 1
+    assert events._needed(["x"]) is None and events._needed(["a", "b"]) is None and events._needed(["bank", "of"]) is None
+    # Seen live: 279 of the 10,400 companies the SEC lists had no usable name for this reason.
+    for symbol in ("GEV", "ORLY", "GWW", "ON"):
+        assert events._named(events.aliases(symbol, COMPANIES[symbol])) is not None
+    # The by-name takeover rule gets the same names, and spells them strictly.
+    assert typed("GWW", "Tidewell to Acquire W.W. Grainger for $60 Billion") == "takeover"
+    assert typed("GEV", "Tidewell to Acquire GE Vernova in All-Stock Deal") == "takeover"
+    assert typed("GEV", "Tidewell to Acquire GE Appliances Unit") != "takeover"
+
+
+def test_a_company_also_goes_by_the_names_it_had_and_the_brands_listed_for_it():
+    names = events.aliases("SRTM", "Stratum Holdings Corp.", ("La Rosa Holdings Corp.", "Stratum Holdings Corp.", ""))
+    assert names == ("SRTM", "stratum holdings", "la rosa holdings")  # cleaned like the name, and none twice
+    old = "La Rosa Holdings Launches 'JAEME' AI Technology System"
+    assert events.headline_type(old, names, NOBODY) == "product"
+    assert events.headline_type(old, events.aliases("SRTM", "Stratum Holdings Corp."), NOBODY) == "another"
+
+    nubank = events.aliases("NU", "Nu Holdings Ltd.", ("Nubank",))
+    assert nubank == ("nu holdings", "nubank")
+    assert events.headline_type("Nubank Raises Full-Year Revenue Guidance", nubank, NOBODY) == "guidance"
+    assert events.headline_type("Tidewell to Acquire Nubank for $40 Billion", nubank, NOBODY) == "takeover"
+    assert events.aliases("C", "CITIGROUP INC", ("Sol\u00e9sence",)) == ("citigroup", "solesence")  # accents taken off
+
+    # A service with nowhere to look former names up has none, and a lookup that fails gives none.
+    def down(symbol):
+        raise httpx.ConnectError("down")
+
+    assert NewsService(NullCache()).former_names("ACME") == ()
+    assert NewsService(NullCache(), former_names=down).former_names("ACME") == ()
+    assert NewsService(NullCache(), former_names=lambda s: ["Old Acme Inc"]).former_names("ACME") == ("Old Acme Inc",)
+
+
 def test_every_rule_points_at_a_type_with_a_label():
     known = set(events.EVENT_TYPES)
     assert {kind for kind, _ in events.HEADLINE_RULES} <= known
@@ -629,7 +787,7 @@ def test_another_companys_news_takes_no_place_and_counts_towards_nothing():
 
     # A week of the company holding other companies' shares, newer than anything of its own.
     holdings = [raw(last, 9 + n % 6, f"Acme Updates Major Holdings in Company {n} PLC", n) for n in range(14)]
-    lookalike = raw(last, 15, "Acmeain Group PLC Announces Total Voting Rights", 50, "Acmeain Group PLC reported its voting rights.")
+    lookalike = raw(last, 15, "Acmain Group PLC Announces Total Voting Rights", 50, "Acmain Group PLC reported its voting rights.")
     own = [
         raw(last - timedelta(days=2), 10, "Acme Raises Full-Year Revenue Guidance", 100),
         raw(last - timedelta(days=3), 10, "Longview Partners Increases Stake in Acme to 6.8%", 101),
@@ -940,7 +1098,7 @@ def test_news_with_no_source_or_a_spoiled_cache_is_harmless(tmp_path):
     assert NewsService(NullCache()).items("ACME", TODAY) == ([], None, False)
 
     cache, feed = DiskCache(tmp_path), Feed([headline(1, NOON)])
-    cache.set("news_headlines_ACME", [{"title": "a row from some other version"}])
+    cache.set("news_headlines2_ACME", [{"title": "a row from some other version"}])
     cache.set("news_filings_ACME", ["not what is expected"])
     service = NewsService(cache, headline_source=feed, filing_source=Filings())
     assert service.items("ACME", TODAY) == ([headline(1, NOON)], None, False)  # fetched afresh, not an error
@@ -948,7 +1106,7 @@ def test_news_with_no_source_or_a_spoiled_cache_is_harmless(tmp_path):
     # A time with no zone cannot be set beside the times a source returns. Left on
     # disk it would fail every scan from then on, so it counts as spoiled too.
     row = {"when": "2026-11-20T10:00:00", "kind": "headline", "title": "no zone", "source": "test"}
-    cache.set("news_headlines_ACME", [row])
+    cache.set("news_headlines2_ACME", [row])
     cache.set("news_filings_ACME", {"items": [row | {"kind": "filing"}], "note": None})
     report = filing(["2.02"], ref="0002")
     service = NewsService(cache, headline_source=feed, filing_source=Filings([report]))
@@ -968,6 +1126,6 @@ def test_a_company_name_is_an_extra_that_may_be_missing():
 def test_headlines_older_than_the_price_history_are_let_go(tmp_path):
     ancient, recent = headline(1, NOON - timedelta(days=1300)), headline(2, NOON)
     service = NewsService(DiskCache(tmp_path), headline_source=Feed([recent]))
-    DiskCache(tmp_path).set("news_headlines_ACME", [{"when": ancient.when.isoformat(), "kind": "headline", "title": ancient.title, "ref": "1"}])
+    DiskCache(tmp_path).set("news_headlines2_ACME", [{"when": ancient.when.isoformat(), "kind": "headline", "title": ancient.title, "ref": "1"}])
     age(tmp_path, 20)
     assert [i.ref for i in service.items("ACME", TODAY)[0]] == ["2"]

@@ -23,8 +23,18 @@ def _env(*names: str) -> str | None:
     return None
 
 
+def tidy(symbols) -> list[str]:
+    """Symbols as the data provider spells them, each once: trimmed, in capitals, a share class with a dot.
+
+    Share classes are written both ways (BRK-B, BRK.B). Every way a symbol
+    comes in goes through here: a request, the watchlist, the universe file.
+    """
+    spelled = (str(s).strip().upper().replace("-", ".") for s in symbols)
+    return list(dict.fromkeys(s for s in spelled if s))
+
+
 def _symbols(text: str | None) -> list[str]:
-    return [s.strip().upper() for s in (text or "").replace(";", ",").split(",") if s.strip()]
+    return tidy((text or "").replace(";", ",").split(","))
 
 
 @dataclass(frozen=True)
@@ -43,6 +53,7 @@ class Settings:
     risk_free_rate: float = 0.04
     cache_dir: Path = ROOT / ".cache"
     universe_file: Path = ROOT / "data" / "universe.txt"
+    aliases_file: Path = ROOT / "data" / "aliases.txt"
 
     @property
     def has_alpaca(self) -> bool:
@@ -53,8 +64,21 @@ class Settings:
             lines = self.universe_file.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
-        symbols = (line.split("#", 1)[0].strip().upper() for line in lines)
-        return [s for s in symbols if s]
+        return tidy(line.split("#", 1)[0] for line in lines)
+
+    def aliases(self) -> dict[str, tuple[str, ...]]:
+        """Other names companies go by, from the aliases file: one "SYMBOL: name, name" to a line."""
+        try:
+            lines = self.aliases_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        out: dict[str, tuple[str, ...]] = {}
+        for line in lines:
+            symbol, colon, names = line.split("#", 1)[0].partition(":")
+            given = tuple(n.strip() for n in names.split(",") if n.strip())
+            if colon and given and tidy([symbol]):
+                out[tidy([symbol])[0]] = given
+        return out
 
 
 def _rate() -> float:

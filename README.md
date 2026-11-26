@@ -98,7 +98,10 @@ something material happens) over the last 14 days.
   company is the one being bought and not the bidder. A headline that never names the
   company, or in which it only wrote the analyst's note or holds the other company's
   shares, is set aside as another company's news. The dashboard keeps those in a folded
-  section, so the rule can be checked.
+  section, so the rule can be checked. A company is known by its registered name, the
+  names it had before, and any brand listed for it in `data/aliases.txt`. When most of a
+  stock's headlines never name it, the scan says so: either the feed is tagging another
+  company with the same ticker, or the company goes by a name that needs listing.
 - **What followed.** For each type seen lately, the app looks back at the same stock's
   earlier events of that type and measures the size of the move on the day the news was
   first felt, and over the five sessions after it. Each goes beside the stock's average

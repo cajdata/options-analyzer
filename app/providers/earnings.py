@@ -160,6 +160,8 @@ class EdgarEarnings:
     SUBMISSIONS_URL = "https://data.sec.gov/submissions/"
     ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/"
     MAX_OLDER_FILES = 4
+    FORMER_NAMES = 3  # how many of a company's earlier names are kept
+    FORMER_TTL = timedelta(days=120)
     MIN_INTERVAL = 0.12  # the SEC allows ten requests a second across all threads
     RETRIES = 2
     # Forms a foreign company files in place of the 10-K, 10-Q and 8-K.
@@ -188,7 +190,13 @@ class EdgarEarnings:
                 if wait > 0:
                     self._sleep(wait)
                 self._last_call = time.monotonic()
-            resp = self._client.get(url, headers=self._headers)
+            try:
+                resp = self._client.get(url, headers=self._headers)
+            except httpx.TransportError:  # timeouts and dropped connections
+                if attempt < self.RETRIES:
+                    self._sleep(2.0 * (attempt + 1))
+                    continue
+                raise
             busy = resp.status_code == 429 or resp.status_code >= 500
             if busy and attempt < self.RETRIES:
                 self._sleep(2.0 * (attempt + 1))
@@ -218,11 +226,27 @@ class EdgarEarnings:
         found = self._company(symbol)
         return found[1] or None if found else None
 
+    def former_names(self, symbol: str) -> list[str]:
+        """Names the company had before, newest first, as far as they are on file. It costs no request.
+
+        A renamed company goes on being called by its old name in headlines
+        ("La Rosa Holdings" for Stratum Holdings). The SEC gives former names
+        with a company's filings, so they are noted whenever those are read.
+        """
+        found = self._cache.get(f"edgar_former_{symbol}", self.FORMER_TTL)
+        return [str(n) for n in found] if isinstance(found, list) else []
+
+    def _note_names(self, symbol: str, data: Any) -> None:
+        former = data.get("formerNames") if isinstance(data, dict) else None
+        names = [str(row.get("name") or "").strip() for row in former or [] if isinstance(row, dict)]
+        self._cache.set(f"edgar_former_{symbol}", [n for n in names if n][: self.FORMER_NAMES])
+
     def history(self, symbol: str, want: int = 12) -> list[EarningsEvent]:
         cik = self._cik(symbol)
         if cik is None:
             return []
         data = self._get(f"{self.SUBMISSIONS_URL}CIK{cik:010d}.json")
+        self._note_names(symbol, data)
         filings = data.get("filings") or {}
         recent = filings.get("recent") or {}
         events = self._events(recent)
@@ -264,6 +288,7 @@ class EdgarEarnings:
         if cik is None:
             return []
         data = self._get(f"{self.SUBMISSIONS_URL}CIK{cik:010d}.json")
+        self._note_names(symbol, data)
         recent = (data.get("filings") or {}).get("recent") or {}
         forms = recent.get("form") or []
 
@@ -302,11 +327,13 @@ def _codes(item: Any) -> tuple[str, ...]:
 
 
 def _accepted(stamp: Any) -> datetime | None:
-    """When the SEC accepted a filing, in New York time."""
+    """When the SEC accepted a filing, in New York time. None for a stamp that is no time or has no zone."""
     try:
-        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(ET)
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
     except ValueError:
         return None
+    # With no zone it would be read as this computer's own time, which is a guess.
+    return when.astimezone(ET) if when.tzinfo is not None else None
 
 
 class EarningsService:
@@ -363,46 +390,64 @@ class EarningsService:
         if not self._history_sources:
             return [], "No earnings data source is configured."
         key = f"earnings_history_{symbol}_{self._tag}"
-        found = self._cache.entry(key)
-        if found is not None:
-            events = [_event(e) for e in found[0]]
-            if not self._stale(events, found[1]):
-                return events, None
+        found = self._on_file(key)
+        if found is not None and not self._stale(*found):
+            return found[0], None
 
-        events, note = [], None
+        # `cut_short` is a source that could not be asked this time, which is not the same
+        # as one that cannot answer for this company at all.
+        events, note, cut_short = [], None, False
         for source in self._history_sources:
             try:
                 got = source.history(symbol)
             except RateLimited:
-                note = f"{source.name} request limit reached; try again later."
+                note, cut_short = f"{source.name} request limit reached; try again later.", True
                 continue
             except Unsupported as err:
                 note = str(err)
                 continue
             except (httpx.HTTPError, ValueError, KeyError) as err:
-                note = f"{source.name} lookup failed: {type(err).__name__}."
+                note, cut_short = f"{source.name} lookup failed: {type(err).__name__}.", True
                 continue
             if len(got) > len(events):
                 events = got
             if len(events) >= self.ENOUGH:
                 break
-        if events or note is None:
+        # A short answer is not kept when a source that might have filled it out could not be
+        # asked. Kept, it would stand for a month, long after that source was answering again.
+        partial = cut_short and len(events) < self.ENOUGH
+        if (events or note is None) and not partial:
             self._cache.set(key, [_plain(e) for e in events])
-        elif found is not None:
-            events = [_event(e) for e in found[0]]  # stale beats nothing
+        elif not events and found is not None:
+            events = found[0]  # stale beats nothing
         return events, note if not events else None
+
+    def _on_file(self, key: str) -> tuple[list[EarningsEvent], timedelta] | None:
+        """A stock's reports as stored, with their age. None if there are none or they do not read as reports."""
+        found = self._cache.entry(key)
+        if found is None:
+            return None
+        try:
+            return [_event(e) for e in found[0]], found[1]
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
 
     def reports(self, symbol: str) -> list[EarningsEvent]:
         """Past reports for a stock that is not being scanned, newest first. Empty when none can be had.
 
-        What is on file answers. Otherwise the first source alone is asked,
-        and its answer is kept nowhere: a stock added to a pool must not spend
-        a request at a rate-limited source, and an answer from one source must
-        not stand in later for the fuller one a scan would get.
+        What is on file answers, if a scan would still trust it: that goes for
+        "no reports" (a fund) as much as for a list of them. Otherwise the
+        first source alone is asked, and its answer is kept nowhere: a stock
+        added to a pool must not spend a request at a rate-limited source, and
+        an answer from one source must not stand in later for the fuller one a
+        scan would get.
+
+        Reports that have gone stale are not used. They would lack the newest
+        report days, and a move on one of those would be counted as an event's.
         """
-        found = self._cache.entry(f"earnings_history_{symbol}_{self._tag}")
-        if found is not None and found[0]:
-            return [_event(e) for e in found[0]]
+        found = self._on_file(f"earnings_history_{symbol}_{self._tag}")
+        if found is not None and not self._stale(*found):
+            return found[0]
         if not self._history_sources or getattr(self._history_sources[0], "rate_limited", False):
             return []
         try:

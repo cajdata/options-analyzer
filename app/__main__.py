@@ -48,28 +48,33 @@ def _study_line(study: EventStudy) -> str:
     return text
 
 
+def _stocks(count: int) -> str:
+    return "stock" if count == 1 else "stocks"
+
+
 def _pooled_line(pooled: PooledStudy, lead: bool = True) -> str:
     """One type of event across the stocks covered about as much as this one, in a line."""
     what = f'{pooled.events} "{pooled.event}" days'
     if lead:
-        what = f"across {pooled.group_stocks} {events.GROUPS[pooled.group]} stocks, {what}"
+        what = f"across {pooled.group_stocks} {events.GROUPS[pooled.group]} {_stocks(pooled.group_stocks)}, {what}"
     if pooled.events < events.MIN_POOLED:
         return f"{what}: too few to compare"
+    any_day = f" ({pooled.big_sessions / pooled.sessions:.0%} of all days)" if pooled.sessions else ""
     return (
-        f"{what}: {pooled.big / pooled.events:.0%} moved over {events.BIG_MOVE:g}x the stock's usual day "
-        f"({pooled.big_sessions / pooled.sessions:.0%} of all days), {pooled.up} up {pooled.down} down"
+        f"{what}: {pooled.big / pooled.events:.0%} moved over {events.BIG_MOVE:g}x the stock's usual day"
+        f"{any_day}, {pooled.up} up {pooled.down} down"
     )
 
 
 def print_pool(found: dict) -> None:
     """What `Scanner.widen_pool` did, and what the pool now holds for the types that are pointed out."""
     added = found["added"]
-    print(f"\nAsked for {found['asked']} stocks. Added " + ", ".join(f"{n} {events.GROUPS[g]}" for g, n in added.items()) + ".")
+    print(f"\nAsked for {found['asked']} {_stocks(found['asked'])}. Added " + ", ".join(f"{n} {events.GROUPS[g]}" for g, n in added.items()) + ".")
     if found["passed_over"]:
         print("Passed over: " + ", ".join(f"{n} with {why}" for why, n in found["passed_over"].items()) + ".")
     for group, label in events.GROUPS.items():
         totals = found["totals"][group]
-        print(f"\n{label.capitalize()}: {totals['stocks']} stocks on record")
+        print(f"\n{label.capitalize()}: {totals['stocks']} {_stocks(totals['stocks'])} on record")
         pooled = events.pooled(found["totals"], group, [kind for kind in events.EVENT_TYPES if kind in events.FLAGGED])
         for study in pooled.values():
             print(f"  {_pooled_line(study, lead=False)}")
@@ -100,6 +105,10 @@ def _news_lines(symbol: str, ctx: UnderlyingContext) -> list[str]:
         if kind in events.CAUTIONS:
             caution = f"{events.EVENT_TYPES[kind]}: {events.CAUTIONS[kind]}"
             lines.append(textwrap.fill(caution, 110, initial_indent=" " * 8, subsequent_indent=" " * 8))
+    if ctx.news_note:
+        # With no headline line above to carry the ticker, the note carries it.
+        lead = " " * 8 if telling else f"  {symbol:<6}"
+        lines.append(textwrap.fill(ctx.news_note, 110, initial_indent=lead, subsequent_indent=" " * 8))
     return lines
 
 

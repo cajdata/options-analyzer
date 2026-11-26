@@ -112,7 +112,7 @@ class DemoMarket:
             out.append(NewsItem(when=when, kind="headline", title=title, source=self.name, ref=f"{symbol}-news-{n}"))
         # Two that a feed would tag with this stock though the news is someone else's: the
         # company as the holder of another's shares, and a company with a name like its ticker.
-        name, lookalike = NAMES[symbol], f"{NAMES[symbol]}ain Group PLC"
+        name, lookalike = NAMES[symbol], f"{NAMES[symbol][:-1]}ain Group PLC"  # "Acmain": like the name, and not built on it
         for back, title, summary in (
             (3, f"{name} Increases Stake in Tidewell Systems to 6.4%", f"{name} reported a larger holding in Tidewell Systems."),
             (6, f"{lookalike} Announces Total Voting Rights", f"{lookalike} reported its total voting rights and capital."),
