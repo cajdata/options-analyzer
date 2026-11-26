@@ -517,6 +517,7 @@ class Scanner:
 
         underlyings: dict[str, UnderlyingContext] = {}
         reports_for: dict[str, _Reports] = {}
+        dates_looked_up = False
         with ThreadPoolExecutor(max_workers=4) as pool:
             for outcome in pool.map(context, [symbol for symbol in symbols if symbol in quotes]):
                 if isinstance(outcome, str):
@@ -526,9 +527,12 @@ class Scanner:
                 underlyings[ctx.symbol], reports_for[ctx.symbol] = ctx, reports
                 if failed:
                     warnings.append(failed)
-        # Only when a stock's dates were looked up just now. A note left by an earlier scan says
-        # nothing about this review if the calendar was never asked.
-        if underlyings and self.earnings.calendar_note:
+                else:
+                    dates_looked_up = True
+        # Only when a stock's dates were looked up just now, to the end. The calendar is the last
+        # thing a lookup asks, so one that failed on the way never reached it, and a note left by an
+        # earlier scan says nothing about this review.
+        if dates_looked_up and self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
 
         held: list[Holding] = []

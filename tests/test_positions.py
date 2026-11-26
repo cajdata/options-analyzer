@@ -19,7 +19,7 @@ from app.analysis import contracts as metrics
 from app.analysis import exits, holdings, risk
 from app.cache import NullCache
 from app.config import Settings, load_settings
-from app.models import EarningsEvent, Holding, ImpliedMove, OptionQuote, Position, Reaction, UnderlyingContext
+from app.models import EarningsEvent, Holding, ImpliedMove, OptionQuote, Position, PositionsReview, Reaction, UnderlyingContext
 from app.positions import PositionStore, StoreError
 from app.providers.alpaca import AlpacaData
 from app.providers.demo import SPECS, DemoMarket
@@ -1006,3 +1006,122 @@ def test_an_expired_position_is_not_given_its_stocks_news(scanner, capsys):
     expired_row, live_row = rows[0], rows[1]
     assert expired_row.rstrip().endswith("expired") and "news:" not in expired_row
     assert "news: split" in live_row
+
+
+# -- From the second outside review of phase 3 -----------------------------------------------------
+#
+# It read the fixes for the first one. Each of these was reproduced against main before it was fixed.
+
+
+@pytest.mark.parametrize(
+    "kind, strike, spot, ask",
+    [("put", 100.0, 80.10, 19.90), ("put", 95.0, 75.10, 19.90), ("put", 50.0, 40.30, 9.70), ("call", 80.10, 100.20, 20.10)],
+)
+def test_an_ask_at_exercise_value_to_the_cent_is_not_below_it(kind, strike, spot, ask):
+    # 100.0 - 80.10 is 19.900000000000006 in floating point, a hair above an ask of 19.90. The check
+    # for a quote that is out of date against the stock took that hair for "below", and said so in
+    # words that contradicted themselves: "Even its ask ($19.90) is below the $19.90 ...".
+    p = position(kind=kind, strike=strike, entry_price=30.0)
+    at_it = quoted(p, round(ask - 0.40, 2), ask)
+    assert holdings.unusable(p, at_it, spot) is None
+    held = holdings.assess(p, TODAY, spot=spot, quote=at_it)
+    assert held.note is None and held.pnl == pytest.approx((30.0 - ask) * 100)
+    # A cent under it is still turned away.
+    under = quoted(p, round(ask - 0.40, 2), round(ask - 0.01, 2))
+    assert "out of date against the stock" in holdings.unusable(p, under, spot)
+
+
+def test_no_whole_cent_ask_at_exercise_value_is_turned_away():
+    # Before the fix this happened in about one case in four, depending on nothing but the digits.
+    for strike_cents in range(5000, 15001, 250):
+        p = position(strike=strike_cents / 100)
+        for spot_cents in range(4003, strike_cents, 97):
+            ask = (strike_cents - spot_cents) / 100
+            assert holdings.unusable(p, quoted(p, None, ask), spot_cents / 100) is None, (strike_cents, spot_cents)
+
+
+def test_the_scans_own_check_gives_a_price_at_exercise_value_the_same_room():
+    # The same subtraction is in the check that the positions check is modelled on. A midpoint exactly
+    # at exercise value is not below it, whatever the digits. One a cent under still is.
+    def analyzed(bid):
+        quote = OptionQuote("X", "XYZ", "put", 100.0, TODAY + timedelta(days=45), bid=bid, ask=20.00)
+        return metrics.analyze_contract(quote, 80.10, TODAY, RATE)
+
+    assert analyzed(19.80).mid == pytest.approx(19.90)  # the stock is at 80.10: exercising pays 19.90
+    assert analyzed(19.78) is None
+    assert metrics.PRICE_TOLERANCE < 0.0001  # far under anything a price is quoted in
+
+
+def test_an_ask_is_shown_on_the_side_of_the_target_it_is_on():
+    # The review's nit. Half of $1.2555 is $0.62775. An ask of exactly that has reached the target, and
+    # rounded for show it read "$0.6278" beside a target of "$0.6277 or less".
+    p = position(entry_price=1.2555)
+    there = holdings.profit_target(p, 0.62775)
+    assert there.state == "reached"
+    assert there.detail == "Buying back at $0.6277 keeps 50% of the $1.2555 collected. The 50% target is $0.6277 or less."
+    over = holdings.profit_target(p, 0.62776)
+    assert over.state == "clear" and over.detail.startswith("Buying back at $0.6278 would keep 49.9% of")
+    # A whole-cent ask reads the same whichever side it is on.
+    assert "at $1.01 would keep" in holdings.profit_target(position(entry_price=2.00), 1.01).detail
+    assert "at $1.00 keeps" in holdings.profit_target(position(entry_price=2.00), 1.00).detail
+
+
+def test_a_price_finer_than_a_cent_is_shown_as_it_is_wherever_a_position_is_shown(client, capsys, tmp_path, monkeypatch):
+    # The first fix showed the entry price and the target exactly. The row beside them still said 1.25
+    # for an entry of 1.255 and 0.52 for an ask of 0.515, above a check that said $0.515.
+    from app.__main__ import main, print_positions
+
+    p = position(underlying="ACME", strike=170.0, entry_price=1.255)
+    held = holdings.assess(p, TODAY, spot=184.0, quote=quoted(p, 0.50, 0.515))
+    print_positions(PositionsReview(datetime.now(ET), "demo", "synthetic", [held]))
+    row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith(p.id))
+    assert "  1.255  " in row and "  0.515  " in row and "1.25  " not in row and "0.52" not in row
+
+    monkeypatch.setenv("POSITIONS_FILE", str(tmp_path / "positions.json"))
+    assert main(["positions", "add", "acme", "2026-12-18", "170", "put", "--sold", "--price", "1.255"]) == 0
+    assert "put, sold at 1.255 (ACME261218P00170000)" in capsys.readouterr().out
+
+    page = client.get("/").text
+    for shown in ("exact(holding.close_price)", "exact(holding.bid)", "exact(holding.ask)", "exact(breakeven)"):
+        assert shown in page
+    assert "money(holding." not in page and "money(breakeven)" not in page and "money(p.entry_price)" not in page
+
+
+def test_a_left_over_calendar_note_is_not_repeated_when_every_lookup_fails_on_the_way(scanner):
+    # The first fix gated the note on a stock having been looked up. A lookup that fails on the earnings
+    # history never reaches the calendar, and since that fix its stock is kept, so the note came back.
+    scanner.earnings.calendar_note = "left by an earlier scan"
+
+    def broke(symbol):
+        raise RuntimeError("lookup broke")
+
+    scanner.earnings.history = broke
+    review = scanner.review(scanner.market.sample_positions()[:2])
+    assert sorted(review.underlyings) == ["CRUX", "ORBT"]
+    assert review.warnings == [
+        "CRUX: its earnings dates could not be looked up (lookup broke).",
+        "ORBT: its earnings dates could not be looked up (lookup broke).",
+    ]
+
+
+def test_a_snapshot_with_no_quote_in_it_is_not_called_outdated():
+    # Only a quote with a time can be from an earlier day. With every dated quote too old to use, a
+    # contract whose snapshot held no quote at all was marked outdated too, and its position said it
+    # had last been quoted "on an earlier day".
+    wanted = {"AAPL261218P00200000": "AAPL", "COST261218C00900000": "COST"}
+
+    def all_old(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"snapshots": {"AAPL261218P00200000": snapshot("2026-11-17T20:59:59Z"), "COST261218C00900000": {"latestQuote": {}}}})
+
+    quotes = alpaca(all_old).option_quotes(wanted)
+    assert set(quotes) == {"AAPL261218P00200000"} and quotes["AAPL261218P00200000"].outdated
+
+    # On an ordinary day such a snapshot comes back as it is: no prices, and not marked.
+    def one_empty(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"snapshots": {"AAPL261218P00200000": snapshot("2026-11-24T20:59:59Z"), "COST261218C00900000": {"latestQuote": {}}}})
+
+    quotes = alpaca(one_empty).option_quotes(wanted)
+    empty = quotes["COST261218C00900000"]
+    assert not empty.outdated and (empty.bid, empty.ask, empty.quote_time) == (None, None, None)
+    assert quotes["AAPL261218P00200000"].bid == 6.1
+

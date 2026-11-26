@@ -246,6 +246,11 @@ def _held(p: Position) -> str:
     return f"{p.underlying} {p.expiry:%b %d} {p.strike:g} {p.kind}, {'bought' if p.side == 'long' else 'sold'}"
 
 
+def _figure(price: float) -> str:
+    """A price as it is, with no dollar sign: to the cent, or finer when it is not a whole cent (1.255)."""
+    return holdings.dollars(price)[1:]
+
+
 def _result(h: Holding) -> str:
     """A result in whole dollars and percent. Signs are settled after rounding, so nothing prints as "+$0" or "-0%"."""
     if h.pnl is None:
@@ -272,9 +277,9 @@ def print_positions(review: PositionsReview) -> None:
             ctx = review.underlyings.get(p.underlying) if h.dte >= 0 else None
             look = [c.label for c in h.checks if c.state != "clear"]
             look += [f"news: {kind}" for kind in (ctx.recent_events if ctx else {}) if kind in events.FLAGGED]
-            close = "-" if h.close_price is None else f"{h.close_price:.2f}"
+            close = "-" if h.close_price is None else _figure(h.close_price)
             print(
-                f"{p.id:<9} {_held(p):<32} {p.quantity:>3}  {p.entry_price:>7.2f}  {close:>8}  {_result(h):>15}  "
+                f"{p.id:<9} {_held(p):<32} {p.quantity:>3}  {_figure(p.entry_price):>7}  {close:>8}  {_result(h):>15}  "
                 f"{h.dte:>4}  {', '.join(look) or '-'}"
             )
 
@@ -326,7 +331,7 @@ def _change_positions(args, settings) -> int:
     except (ValueError, positions.StoreError) as err:
         print(err, file=sys.stderr)
         return 2
-    print(f"Added {made.id}: {made.quantity} x {_held(made)} at {made.entry_price:.2f} ({made.symbol}), in {store.path}.")
+    print(f"Added {made.id}: {made.quantity} x {_held(made)} at {_figure(made.entry_price)} ({made.symbol}), in {store.path}.")
     return 0
 
 

@@ -14,6 +14,11 @@ from app.models import Bar, ContractAnalysis, OptionQuote
 # Volatility is annualized over 252 trading days, so one trading day carries this
 # share of a year's variance. An earnings report replaces one such day.
 TRADING_DAY = 1.0 / 252.0
+# Prices are amounts in cents, and a float is not one: 100.0 - 80.10 comes out as
+# 19.900000000000006. So a price is below exercise value only when it is below it by more
+# than this. Without the room, a quote exactly at exercise value was turned away about one
+# time in four, depending on nothing but the digits of the two prices.
+PRICE_TOLERANCE = 1e-6
 
 
 def years_to_expiry(expiry: date, today: date) -> float:
@@ -37,7 +42,7 @@ def analyze_contract(q: OptionQuote, spot: float, today: date, rate: float) -> C
     # supplies its own volatility figure.
     intrinsic = max(spot - q.strike, 0.0) if is_call else max(q.strike - spot, 0.0)
     breakeven = q.strike + mid if is_call else q.strike - mid
-    if mid < intrinsic or breakeven <= 0:
+    if mid < intrinsic - PRICE_TOLERANCE or breakeven <= 0:
         return None
 
     if q.iv and q.iv > 0:
