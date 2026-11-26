@@ -25,6 +25,14 @@ class MarketData(Protocol):
         self, symbol: str, *, expiry_from: date, expiry_to: date, strike_from: float, strike_to: float
     ) -> dict[str, int]: ...
 
+    def option_quotes(self, contracts: dict[str, str]) -> dict[str, OptionQuote]:
+        """Quotes for named contracts, for positions already held: no chain is pulled.
+
+        `contracts` maps each OCC symbol to its underlying. A contract with no
+        quote from the latest session is left out of the answer.
+        """
+        ...
+
     def most_actives(self, top: int) -> list[str]: ...
 
     def movers(self, top: int) -> list[str]: ...

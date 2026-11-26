@@ -323,3 +323,65 @@ class ScanResult:
     warnings: list[str] = field(default_factory=list)
     budget: float | None = None  # per-contract limit the scan was run with
     exit_plans: dict[str, ExitPlan] = field(default_factory=dict)  # by contract symbol
+
+
+@dataclass(frozen=True)
+class Position:
+    """One option position as the person entered it. Kept by app/positions.py."""
+
+    id: str
+    underlying: str
+    kind: str  # "call" or "put"
+    strike: float
+    expiry: date
+    side: str  # "long" (bought) or "short" (sold)
+    quantity: int  # contracts
+    entry_price: float  # per share: what was paid, or what was collected
+    opened: date
+    symbol: str  # the OCC contract symbol, worked out from the fields above
+
+
+@dataclass(frozen=True)
+class PositionCheck:
+    """One exit rule set against one position. Built by analysis/holdings.py."""
+
+    rule: str  # "profit_target", "time_stop", "earnings", "strike" or "expired"
+    # "reached": the rule's condition is met. "clear": it is not. "unknown": it cannot be told.
+    state: str
+    label: str  # a few words, for a chip
+    detail: str  # one or two sentences with the numbers
+
+
+@dataclass
+class Holding:
+    """A position with today's numbers beside it. Built by analysis/holdings.py.
+
+    A position is always listed. Whatever could not be read is None, and
+    `note` says why.
+    """
+
+    position: Position
+    dte: int  # calendar days to expiry; negative once it has expired
+    checks: list[PositionCheck]
+    bid: float | None = None
+    ask: float | None = None
+    quote_time: datetime | None = None
+    # What closing now fetches (the bid, for a holder) or costs (the ask, to buy back), per share.
+    close_price: float | None = None
+    pnl: float | None = None  # dollars across every contract, closing at that price
+    pnl_pct: float | None = None  # as a share of the premium paid or collected
+    contract: ContractAnalysis | None = None  # today's metrics, when the quote can be priced
+    plan: ExitPlan | None = None  # the standing-still path from here, measured against the entry price
+    note: str | None = None
+
+
+@dataclass
+class PositionsReview:
+    """Every position on file, checked against the exit rules. Built by Scanner.review."""
+
+    generated_at: datetime
+    mode: str  # "demo", "live" or "unconfigured"
+    options_feed: str | None
+    holdings: list[Holding]
+    underlyings: dict[str, UnderlyingContext] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)

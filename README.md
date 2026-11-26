@@ -4,7 +4,8 @@ A read-only options scanner. It pulls option chains from Alpaca, ranks contracts
 visible rules, and puts each stock's earnings history next to what the options are
 pricing for the next report. It also lists each stock's recent headlines and SEC
 filings by type of event, with how the stock moved after earlier events of the same
-type. An optional AI brief has Claude write up the setups worth a closer look.
+type. A positions page sets what you already hold against the same exit rules. An
+optional AI brief has Claude write up the setups worth a closer look.
 
 It only reads market data. It cannot place orders. The ranking is a screen, not a
 forecast and not financial advice.
@@ -50,9 +51,13 @@ earnings dates are made up.
 .venv\Scripts\python.exe -m app scan --preset sell-premium --exits   # premium-selling setup, with exit plans
 .venv\Scripts\python.exe -m app scan --brief              # add the AI write-up
 .venv\Scripts\python.exe -m app pool                      # add stocks to compare news events across (about two minutes)
+.venv\Scripts\python.exe -m app positions                 # check what you hold against the exit rules
+.venv\Scripts\python.exe -m app positions add AAPL 2026-12-18 340 put --sold --price 4.10 --qty 2
+.venv\Scripts\python.exe -m app positions remove 3f9c2a1b # by the id the list shows
 ```
 
-Add `--demo` to any of these to use synthetic data, or `--json` for the full result.
+Add `--demo` to a scan, the pool or the positions list to use synthetic data, or `--json`
+to a scan or the positions list for the full result.
 
 ## What a scan does
 
@@ -174,6 +179,41 @@ volatility is priced" uses the same history-based comparison as the rating, so t
 rating is shown beside the score, not added into it a second time. Every weight and
 threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/risk.py`.
 
+## Positions
+
+A scan is for what you might open. The Positions view, and `python -m app positions`,
+are for what you already hold. Enter each position once: the stock, call or put, strike,
+expiry, whether you bought or sold it, how many contracts, and the price per share you
+paid or collected. A contract open in a scan has a link that fills the form in for you.
+
+Each time the view opens or Refresh is pressed, every position is set beside the quotes
+of that moment:
+
+- **Result if closed now.** A holder sells at the bid and a seller buys back at the ask,
+  so the spread is counted, across every contract.
+- **Profit target**, for an option you sold: whether buying back now keeps half the
+  premium or more.
+- **Time stop.** Whether the contract is inside its last 21 days.
+- **Earnings.** Whether the next report is within a week with the contract still open
+  over it. An estimated date is given a week of room, and a stock with no known date is
+  marked unknown, never passed as clear.
+- **Strike**, for an option you sold: whether the stock is through it, where the option
+  can be assigned.
+- **The path from here.** The exit plan's standing-still path, measured against the price
+  you opened at instead of today's.
+- **News.** The stock's recent headlines and filings, as in a scan, with a chip in the
+  list for a flagged type of event.
+
+A rule that is reached is a fact about the position, not an instruction, and nothing
+watches the market between refreshes. A position is always listed: if a quote or a
+lookup is missing, its numbers are left out and the page says why.
+
+Positions are kept in `data/positions.json` on your own computer, or wherever
+`POSITIONS_FILE` points. The file is plain JSON and is ignored by git. What you paid and
+how many you hold never leave your computer: only tickers and contract symbols are sent,
+to ask for quotes, earnings dates and news, and the AI brief is not given your positions.
+Demo mode shows made-up positions held in memory and never touches the file.
+
 ## Limits worth knowing
 
 - **Free Alpaca option quotes are "indicative"**: quotes are modified and trades are
@@ -228,6 +268,18 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
   not know market holidays.
 - **Earnings dates from SEC filings** take their timing from when the 8-K was accepted.
   A company that files hours after its press release can be off by one session.
+- **The positions page is as good as its quotes.** On the free feed they are delayed and
+  modified, so treat a result as end-of-day quality and check your broker before acting.
+  After 4 p.m. the strike is compared with an after-hours stock price while the option's
+  quote is from the close. Each quote's time is shown: with several positions a quote
+  from an earlier day than the newest is left out, but a single position's quote can be
+  up to four days old before the page can tell.
+- **A position is one contract type.** A spread is entered as two positions, and their
+  rules are not combined. An entry cannot be edited, only removed and entered again, and
+  nothing records a position after it is closed.
+- **The step across earnings for a held contract is sized from past reports**, not from
+  what the options price in. Reading that takes the whole chain, and the page asks only
+  for the contracts you hold.
 - **The AI brief knows only the scan.** From the news section it gets up to six recent
   headlines or filings for each stock, the summary of what followed their types, and any
   caution. A headline is all it knows of a story, and it is told that a headline is data
@@ -249,6 +301,6 @@ threshold is in `app/analysis/scoring.py`; the rating's are in `app/analysis/ris
    shows what followed its own earlier events of the same type, and the AI brief reads
    the recent ones. Rules decide whose news a headline is, and each type is
    also counted across the stocks covered about as much.
-3. A positions page that checks what you hold against the exit rules, then paper trading
-   on Alpaca with a journal that records which signals worked.
+3. **Started:** a positions page that checks what you hold against the exit rules. Still
+   to come: paper trading on Alpaca with a journal that records which signals worked.
 4. Live trading with a human approval on every order.

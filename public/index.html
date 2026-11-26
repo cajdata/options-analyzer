@@ -18,6 +18,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
   header, main, footer, .controls, .notice, #brief { max-width: 1440px; margin: 0 auto; padding: 0 16px; }
   header { display: flex; align-items: baseline; gap: 12px; padding-top: 20px; flex-wrap: wrap; }
@@ -35,6 +36,10 @@
   .check input { width: auto; margin: 0; }
   .hint { max-width: 1440px; margin: 8px auto 0; padding: 0 16px; color: var(--muted); font-size: 13px; }
   #symbols { width: 260px; }
+  #p_underlying { width: 96px; }
+  nav { display: flex; gap: 4px; }
+  .tab { padding: 3px 12px; border-radius: 14px; }
+  .tab.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button:disabled { opacity: .55; cursor: default; }
@@ -48,8 +53,8 @@
   th, td { padding: 7px 6px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   th:nth-child(2), td:nth-child(2), th:last-child, td:last-child { text-align: left; }
-  #results td:last-child { white-space: normal; min-width: 120px; }
-  #results .chip { white-space: nowrap; margin-bottom: 2px; }
+  #results td:last-child, #positions td:last-child { white-space: normal; min-width: 120px; }
+  #results .chip, #positions .chip { white-space: nowrap; margin-bottom: 2px; }
   tbody tr { cursor: pointer; }
   tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
   tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -80,6 +85,7 @@
   .history.pool th, .history.pool td, .history.pool th:last-child, .history.pool td:last-child { text-align: right; }
   .history.pool th:first-child, .history.pool td:first-child { text-align: left; white-space: normal; }
   .caution { margin: 6px 0; padding: 6px 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 6px; font-size: 13px; }
+  .rule { margin: 6px 0; font-size: 13px; }
   details { border-top: 1px solid var(--line); padding: 6px 0; }
   summary { cursor: pointer; }
   #brief { margin-top: 16px; }
@@ -94,10 +100,14 @@
 <header>
   <h1>Strike Check</h1>
   <span id="mode" class="badge">loading</span>
+  <nav aria-label="Views">
+    <button type="button" class="tab selected" id="tab-scan" aria-pressed="true">Scan</button>
+    <button type="button" class="tab" id="tab-positions" aria-pressed="false">Positions</button>
+  </nav>
   <span id="sources" class="sub"></span>
 </header>
 
-<form class="controls" id="controls">
+<form class="controls" id="controls" data-view="scan">
   <label>Symbols
     <input id="symbols" placeholder="Leave blank to discover" autocomplete="off" spellcheck="false">
   </label>
@@ -129,10 +139,47 @@
   <span id="busy" class="sub" role="status"></span>
 </form>
 
-<p class="hint" id="hint" role="status"></p>
+<p class="hint" id="hint" role="status" data-view="scan"></p>
+
+<form class="controls" id="position-form" data-view="positions" hidden>
+  <label>Stock <input id="p_underlying" placeholder="Ticker" autocomplete="off" spellcheck="false" required></label>
+  <label>Type
+    <select id="p_kind">
+      <option value="put">Put</option>
+      <option value="call">Call</option>
+    </select>
+  </label>
+  <label>Strike <input id="p_strike" type="number" min="0.01" step="any" required></label>
+  <label>Expiry <input id="p_expiry" type="date" required></label>
+  <label title="Sold: you collected the premium and owe the option (short). Bought: you paid for it and own it (long).">You
+    <select id="p_side">
+      <option value="short">Sold it (short)</option>
+      <option value="long">Bought it (long)</option>
+    </select>
+  </label>
+  <label>Contracts <input id="p_quantity" type="number" min="1" max="10000" step="1" value="1" required></label>
+  <label title="What you paid or collected for one share. A contract is 100 shares, so 1.25 here is $125 a contract.">Price per share ($)
+    <input id="p_entry_price" type="number" min="0.01" step="0.01" required>
+  </label>
+  <label title="Leave blank for today.">Opened <input id="p_opened" type="date"></label>
+  <button class="primary" id="p_add" type="submit">Add position</button>
+  <button id="p_refresh" type="button">Refresh</button>
+  <span id="p_busy" class="sub" role="status"></span>
+</form>
+<p class="hint" id="position-about" data-view="positions" hidden></p>
+<p class="hint" id="position-hint" role="status" data-view="positions" hidden></p>
+
 <div class="notice" id="notice"></div>
 
-<main>
+<main data-view="positions" hidden>
+  <section class="panel">
+    <h2 id="positions-title">Positions</h2>
+    <div class="scroll" id="positions"><p class="empty">Loading what is on file.</p></div>
+  </section>
+  <aside class="panel" id="position-detail"><p class="empty">Select a position to see what the exit rules say about it.</p></aside>
+</main>
+
+<main data-view="scan">
   <section class="panel">
     <h2 id="results-title">Results</h2>
     <div class="scroll" id="results"><p class="empty">Run a scan to see ranked contracts.</p></div>
@@ -140,7 +187,7 @@
   <aside class="panel" id="detail"><p class="empty">Select a contract to see its numbers, the stock's earnings history and its recent news.</p></aside>
 </main>
 
-<section id="brief"></section>
+<section id="brief" data-view="scan"></section>
 
 <footer>
   Contracts are ranked by fixed, visible rules: liquidity, distance to breakeven, how volatility is priced,
@@ -153,6 +200,9 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let status = null, scan = null, selected = null;
+// The positions view: what the last check returned, and the id of the position that is open.
+let view = "scan", review = null, held = null;
+const notices = { scan: [], positions: [] };
 
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
@@ -200,19 +250,32 @@ const COMPONENTS = {
 };
 const TIMING = { pre: "before the open", post: "after the close", unknown: "time unknown" };
 
-async function api(path, body) {
-  const response = await fetch(path, body === undefined ? {} : {
+async function api(path, body, method) {
+  const options = body === undefined ? {} : {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
+  };
+  if (method) options.method = method;
+  const response = await fetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data);
+    // A rejected field comes back as a list, one entry for each thing wrong with it.
+    const detail = typeof data.detail === "string" ? data.detail
+      : Array.isArray(data.detail) ? data.detail.map((d) => (d.loc ? d.loc[d.loc.length - 1] + ": " : "") + d.msg).join("; ")
+      : JSON.stringify(data.detail || data);
     throw new Error(detail || ("Request failed: " + response.status));
   }
   return data;
 }
 
-function showNotices(extra) {
+// Each view has its own notes. Passing `extra` replaces those of one view (the scan's unless `of` says otherwise).
+// The line under the entry form: a note about what was filled in, or why an entry was turned away.
+function formNote(text, failed) {
+  $("position-hint").textContent = text;
+  $("position-hint").classList.toggle("error", Boolean(failed));
+}
+
+function showNotices(extra, of) {
+  if (extra !== undefined) notices[of || "scan"] = extra;
   const lines = [];
   if (status && status.setup_error) lines.push(status.setup_error);
   if (status && status.mode === "demo") lines.push("Synthetic demo data. The tickers, prices and earnings dates are made up.");
@@ -222,7 +285,7 @@ function showNotices(extra) {
   if (status && status.mode === "live" && !status.earnings_sources.length) {
     lines.push("No earnings data source is configured, so earnings context is missing. Set SEC_USER_AGENT or ALPHAVANTAGE_API_KEY in .env.");
   }
-  $("notice").replaceChildren(...lines.concat(extra || []).map((text) => el("p", {}, text)));
+  $("notice").replaceChildren(...lines.concat(notices[view]).map((text) => el("p", {}, text)));
 }
 
 function earningsChips(ctx, idea) {
@@ -320,7 +383,12 @@ function riskBlock(idea, ctx) {
 
 function exitBlock(idea, ctx) {
   const plan = scan.exit_plans[idea.symbol];
-  if (!plan) return [];
+  return plan ? planBlock(plan, ctx, null) : [];
+}
+
+// A contract's standing-still path. For a scan it starts from opening now. For a position already
+// held, `mine` carries what is known about it, and every result is against the price it was opened at.
+function planBlock(plan, ctx, mine) {
   const rules = status.exit_rules;
   const seller = plan.lens === "sell";
   const where = Math.abs(plan.strike_distance_pct) < 0.0005 ? "at the stock price"
@@ -328,17 +396,19 @@ function exitBlock(idea, ctx) {
   const rows = [];
   if (seller) {
     rows.push(["Buy back to keep " + pct(rules.profit_target, 0), money(plan.target_price) + " or less"]);
-    rows.push(["Decay alone gets there", plan.target_day ? "about " + dayMonth(plan.target_day) : "not before expiry"]);
+    rows.push(["Decay alone gets there", mine && mine.reached ? "already there"
+      : plan.target_day ? "about " + dayMonth(plan.target_day) : "not before expiry"]);
   } else if (plan.half_life_day) {
     rows.push(["Half the time value is gone by", dayMonth(plan.half_life_day)]);
   }
   rows.push(["Time stop (" + rules.time_stop_dte + " days left)", plan.time_stop_day ? dayMonth(plan.time_stop_day) : "already inside it"]);
-  rows.push(["Strike is", where]);
+  if (!mine) rows.push(["Strike is", where]);
 
   const parts = [
-    el("h3", {}, "Exit plan"),
+    el("h3", {}, mine ? "From here, if the stock stands still" : "Exit plan"),
     facts(rows),
-    el("p", { class: "sub" }, "If the stock stands still, closing at the " + (seller ? "ask" : "bid") + ":"),
+    el("p", { class: "sub" }, (mine ? "One contract, against the " + money(plan.entry_price) + " it was opened at, closing at the "
+      : "If the stock stands still, closing at the ") + (seller ? "ask" : "bid") + ":"),
     el("table", { class: "history" },
       el("thead", {}, el("tr", {}, el("th", {}, "When"), el("th", {}, "Close at"), el("th", {}, "Result"))),
       el("tbody", {}, plan.checkpoints.map((k) => el("tr", {},
@@ -498,7 +568,8 @@ function select(idea) {
   const weights = status.lenses[scan.lens];
   const parts = [
     el("h2", {}, idea.underlying + " " + shortDate(idea.expiry) + " " + idea.strike + " " + idea.kind),
-    el("div", { class: "sub" }, idea.symbol),
+    el("div", { class: "sub" }, idea.symbol, " · ",
+      el("a", { href: "#positions", onclick: (e) => { e.preventDefault(); record(idea); } }, "I hold this: record it as a position")),
     el("h3", {}, "Contract"),
     facts([
       ["Bid × ask", money(idea.bid) + " × " + money(idea.ask)],
@@ -528,15 +599,23 @@ function select(idea) {
       ["Realized volatility, 20d / 60d", pct(ctx.realized_vol_20d) + " / " + pct(ctx.realized_vol_60d)],
       ["At-the-money implied volatility", pct(ctx.atm_iv)],
     ]),
-    el("h3", {}, "Earnings"),
   ];
+  parts.push(earningsBlock(ctx, idea.spans_earnings));
+  parts.push(newsBlock(ctx));
+  $("detail").replaceChildren(...parts.flat());
+}
+
+// A stock's next report and how it moved across past ones. `spans` says whether the contract
+// being looked at is still open at the report, and is null when that is not known.
+function earningsBlock(ctx, spans) {
+  const parts = [el("h3", {}, "Earnings")];
   if (ctx.next_earnings) {
     const e = ctx.next_earnings;
     parts.push(facts([
       ["Next report", shortDate(e.day) + ", " + (TIMING[e.timing] || e.timing)],
       ["When", inDays(ctx.days_to_earnings) + (e.confirmed ? "" : " (estimated date)")],
-      ["This contract", idea.spans_earnings ? "still open at the report" : "expires before the report"],
-    ]));
+      spans === null || spans === undefined ? null : ["This contract", spans ? "still open at the report" : "expires before the report"],
+    ].filter(Boolean)));
   } else {
     parts.push(el("p", { class: "sub" }, ctx.earnings_note || "No upcoming earnings date on record (normal for ETFs)."));
   }
@@ -559,8 +638,154 @@ function select(idea) {
   } else if (ctx.next_earnings && ctx.earnings_note) {
     parts.push(el("p", { class: "sub" }, ctx.earnings_note));
   }
-  parts.push(newsBlock(ctx));
-  $("detail").replaceChildren(...parts.flat());
+  return parts;
+}
+
+// -- Positions ---------------------------------------------------------------------------------
+
+const SIDE = { long: "bought", short: "sold" };
+
+// What a row is flagged for: every rule that is reached or could not be checked.
+function checkChips(holding) {
+  return holding.checks.filter((check) => check.state !== "clear")
+    .map((check) => el("span", { class: "chip hot", title: check.detail }, check.label));
+}
+
+function renderPositions() {
+  const list = review.holdings;
+  $("positions-title").textContent = list.length
+    ? list.length + (list.length === 1 ? " position" : " positions") + ", in the order entered" : "Positions";
+  if (!list.length) {
+    $("positions").replaceChildren(el("p", { class: "empty" },
+      "No positions on file. Enter one above, or open a contract in a scan and record it from there."));
+    $("position-detail").replaceChildren(el("p", { class: "empty" }, "Select a position to see what the exit rules say about it."));
+    return;
+  }
+  const head = ["#", "Position", "Entry", "Close at", "Result now", "Days left", "To look at"];
+  const rows = list.map((holding, i) => {
+    const p = holding.position, ctx = review.underlyings[p.underlying];
+    const row = el("tr", { tabindex: "0", onclick: () => selectHolding(holding), onkeydown: (e) => { if (e.key === "Enter") selectHolding(holding); } },
+      el("td", {}, String(i + 1)),
+      el("td", {}, el("strong", {}, p.underlying), " ",
+        el("span", { class: "sub" }, dayMonth(p.expiry) + " · " + p.strike + " " + p.kind),
+        el("div", { class: "sub" }, SIDE[p.side] + " × " + p.quantity)),
+      el("td", {}, money(p.entry_price), el("div", { class: "sub" }, "opened " + dayMonth(p.opened))),
+      el("td", {}, money(holding.close_price),
+        holding.close_price === null ? null : el("div", { class: "sub" }, p.side === "long" ? "the bid" : "the ask")),
+      holding.pnl === null ? el("td", {}, "–")
+        : el("td", { class: tone(Math.round(holding.pnl)) }, dollars(holding.pnl, true), el("div", { class: "sub" }, signedPct(holding.pnl_pct, 0))),
+      el("td", {}, holding.dte < 0 ? "expired" : String(holding.dte)),
+      el("td", {}, checkChips(holding), ctx ? newsChips(ctx) : null),
+    );
+    row.dataset.id = p.id;
+    return row;
+  });
+  $("positions").replaceChildren(el("table", {}, el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, h)))), el("tbody", {}, rows)));
+}
+
+// Removing asks once more in the page itself, since an entry cannot be brought back.
+function removeBlock(p) {
+  const box = el("p", { class: "sub" });
+  const offer = () => box.replaceChildren(el("button", { type: "button", onclick: sure }, "Remove this position…"));
+  const sure = () => box.replaceChildren("Remove it from the list? This deletes the entry here and nothing else. ",
+    el("button", { type: "button", onclick: async () => {
+      try {
+        await api("/api/positions/" + encodeURIComponent(p.id), undefined, "DELETE");
+        held = null;
+        await loadPositions();
+      } catch (err) {
+        box.append(el("span", { class: "error" }, " " + err.message));
+      }
+    } }, "Remove"), " ", el("button", { type: "button", onclick: offer }, "Keep"));
+  offer();
+  return box;
+}
+
+function selectHolding(holding) {
+  const p = holding.position, c = holding.contract, ctx = review.underlyings[p.underlying];
+  held = p.id;
+  document.querySelectorAll("#positions tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.id === held));
+  const short = p.side === "short";
+  const breakeven = p.kind === "call" ? p.strike + p.entry_price : p.strike - p.entry_price;
+  const reached = holding.checks.some((check) => check.rule === "profit_target" && check.state === "reached");
+  const parts = [
+    el("h2", {}, p.underlying + " " + shortDate(p.expiry) + " " + p.strike + " " + p.kind),
+    el("div", { class: "sub" }, p.symbol + " · " + SIDE[p.side] + " " + p.quantity + (p.quantity === 1 ? " contract" : " contracts")
+      + " · opened " + shortDate(p.opened)),
+    holding.note ? el("p", { class: "caution" }, holding.note) : null,
+    el("h3", {}, "What the exit rules say"),
+    holding.checks.map((check) => el("p", { class: check.state === "clear" ? "rule" : "rule caution" },
+      el("strong", {}, status.positions.rules[check.rule] + ". "), check.detail)),
+    el("h3", {}, "Position"),
+    facts([
+      [short ? "Collected" : "Paid", money(p.entry_price) + " a share · " + dollars(p.entry_price * 100 * p.quantity) + " in all"],
+      ["Bid × ask now", holding.bid === null && holding.ask === null ? "–" : money(holding.bid) + " × " + money(holding.ask)],
+      holding.quote_time ? ["Quoted", newsTime(holding.quote_time) + ", New York"] : null,
+      [short ? "Buying back now, at the ask" : "Selling now, at the bid", money(holding.close_price)],
+      ["Result if closed now", holding.pnl === null ? "–" : dollars(holding.pnl, true) + " (" + signedPct(holding.pnl_pct, 0) + ")"],
+      ["Breakeven at expiry", money(breakeven)],
+      ["Expires", shortDate(p.expiry) + (holding.dte < 0 ? "" : " · " + inDays(holding.dte))],
+      c ? ["Implied volatility", pct(c.iv) + " (" + c.iv_source + ")"] : null,
+      c ? ["Delta · gamma", num(c.delta) + " · " + num(c.gamma, 3) + " (" + c.greeks_source + ")"] : null,
+      c ? ["Theta · vega", num(c.theta, 3) + " · " + num(c.vega, 3)] : null,
+    ].filter(Boolean)),
+    holding.plan ? planBlock(holding.plan, ctx, { reached }) : null,
+  ];
+  if (ctx) {
+    parts.push(
+      el("h3", {}, p.underlying + " stock"),
+      facts([
+        ["Price", [money(ctx.price), " ", el("span", { class: tone(ctx.change_pct) }, signedPct(ctx.change_pct))]],
+        ["Realized volatility, 20d / 60d", pct(ctx.realized_vol_20d) + " / " + pct(ctx.realized_vol_60d)],
+      ]),
+      earningsBlock(ctx, c ? c.spans_earnings : null),
+      newsBlock(ctx),
+    );
+  }
+  parts.push(el("p", { class: "sub" }, "A rule that is reached is a fact about the position, not an instruction. The result counts the spread: "
+    + "a holder sells at the bid and a seller buys back at the ask."), removeBlock(p));
+  $("position-detail").replaceChildren(...parts.flat(Infinity).filter(Boolean));
+}
+
+async function loadPositions() {
+  $("p_busy").textContent = "Checking…";
+  $("p_refresh").disabled = true;
+  try {
+    review = await api("/api/positions");
+    showNotices(review.warnings, "positions");
+    renderPositions();
+    const open = review.holdings.find((holding) => holding.position.id === held) || review.holdings[0];
+    if (open) selectHolding(open);
+  } catch (err) {
+    showNotices(["Positions could not be loaded: " + err.message], "positions");
+  } finally {
+    $("p_busy").textContent = "";
+    $("p_refresh").disabled = false;
+  }
+}
+
+// Fill in the entry form from a contract in a scan. Nothing is saved until Add is pressed.
+function record(idea) {
+  const fill = { p_underlying: idea.underlying, p_kind: idea.kind, p_strike: idea.strike, p_expiry: idea.expiry,
+    p_side: scan.lens === "buy" ? "long" : "short", p_quantity: 1,
+    p_entry_price: (scan.lens === "buy" ? idea.ask : idea.bid).toFixed(2), p_opened: "" };
+  for (const [id, value] of Object.entries(fill)) $(id).value = value;
+  show("positions");
+  formNote("Filled in from the scan, at today's " + (scan.lens === "buy" ? "ask" : "bid")
+    + ". Change the price to what you actually " + (scan.lens === "buy" ? "paid" : "collected") + ", set the contracts, then press Add position.");
+}
+
+function show(name) {
+  view = name;
+  document.querySelectorAll("[data-view]").forEach((node) => { node.hidden = node.dataset.view !== name; });
+  for (const tab of ["scan", "positions"]) {
+    $("tab-" + tab).classList.toggle("selected", tab === name);
+    $("tab-" + tab).setAttribute("aria-pressed", String(tab === name));
+  }
+  const hash = name === "scan" ? "" : "#" + name;
+  if (location.hash !== hash) history.replaceState(null, "", location.pathname + hash);
+  showNotices();
+  if (name === "positions" && !review) loadPositions();
 }
 
 function renderBriefButton() {
@@ -628,6 +853,36 @@ $("controls").addEventListener("submit", async (event) => {
 // A preset's note describes the controls as it left them, so it goes once they are edited.
 $("controls").addEventListener("input", () => { $("hint").textContent = ""; });
 
+$("position-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("p_add").disabled = true;
+  formNote("");
+  try {
+    const made = await api("/api/positions", {
+      underlying: $("p_underlying").value.trim(),
+      kind: $("p_kind").value,
+      strike: Number($("p_strike").value),
+      expiry: $("p_expiry").value,
+      side: $("p_side").value,
+      quantity: Number($("p_quantity").value || 1),
+      entry_price: Number($("p_entry_price").value),
+      opened: $("p_opened").value || null,
+    });
+    held = made.id;
+    for (const id of ["p_underlying", "p_strike", "p_expiry", "p_entry_price", "p_opened"]) $(id).value = "";
+    $("p_quantity").value = 1;
+    await loadPositions();
+  } catch (err) {
+    formNote("Not added: " + err.message, true);
+  } finally {
+    $("p_add").disabled = false;
+  }
+});
+$("p_refresh").addEventListener("click", loadPositions);
+$("tab-scan").addEventListener("click", () => show("scan"));
+$("tab-positions").addEventListener("click", () => show("positions"));
+window.addEventListener("hashchange", () => show(location.hash === "#positions" ? "positions" : "scan"));
+
 (async function start() {
   try {
     status = await api("/api/status");
@@ -656,7 +911,11 @@ $("controls").addEventListener("input", () => { $("hint").textContent = ""; });
       $("hint").textContent = preset.label + " preset applied. " + preset.about + " Press Scan.";
     },
   }, preset.label + " preset")));
-  showNotices();
+  $("position-about").textContent = "Each position is checked against the exit rules when this view opens and when Refresh is pressed, "
+    + "on the quotes of that moment. Nothing watches the market in between. "
+    + (status.positions.file ? "Positions are kept on this computer, in " + status.positions.file + "."
+      : "The demo's positions are made up and kept in memory: they are gone when the server stops.");
+  show(location.hash === "#positions" ? "positions" : "scan");
 })();
 </script>
 </body>

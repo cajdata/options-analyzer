@@ -54,6 +54,8 @@ class Settings:
     cache_dir: Path = ROOT / ".cache"
     universe_file: Path = ROOT / "data" / "universe.txt"
     aliases_file: Path = ROOT / "data" / "aliases.txt"
+    # The positions a person holds. Theirs alone, so it is kept out of the cache and out of git.
+    positions_file: Path = ROOT / "data" / "positions.json"
 
     @property
     def has_alpaca(self) -> bool:
@@ -108,4 +110,5 @@ def load_settings() -> Settings:
         ai_effort=None if effort in ("none", "off") else effort,
         watchlist=tuple(_symbols(_env("WATCHLIST"))),
         risk_free_rate=_rate(),
+        positions_file=Path(_env("POSITIONS_FILE") or Settings.positions_file).expanduser(),
     )

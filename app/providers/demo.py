@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from app import occ, pricing
 from app.analysis.earnings import spans
-from app.models import Bar, EarningsEvent, NewsItem, OptionQuote, StockQuote
+from app.models import Bar, EarningsEvent, NewsItem, OptionQuote, Position, StockQuote
 
 RATE = 0.04
 ET = ZoneInfo("America/New_York")
@@ -52,6 +52,16 @@ HEADLINES = (
 # Item codes on the made-up 8-K filings that are not earnings reports.
 FILING_ITEMS = (("5.02",), ("1.01", "9.01"), ("7.01", "9.01"), ("8.01",), ("5.07",), ("5.02", "9.01"))
 NEWS_TIMES = (clock(8, 30), clock(11, 15), clock(13, 40), clock(16, 30))
+
+# Positions the demo starts with: stock, call or put, strike, least days to expiry, side,
+# contracts, days held, and the entry price as a multiple of today's.
+SAMPLE_POSITIONS = (
+    ("CRUX", "put", 395.0, 24, "short", 1, 21, 2.40),  # most of the premium is already kept
+    ("ORBT", "call", 147.5, 10, "short", 2, 35, 1.50),  # inside the time stop
+    ("BOLT", "call", 65.0, 30, "long", 1, 6, 0.85),  # still open over a report a few days away
+    ("EMBR", "put", 29.0, 38, "short", 1, 12, 0.60),  # the stock is through the strike
+    ("FLUX", "put", 87.5, 45, "short", 1, 3, 1.08),  # nothing to act on
+)
 
 
 def _weekday(day: date) -> date:
@@ -179,45 +189,95 @@ class DemoMarket:
         spec = SPECS.get(symbol)
         if spec is None:
             return []
-        spot, upcoming, rng = spec["price"], self.next_event(symbol), random.Random(f"{symbol}-chain")
+        spot, rng = spec["price"], random.Random(f"{symbol}-chain")
         step = 0.5 if spot < 30 else 1.0 if spot < 75 else 2.5 if spot < 200 else 5.0
         strikes = [n * step for n in range(math.ceil(strike_from / step), math.floor(strike_to / step) + 1)]
-        base, event_std = spec["vol"] * 1.08, spec["jump"] * spec["pricing"]
 
         quotes: list[OptionQuote] = []
         expiry = expiry_from + timedelta(days=(4 - expiry_from.weekday()) % 7)  # first Friday
         while expiry <= expiry_to:
-            t = max((expiry - self.today).days, 0.5) / 365.0
             for strike in strikes:
-                moneyness = math.log(strike / spot)
-                skewed = base * min(1.8, max(0.6, 1.0 - 0.6 * moneyness))
-                event_var = event_std**2 if spans(expiry, upcoming) else 0.0
-                iv = math.sqrt((skewed * skewed * t + event_var) / t)
-                interest = int(4000 * math.exp(-((moneyness / 0.07) ** 2)) * (0.5 + rng.random()))
+                interest = self._interest(spot, strike, rng)
                 for kind in ("call", "put"):
-                    mid = pricing.price(kind, spot, strike, t, RATE, iv)
-                    half = max(0.01, mid * (0.012 + 0.5 * abs(moneyness)))
-                    bid = math.floor((mid - half) * 100) / 100
-                    if bid < 0.01:
-                        continue
-                    quote = OptionQuote(
-                        symbol=occ.build(symbol, expiry, kind, strike),
-                        underlying=symbol,
-                        kind=kind,
-                        strike=strike,
-                        expiry=expiry,
-                        bid=bid,
-                        ask=math.ceil((mid + half) * 100) / 100,
-                        last=round(mid, 2),
-                        volume=int(interest * 0.2 * rng.random()),
-                        open_interest=interest,
-                    )
-                    if symbol not in NO_PROVIDER_GREEKS:
-                        g = pricing.greeks(kind, spot, strike, t, RATE, iv)
-                        quote.iv, quote.delta, quote.gamma, quote.theta, quote.vega = iv, g.delta, g.gamma, g.theta, g.vega
-                    quotes.append(quote)
+                    quote = self._quote(symbol, expiry, strike, kind, interest, rng)
+                    if quote:
+                        quotes.append(quote)
             expiry += timedelta(days=7)
         return quotes
+
+    @staticmethod
+    def _interest(spot: float, strike: float, rng: random.Random) -> int:
+        return int(4000 * math.exp(-((math.log(strike / spot) / 0.07) ** 2)) * (0.5 + rng.random()))
+
+    def _quote(
+        self, symbol: str, expiry: date, strike: float, kind: str, interest: int, rng: random.Random
+    ) -> OptionQuote | None:
+        """One contract's quote, priced the same whether a chain or a single contract was asked for. None with no bid."""
+        spec, upcoming = SPECS[symbol], self.next_event(symbol)
+        spot, base, event_std = spec["price"], spec["vol"] * 1.08, spec["jump"] * spec["pricing"]
+        t = max((expiry - self.today).days, 0.5) / 365.0
+        moneyness = math.log(strike / spot)
+        skewed = base * min(1.8, max(0.6, 1.0 - 0.6 * moneyness))
+        event_var = event_std**2 if spans(expiry, upcoming) else 0.0
+        iv = math.sqrt((skewed * skewed * t + event_var) / t)
+        mid = pricing.price(kind, spot, strike, t, RATE, iv)
+        half = max(0.01, mid * (0.012 + 0.5 * abs(moneyness)))
+        bid = math.floor((mid - half) * 100) / 100
+        if bid < 0.01:
+            return None
+        quote = OptionQuote(
+            symbol=occ.build(symbol, expiry, kind, strike),
+            underlying=symbol,
+            kind=kind,
+            strike=strike,
+            expiry=expiry,
+            bid=bid,
+            ask=math.ceil((mid + half) * 100) / 100,
+            last=round(mid, 2),
+            volume=int(interest * 0.2 * rng.random()),
+            open_interest=interest,
+        )
+        if symbol not in NO_PROVIDER_GREEKS:
+            g = pricing.greeks(kind, spot, strike, t, RATE, iv)
+            quote.iv, quote.delta, quote.gamma, quote.theta, quote.vega = iv, g.delta, g.gamma, g.theta, g.vega
+        return quote
+
+    def option_quotes(self, contracts: dict[str, str]) -> dict[str, OptionQuote]:
+        """Quotes for named contracts. One that has expired, or that nobody bids for, has none."""
+        out: dict[str, OptionQuote] = {}
+        for contract, underlying in contracts.items():
+            try:
+                _, expiry, kind, strike = occ.parse(contract)
+            except ValueError:
+                continue
+            if underlying not in SPECS or expiry < self.today or strike <= 0:
+                continue
+            rng = random.Random(f"{contract}-quote")
+            quote = self._quote(underlying, expiry, strike, kind, self._interest(SPECS[underlying]["price"], strike, rng), rng)
+            if quote:
+                out[contract] = quote
+        return out
+
+    # -- Positions ----------------------------------------------------------
+
+    def sample_positions(self) -> list[Position]:
+        """Made-up positions for the positions page, one for each thing it checks.
+
+        Each entry price is a multiple of today's price, as if the contract had been
+        opened when it cost more or less than it does now.
+        """
+        out: list[Position] = []
+        for n, (symbol, kind, strike, days, side, quantity, held, multiple) in enumerate(SAMPLE_POSITIONS, 1):
+            ahead = self.today + timedelta(days=days)
+            expiry = ahead + timedelta(days=(4 - ahead.weekday()) % 7)  # the Friday on or after
+            contract = occ.build(symbol, expiry, kind, strike)
+            quote = self.option_quotes({contract: symbol}).get(contract)
+            if quote is None:
+                continue
+            entry = round((quote.bid + quote.ask) / 2.0 * multiple, 2)
+            opened = min(_weekday(self.today - timedelta(days=held)), self.today)
+            out.append(Position(f"demo{n}", symbol, kind, strike, expiry, side, quantity, entry, opened, contract))
+        return out
 
     def open_interest(self, symbol: str, **_: object) -> dict[str, int]:
         return {}  # already on each quote

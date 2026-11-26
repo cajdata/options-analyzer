@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It also types each stock's recent headlines and SEC filings by event and shows what followed earlier events of the same type. It has no order endpoints and must stay that way: it shows rules and numbers, and the person decides.
+A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It also types each stock's recent headlines and SEC filings by event and shows what followed earlier events of the same type. A positions page sets what the person already holds against the exit rules. It has no order endpoints and must stay that way: it shows rules and numbers, and the person decides.
 
 ## Commands
 
@@ -18,9 +18,11 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 .venv\Scripts\python.exe -m app scan --demo                            # command line, synthetic data
 .venv\Scripts\python.exe -m app serve --demo                           # dashboard at http://127.0.0.1:8000
 .venv\Scripts\python.exe -m app pool                                   # widen the pool news events are compared across (live: about two minutes)
+.venv\Scripts\python.exe -m app positions --demo                       # what is held, checked against the exit rules
 ```
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
+- `positions add` and `positions remove` change the positions file (`data/positions.json`, or `POSITIONS_FILE`) and need no keys. That file is the person's own and is ignored by git: never write a made-up entry to it to try something out. Use `--demo`, or a `Settings(positions_file=...)` under a temporary folder as the tests do.
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
 - `main` is protected on GitHub (since 2026-11-25): a merge needs both checks, "Python 3.11" and "Python 3.13", to have passed, for the owner too, and a push straight to `main` of a commit that has not passed them is refused. The rule names the checks by the workflow's job names. If the matrix or the job name in `tests.yml` changes, change the rule's required checks along with it, or every pull request will wait for a check that never reports. A branch does not have to be level with `main` to merge.
 - `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code. A third entry, `strike-check-site` on port 8768, serves the landing page in `docs/` with the system `python`.
@@ -35,6 +37,8 @@ One scan flows in a straight line:
 3. **Analysis** (`app/analysis/`) runs in a fixed order per symbol: `contracts` (per-contract metrics) → `earnings` (past reactions, implied move) → `risk.history_vol` (history-based volatility) → `scoring.score` → `risk.assess` (risk/reward). `scoring.rank` runs last, across all symbols. `exits.build` then draws an exit plan for each ranked contract, and `Scanner._add_news` loads news and runs `events.context` for each stock that has one. `Scanner._pool_studies` then adds those stocks to the pool (`app/pool.py`) and gives each its pooled studies.
 4. **Surfaces** read the resulting `ScanResult`: `app/server.py` (FastAPI plus `public/index.html`), `app/__main__.py` (command line), `app/ai.py` (optional Claude write-up).
 
+A review of positions is a second, shorter line through the same parts (`Scanner.review`). `positions.PositionStore` hands over what is on file. The held contracts are quoted by name (`MarketData.option_quotes`), and each stock held gets the earnings context a scan gives it (`Scanner._reports`, shared with `_analyze`). `exits.build` draws the path from the entry price, `analysis/holdings.py` sets the rules against each position, and `_add_news` adds the news. The server and the command line read the resulting `PositionsReview`. The AI brief does not.
+
 Things that are not obvious from any one file:
 
 - **The lens decides late.** `contracts.analyze_contract` produces lens-independent metrics priced at the mid. Only afterwards, in `Scanner._analyze`, does the lens ("buy" or "sell") set `pop`, `outlay`, `score` and `risk_reward`. A `ContractAnalysis` is therefore filled in across several modules.
@@ -47,6 +51,8 @@ Things that are not obvious from any one file:
 - **The dashboard builds DOM with the `el()` helper.** Never use `innerHTML` with scan data.
 - **News is typed late, like the lens.** A source returns raw `NewsItem`s. `events.classify` sets the event type afterwards, from two tables in `analysis/events.py`: `HEADLINE_RULES` (keywords, first match wins, so the order is part of the rule) and `FILING_ITEMS` (8-K item codes, most telling first). With the company's name to go by (`events.aliases`), a type also has to fit where the headline puts the company: see the invariants. Labels, the flagged types and the cautions are served by `/api/status`, so the dashboard holds no copy of them.
 - **News lives on `UnderlyingContext`** (`news`, `news_elsewhere`, `recent_events`, `event_studies`, `coverage`, `pooled_studies`, `news_note`), filled in only for a stock with a ranked contract. `Scanner(news=None)` leaves it out.
+- **A check on a position is worded once, in Python.** `PositionCheck.label` and `.detail` are made in `analysis/holdings.py`, so the page and the command line cannot word a rule two ways. The rules' titles reach the page through `/api/status`.
+- **The dashboard has two views in the one file**, Scan and Positions. Each element belongs to a view through `data-view`, `show()` switches them, and the address ends in `#positions` for the second. The notes under the controls are kept for each view (`notices`).
 - **`docs/` is the public site for strikecheck.app**, published by GitHub Pages from that folder on `main`. It is one plain HTML file with no scripts, plus `CNAME` and `.nojekyll`. Its sample table and earnings bars were copied from a `scan --demo` run and its claims come from the README, so change them together. The dashboard itself is never hosted there: it has no login and runs on the owner's keys.
 
 ## Invariants
@@ -126,6 +132,22 @@ These belong to pooling events across stocks (2026-11-25). Each has a test in `t
 - **The demo's pool lives in memory** (`MemoryCache`), never on disk, and starts with every demo stock in it.
 - **The AI brief is not given pooled studies.** They would need the prompt to say what they are, and the payload and the prompt change together or not at all.
 
+These belong to the positions page (phase 3, started 2026-11-25). Each has a test in `tests/test_positions.py`.
+
+- **The positions file is handled the opposite way to the cache.** It is the person's own and cannot be fetched again. A file that does not read is an error (`positions.StoreError`), never "no positions": read as empty, it would be written over by the next entry. An entry that does not read stays in the file as it was written and is counted in a warning. A write that fails is an error. Entries are written back as they were read, so anything a person adds to one by hand survives.
+- **Demo positions live in memory** (`positions.open_store`, `PositionStore(None)`), like the demo's pool. Demo data never reaches the disk, and the person's own file is never shown under the demo badge.
+- **A position is always listed.** `Scanner.review` catches each source on its own (stock prices, option quotes, price history, one stock's lookups) and turns a failure into a warning, and `holdings.assess` works with every input missing. An expired position gets one check and costs no request. With no keys at all the server still lists what is on file.
+- **A check that cannot be made says "unknown" and never passes.** That covers no earnings date, an estimated date just past the expiry, no ask to buy back at, and no stock price. It is skip-earnings failing closed again, and an estimated date gets `scanner.ESTIMATE_MARGIN` of room here too.
+- **A result is priced where the position would be closed**: the bid for a holder, the ask to buy back (`holdings.result`), across every contract. It comes from the quote alone, so it survives a quote the scan's math turns away. An option sold that is now nearly worthless often has no bid, and buying it back needs only the ask.
+- **Only a seller has a profit target, and only a short option is pointed out for being through its strike.** `exits.PROFIT_TARGET` is a seller's rule and no buyer's rule was made up to match it. In the money is what a holder is waiting for, so for a holder it is said and not flagged. The time stop is counted for both.
+- **A review pulls no chain.** Held contracts are asked for by name, a hundred to a request, whatever their stocks. The two rules about a quote's age apply as they do to a chain, with the newest quote among the contracts asked for setting the day.
+- **Without the chain there is no reading of what the options price for a report.** `ctx.implied_move` and `ctx.atm_iv` are None in a review, so the step across earnings in a held contract's plan is sized from past reports, and the plan carries a note saying so. This is the case `exits._place_report` already had for "no reading at all", and nothing beside it on the page shows a priced-in move to contradict.
+- **The path for a held contract is the scan's path with another entry price** (`exits.build(entry=)`). It still starts at the quoted mid. Only what a result is measured against changes. A checkpoint's result is for one contract, and `Holding.pnl` is for all of them.
+- **The strike is measured one way**: `strike / stock - 1`, as `ExitPlan.strike_distance_pct` has it. The first version of the check used `stock / strike - 1`, and the page showed 4.3% in the check and 4.1% in the plan for the same gap.
+- **A rule that is reached is a fact about the position, not an instruction.** No surface says to close, roll or hold.
+- **What the person paid and how many they hold never leave the machine.** A review sends tickers and contract symbols and nothing else, and the AI brief is not given positions.
+- **The routes that change the file take JSON only.** A form on another site can post text without the browser asking, but not JSON, and FastAPI reads a body as JSON only when it is sent as JSON. The page asks once more before removing an entry, since one cannot be brought back.
+
 ## What live data looks like
 
 Measured on 2026-11-24 after the close, with paper keys on the free plan. Use these when judging whether a result is a bug.
@@ -160,6 +182,13 @@ News, measured the same evening:
 - **The SEC gives a company's former names** in the same file as its filings (`formerNames`), each with the days it was first and last used. Seen live: "La Rosa Holdings" for Stratum Holdings (until October 2026) and "K Wave Media" for Nexus Advanced Technologies (until August 2026), both still used in most of their headlines. It also gives names from decades ago: "TRAVELERS GROUP INC" for Citigroup (1998), "BANKAMERICA CORP/DE/" and "NATIONSBANK CORP" for Bank of America, "PRICE/COSTCO INC" for Costco (1997).
 - **Both known traps showed up as flagged types that day**: INSM's buyout as `takeover`, and COST's special dividend as `split`, beside the note that 64 of its contracts were quoted on an earlier day.
 
+Positions, measured on 2026-11-25 at 11 p.m. New York time, with the same keys:
+
+- **Snapshots by contract are on the free plan** (`/v1beta1/options/snapshots?symbols=`). Three contracts on two stocks came back in one request, each with the same bid, ask, quote time, implied volatility and delta as in its stock's chain.
+- **A contract that does not exist is simply missing from the answer.** A symbol that was never listed and one that is not an option symbol at all were sent with three real ones, and the three came back as before. `AlpacaData._contract_snapshots` still asks one at a time if a batch is ever turned away, as it has to for stock snapshots. That path has only been run in a test.
+- **A snapshot by contract can come with no Greeks and no volatility**, as one in a chain can. An at-the-money BRK.B put had neither, and the app solved its own.
+- **A review of three positions on two stocks took 0.6 seconds** with their earnings history and headlines already on file.
+
 ## Working agreement
 
 - Branch off `main` for each change. Commit, push, open a pull request, merge, and delete the branch only when asked for that step. Merge with a merge commit.
@@ -190,8 +219,13 @@ The whose-news rules were run live on 2026-11-25, after the close: a scan of JPM
 
 The news layer was run live the same evening: the news endpoint with paging, 8-K filings and company names from SEC EDGAR, a foreign filer (TSM) and an ETF (SPY), the command line and the live dashboard.
 
+The positions review was run live on 2026-11-25 at 11 p.m.: `Scanner.review` on three made-up positions (two on AAPL, one on BRK.B) that were never written to the positions file. All three were priced, with a plan and every check made, and `BRK-B` options came back under the stock's own spelling. The live dashboard's Positions view was opened with nothing on file and showed the empty list and where the file is kept. Python 3.11 ran the whole test suite in a throwaway environment (`uv run --python 3.11`).
+
 Not yet verified:
 
+- **The positions page with a real position in it.** The live review went through `Scanner.review`, not through the page's form, the live `/api/positions` with something on file, or `python -m app positions` with keys.
+- **A single held contract with a quote a day or three old.** With nothing else held there is nothing to compare its quote with, and only the four-day clock rule applies. The quote's time is shown, and that is all.
+- **A held contract on the morning its strikes changed** (a split or special dividend). The same gap as for a chain, below.
 - **News during market hours.** A headline at 10 a.m. is measured from the previous close to that day's close, so the move includes whatever happened before it. The feed stamps a headline when it takes it in, in batches hours apart (see above), so how long after the story that is has not been measured, and a story from the last hour before the close can be placed on the next session. That is left as it is, by decision (see the invariant on the 4 p.m. cutoff).
 - **A cold scan of twenty heavily covered stocks.** Each can need up to 40 pages of headlines the first time (`alpaca.MAX_NEWS_PAGES`), which together could pass 200 requests a minute. `AlpacaData._get` waits and retries, and a stock that still fails gets a note and is tried again next scan. Partly seen: 446 news requests made one after another in 75 seconds went through with no failure, but a scan asks for four stocks at a time and that has not been pushed this hard.
 - **Anything during market hours.** How many quotes the exercise-value check drops while the stock is moving, how old the indicative quotes are during the session, and how soon after the open every contract has a quote from that day (until it does, the earlier-day rule leaves it out). Each stock that loses contracts that way adds its own note; if a scan soon after the open shows many, fold them into one as was done for stocks with no quotes.
@@ -213,17 +247,16 @@ In so far: typed headlines and filings, a per-stock study of what followed, the 
 - **What the whose-news rules do not settle.** A partner's or a customer's press release that name-drops the stock still counts as the stock's ("Dell Introduces Server Featuring NVIDIA ...", "... Launches at Costco"): no rule tells that from a small company's landmark deal. A company's own strategic stake is set aside with a bank's routine holdings ("GameStop Increases Economic Stake in eBay", "Pfizer Divests Stake in ViiV Healthcare"). A different company with the same name is not caught ("Oracle Commodity Holding" under ORCL). The guidance keywords cannot tell a bank's forecast for oil from its own outlook. And a takeover target is missed when the headline opens with its name but words the deal in a way `_RECEIVING` does not list.
 - **Classify with a model instead of keywords.** It would fix much of the 28% that fit no rule, at a cost per headline and with rules nobody can read. Keyword rules were chosen because the scan's rules are meant to be visible.
 
-## Next step (proposed, not approved)
+## Positions page: what is left (not started)
 
-A positions page: the person enters what they hold, and the app checks each position against the exit rules (profit target reached, time stop reached, earnings in a few days, stock through the strike). Ask before building it.
+In so far: a file of entries, a review that sets each one beside today's quotes, the four checks, the path from the entry price, the stock's news, and all of it on the page and the command line. Ask before building any of these.
 
-If it is built:
-
-- It needs a small persistent store outside `.cache/` for entries (contract, side, quantity, entry price and date). The server keeps only the last ten scans in memory.
-- Refresh held contracts with Alpaca's snapshot-by-symbols endpoint instead of pulling whole chains.
-- Reuse `exits.build` for the forward path; do not write a second repricing model.
-- The chance of reaching a target before expiry is path-dependent. If it is ever shown, it needs its own model (first-passage or simulation), never the chance of profit at expiry.
-- Early assignment around an ex-dividend date matters for short options and needs a dividend data source. The pricing currently assumes no dividends.
-- With free delayed quotes, signals are end-of-day quality, not intraday.
-
-The README roadmap lists this with paper trading as item 3, after the news layer. A positions page could reuse the news layer to say when a held stock has a flagged event.
+- **Paper trading and the journal.** The README roadmap puts them next in item 3: paper orders on Alpaca, and a record of which signals worked. Nothing here places an order, and nothing records a position after it is removed. Paper trading would be the first order endpoint in the app, so it is a decision for the person and not a next step to take unasked.
+- **Editing an entry.** An entry can be added and removed. To change one it is removed and entered again, or the file is edited by hand.
+- **Positions with more than one leg.** A spread is two entries, and their rules are not combined: the most a vertical can lose, or a covered call's shares, are not known to the page.
+- **The chance of reaching a target before expiry.** It depends on the path. If it is ever shown it needs its own model (first passage or a simulation), never the chance of profit at expiry.
+- **Early assignment around an ex-dividend date.** It matters for short options and needs a dividend data source. The pricing assumes no dividends, and the plan's note for a short call says so.
+- **What the options price for a held stock's next report.** That takes the chain around the report, which a review does not pull. It could be fetched for one position when the person asks for it.
+- **A stock price from after hours.** After 4 p.m. the strike check compares the strike with an after-hours trade while the option's quote is from the close. This is the scan's open problem too (see "What live data looks like").
+- **Anything that watches.** A review runs when the view opens or Refresh is pressed. With free delayed quotes a signal is end-of-day quality, so no timer and no alert was built.
+- **The public page in `docs/`** does not mention positions.

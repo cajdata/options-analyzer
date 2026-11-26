@@ -118,9 +118,18 @@ class _Model:
         return max(pricing.price(self.c.kind, s, self.c.strike, t, self.rate, vol), self.intrinsic(s))
 
 
-def build(c: ContractAnalysis, ctx: UnderlyingContext, lens: str, rate: float, today: date) -> ExitPlan | None:
-    """The exit plan for the buyer ("buy") or the seller ("sell") of `c`."""
-    entry = c.ask if lens == "buy" else c.bid
+def build(
+    c: ContractAnalysis, ctx: UnderlyingContext, lens: str, rate: float, today: date, entry: float | None = None
+) -> ExitPlan | None:
+    """The exit plan for the buyer ("buy") or the seller ("sell") of `c`.
+
+    With no `entry` the contract is opened now, at the fill: the ask to buy, the
+    bid to sell. For a position already held, `entry` is the price it was opened
+    at. That changes only what a result is measured against. The path itself
+    still starts at today's quoted mid.
+    """
+    if entry is None:
+        entry = c.ask if lens == "buy" else c.bid
     if entry <= 0 or c.dte < 1:
         return None
     model = _Model(c, ctx, rate, today)

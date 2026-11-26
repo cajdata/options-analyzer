@@ -7,17 +7,18 @@ import re
 import threading
 from collections import OrderedDict
 from dataclasses import asdict
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app import ai
-from app.analysis import events, exits, scoring
+from app import ai, positions
+from app.analysis import events, exits, holdings, scoring
 from app.config import ROOT, ConfigError, Settings, load_settings
-from app.models import ScanResult
-from app.scanner import PRESETS, Scanner, ScanRequest, build_scanner
+from app.models import Position, PositionsReview, ScanResult
+from app.scanner import ET, PRESETS, Scanner, ScanRequest, build_scanner
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,19 @@ class ScanBody(BaseModel):
         return list(dict.fromkeys(cleaned))
 
 
+class PositionBody(BaseModel):
+    """A position as the person enters it. `positions.make` has the last word on what is one."""
+
+    underlying: str = Field(max_length=12)
+    kind: Literal["call", "put"]
+    strike: float = Field(gt=0, lt=100_000)
+    expiry: date
+    side: Literal["long", "short"]
+    quantity: int = Field(1, ge=1, le=positions.MAX_QUANTITY)
+    entry_price: float = Field(gt=0, le=1_000_000)
+    opened: date | None = None  # today, when left out
+
+
 def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
     settings = settings or load_settings()
     app = FastAPI(title="Strike Check", docs_url=None, redoc_url=None)
@@ -60,6 +74,11 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
         scanner = build_scanner(settings, demo=demo)
     except ConfigError as err:
         setup_error = str(err)
+    # Positions can be entered and read without market data, so the store does not wait on the keys.
+    store = positions.open_store(settings, scanner.market if scanner else None)
+
+    def today() -> date:
+        return scanner.today if scanner else datetime.now(ET).date()
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -78,6 +97,12 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             "lenses": {name: cfg["weights"] for name, cfg in scoring.LENSES.items()},
             "presets": PRESETS,
             "exit_rules": {"profit_target": exits.PROFIT_TARGET, "time_stop_dte": exits.TIME_STOP_DTE},
+            "positions": {
+                "rules": holdings.RULES,
+                "earnings_soon_days": holdings.EARNINGS_SOON,
+                # Where they are kept. None: in memory, as the demo's are.
+                "file": str(store.path) if store.path else None,
+            },
             "news_sources": scanner.news.sources if scanner and scanner.news else [],
             "events": {
                 "labels": events.EVENT_TYPES,
@@ -141,5 +166,57 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
         except ai.BriefError as err:
             raise HTTPException(502, str(err)) from err
         return asdict(written)
+
+    @app.get("/api/positions")
+    def held() -> PositionsReview:
+        """Every position on file beside today's numbers. They are listed even when nothing can be priced."""
+        try:
+            found, unread = store.load()
+        except positions.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+        if scanner is None:
+            listed = [holdings.assess(p, today()) for p in found]
+            # No data source: the positions are still there to read, with the checks that need only the date.
+            review = PositionsReview(
+                datetime.now(timezone.utc), "unconfigured", None, listed, warnings=[setup_error] if setup_error else []
+            )
+        else:
+            try:
+                review = scanner.review(found)
+            except Exception as err:  # as for a scan: report it rather than a bare 500
+                log.exception("review failed")
+                raise HTTPException(502, f"Positions could not be checked: {err}") from err
+        if unread:
+            review.warnings.insert(0, positions.unread_note(unread, store.path))
+        return review
+
+    @app.post("/api/positions", status_code=201)
+    def add_position(body: PositionBody) -> Position:
+        try:
+            made = positions.make(
+                body.underlying,
+                body.kind,
+                body.strike,
+                body.expiry,
+                body.side,
+                body.quantity,
+                body.entry_price,
+                body.opened or today(),
+            )
+            return store.add(made)
+        except ValueError as err:
+            raise HTTPException(422, str(err)) from err
+        except positions.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+
+    @app.delete("/api/positions/{position_id}")
+    def remove_position(position_id: str) -> dict:
+        try:
+            removed = store.remove(position_id)
+        except positions.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+        if not removed:
+            raise HTTPException(404, "There is no position with that id.")
+        return {"removed": position_id}
 
     return app
