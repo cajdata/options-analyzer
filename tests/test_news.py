@@ -616,6 +616,10 @@ def test_a_takeover_by_name_goes_by_the_companys_own_name_and_no_other(symbol, t
         ("JPM", "JPMorgan Chase Rival Bank Cuts Full-Year Revenue Outlook"),
         ("PLTR", "Palantir Technologies Customer Tidewell Seeks $1 Billion Financing"),
         ("AAPL", "Apple's Top Chip Supplier Cuts Full-Year Revenue Outlook"),
+        # A legal ending between the name and what follows does not hide it.
+        ("AAPL", "Apple Inc.'s Supplier Foxconn Cuts Full-Year Revenue Outlook"),
+        ("AAPL", "Apple Inc. Supplier Foxconn Cuts Full-Year Revenue Outlook"),
+        ("JPM", "JPMorgan Chase & Co. Rival Bank Cuts Full-Year Revenue Outlook"),
     ],
 )
 def test_someone_else_after_the_name_is_seen_however_long_the_name_is(symbol, text):
@@ -627,6 +631,7 @@ def test_someone_else_after_the_name_is_seen_however_long_the_name_is(symbol, te
     # The company's own news, under the same long name, still counts.
     own = text.split(" Supplier ")[0].split("'s ")[0].split(" Partner ")[0].split(" Rival ")[0].split(" Customer ")[0]
     assert events.headline_type(own + " Raises Full-Year Revenue Guidance", names, NOBODY) == "guidance"
+    assert events.headline_type(own + "'s Services Unit Raises Full-Year Revenue Guidance", names, NOBODY) == "guidance"
 
 
 def test_another_name_is_given_whole():
