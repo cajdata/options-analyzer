@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It also types each stock's recent headlines and SEC filings by event and shows what followed earlier events of the same type. A positions page sets what the person already holds against the exit rules. It has no order endpoints and must stay that way: it shows rules and numbers, and the person decides.
+An options scanner. It pulls option chains from Alpaca, ranks contracts by visible rules, and sets each stock's earnings history beside what the options price in. It also types each stock's recent headlines and SEC filings by event and shows what followed earlier events of the same type. A positions page sets what the person already holds against the exit rules. Since phase 4 (started 2026-11-26) a paper view sends orders to Alpaca's paper account, and a journal records what the scan showed for each paper trade and how it ended.
+
+It can send one kind of order: a limit order to the paper account, which holds pretend money, that the person has written out and confirmed. It has no way to send an order to a live account and must stay that way until phase 5 is asked for. Everything else only reads. It shows rules and numbers, and the person decides: nothing in it sends, cancels or closes anything on its own.
 
 ## Commands
 
@@ -19,10 +21,14 @@ The project uses the virtual environment in `.venv` (Windows, PowerShell).
 .venv\Scripts\python.exe -m app serve --demo                           # dashboard at http://127.0.0.1:8000
 .venv\Scripts\python.exe -m app pool                                   # widen the pool news events are compared across (live: about two minutes)
 .venv\Scripts\python.exe -m app positions --demo                       # what is held, checked against the exit rules
+.venv\Scripts\python.exe -m app paper --demo                           # the paper account, the journal, which signals worked
+.venv\Scripts\python.exe -m app paper --demo open CRUX 2026-12-18 400 put --sell   # writes an order out; --send sends it
 ```
 
 - `--demo` uses the synthetic provider and needs no keys. Without it the app needs Alpaca keys in `.env` (see `.env.example`).
 - `positions add` and `positions remove` change the positions file (`data/positions.json`, or `POSITIONS_FILE`) and need no keys. That file is the person's own and is ignored by git: never write a made-up entry to it to try something out. Use `--demo`, or a `Settings(positions_file=...)` under a temporary folder as the tests do.
+- `paper open`, `paper close` and `paper cancel` reach the paper account. Without `--demo` that is the person's real Alpaca paper account, and with `--send` an order goes to it. Never run one of those without `--demo` unless the person asked for that order: see the working agreement. `--demo` goes straight after `paper`, and its account and journal live in memory for that one run.
+- The journal (`data/journal.json`, or `JOURNAL_FILE`) is the person's own, like the positions file, and git ignores it. Never write a made-up trade to it. Use `--demo`, or a `Journal` under a temporary folder as the tests do.
 - No linter is configured. CI (`.github/workflows/tests.yml`) runs pytest on Python 3.11 and 3.13 for every pull request, so code must run on 3.11.
 - `main` is protected on GitHub (since 2026-11-25): a merge needs both checks, "Python 3.11" and "Python 3.13", to have passed, for the owner too, and a push straight to `main` of a commit that has not passed them is refused. The rule names the checks by the workflow's job names. If the matrix or the job name in `tests.yml` changes, change the rule's required checks along with it, or every pull request will wait for a check that never reports. A branch does not have to be level with `main` to merge.
 - `.claude/launch.json` defines two dashboards for the preview tools: `strike-check-demo` on port 8765 (synthetic data) and `strike-check-live` on port 8766 (needs the keys in `.env`). The server does not reload: restart it after changing Python code. A third entry, `strike-check-site` on port 8768, serves the landing page in `docs/` with the system `python`.
@@ -39,6 +45,8 @@ One scan flows in a straight line:
 
 A review of positions is a second, shorter line through the same parts (`Scanner.review`). `positions.PositionStore` hands over what is on file. The held contracts are quoted by name (`MarketData.option_quotes`), and each stock held gets the earnings context a scan gives it (`Scanner._reports`, shared with `_analyze`). `exits.build` draws the path from the entry price, `analysis/holdings.py` sets the rules against each position, and `_add_news` adds the news. The server and the command line read the resulting `PositionsReview`. The AI brief does not.
 
+Paper trading is a third line, and the only one that sends anything. `paper.PaperDesk` writes an order out as a `Ticket` (`write_open` from a contract in a `ScanResult`, `write_close` from a journal entry), and `send` takes a ticket's id and hands the order to `broker.AlpacaPaper`, or to `broker.DemoBroker` in the demo. `journal.Journal` keeps each `Trade`. `PaperDesk.review` reads the account's orders and positions, brings the journal up to date (`paper.reconcile`), sets what the account holds against the exit rules through `Scanner.review`, and sums up the closed trades (`analysis/signals.py`). The server, the page's Paper view and `python -m app paper` read the resulting `PaperReview`. The AI brief does not.
+
 Things that are not obvious from any one file:
 
 - **The lens decides late.** `contracts.analyze_contract` produces lens-independent metrics priced at the mid. Only afterwards, in `Scanner._analyze`, does the lens ("buy" or "sell") set `pop`, `outlay`, `score` and `risk_reward`. A `ContractAnalysis` is therefore filled in across several modules.
@@ -53,6 +61,8 @@ Things that are not obvious from any one file:
 - **News lives on `UnderlyingContext`** (`news`, `news_elsewhere`, `recent_events`, `event_studies`, `coverage`, `pooled_studies`, `news_note`), filled in only for a stock with a ranked contract. `Scanner(news=None)` leaves it out.
 - **A check on a position is worded once, in Python.** `PositionCheck.label` and `.detail` are made in `analysis/holdings.py`, so the page and the command line cannot word a rule two ways. The rules' titles reach the page through `/api/status`.
 - **The dashboard has two views in the one file**, Scan and Positions. Each element belongs to a view through `data-view`, `show()` switches them, and the address ends in `#positions` for the second. The notes under the controls are kept for each view (`notices`).
+- **The page draws two lists of held positions with one function.** `BOOKS` names the table, the detail pane and the open row of each: what the person entered (Positions) and what the paper account holds (Paper). `renderHoldings` and `showHolding` take the review and the book, so a fix to one list is a fix to both.
+- **The file handling for the positions and the journal is one class** (`store.ListFile`). `PositionStore` and `Journal` say what an entry means, and share how a file is read, written and refused.
 - **`docs/` is the public site for strikecheck.app**, published by GitHub Pages from that folder on `main`. It is one plain HTML file with no scripts, plus `CNAME` and `.nojekyll`. Its sample table and earnings bars were copied from a `scan --demo` run and its claims come from the README, so change them together. The dashboard itself is never hosted there: it has no login and runs on the owner's keys.
 
 ## Invariants
@@ -169,6 +179,32 @@ A second review the same day read those fixes and found four more points and a n
 - **The calendar note is repeated only when a stock's dates were looked up to the end.** A lookup that fails on the earnings history never reaches the calendar, and since the first fix its stock is kept, so "a stock was looked up" was no longer the right test.
 - **Only a quote with a time can be outdated.** A snapshot with no quote in it at all is left out of the answer when every dated quote is too old, and comes back as it is, unmarked, on an ordinary day.
 
+These belong to paper trading (phase 4, started 2026-11-26). Each has a test in `tests/test_paper.py`.
+
+- **One module sends an order, and it knows one host.** `app/broker.py` is the only file with an order endpoint in it, and `PAPER_URL` is the only address it has. The address is not a setting and `AlpacaPaper` takes none. With `ALPACA_PAPER` off there is no broker at all (`paper.build_desk`, `paper.LIVE_KEYS`): the app scans, reads the journal, and sends nothing. A test reads the source for both. `providers/` stays read-only, as its docstring says.
+- **Every order is the person's, and is sent once.** An order is written out first as a `Ticket` (`PaperDesk.write_open`, `write_close`), which sends nothing and writes nothing. `PaperDesk.send` takes a ticket's id and nothing else, uses the ticket up, and turns away one older than `paper.TICKET_MINUTES`. So what reaches the broker is what was shown, and a second click or a replayed request sends nothing. `POST /api/paper/orders` is the one route that sends, and on the command line nothing is sent without `--send`.
+- **Looking never sends or cancels.** `PaperDesk.review`, a scan, and a rule being reached send no order. A test runs reviews over a position whose profit target is reached and counts the orders.
+- **The two routes that write an order out or send one take JSON only**, as the positions routes do, and the server makes up neither a quantity nor a price: both come from what the person was shown.
+- **An order is a day limit order for whole contracts of one option, priced in whole cents** (`broker.check`, and `PaperDesk._sized` before it). There is no market order, no order that outlives the session, no second leg and no stock order.
+- **Sending is never retried.** A request that timed out may have arrived, and a second one would be a second order. `BrokerError.refused` says which it was: the account answered and said no, or nobody can tell. A 5xx is "nobody can tell". Reading is retried like any other lookup.
+- **The journal is written before the order leaves**, so an order is never out there with no record of it. An order the account turns down outright is taken back out of the journal: nothing happened. One whose answer was lost stays as ordered, and the next review asks the account for it by the id this app gave it (`paper.open_id`, `Broker.order`).
+- **Only the account saying it never had an order makes it one that never arrived.** An order the account confirmed and that is missing from its list is waited for. An order that cannot be asked after is waited for. Neither is written off (`paper.reconcile`, `find`).
+- **An order still working changes nothing in the journal, however much of it has filled.** A trade is open once its order has ended, at the account's average fill and for as many contracts as filled, and a closing order becomes an exit the same way. While a closing order is working, contracts missing from the account are taken to be that order's, and nothing else is concluded about them.
+- **Opening goes through a scan.** A paper trade is opened from a contract in a `ScanResult` (the page's scan in memory, or a one-stock scan the command line runs), so the journal always has what the scan showed. `signals.snapshot` copies it as plain values, and the copy is never recomputed: a later change to a weight does not rewrite what was shown.
+- **The rules reached at the close are read when the closing order is sent** (`PaperDesk._rules_now`), and go with the order to the exit. When they cannot be read they are None, "not on record", and never guessed. The order is sent either way: it is the person's.
+- **The journal file is handled like the positions file**, by the same class (`store.ListFile`). A file that does not read is an error, an entry that does not read stays as written and is counted, an entry repeating an id is never changed with the first, and anything added to an entry by hand survives a save. The demo's journal and account live in memory.
+- **The result on file is never trusted over the exits.** `journal.settle` works out the state, the result and `stands` from the exits every time an entry is read or written. A result is an amount in cents (`round(..., 2)`): 100 times (1.03 less 0.52) is 51.00000000000001 in floating point.
+- **Contracts the account no longer holds are accounted for in a fixed order** (`paper._unheld`): by a filled order this app did not send (the trade was closed at Alpaca), else at expiry, else as "unknown" with no price. An order from before the trade opened, and one already counted, are not used. With two trades on one contract the older is closed first.
+- **Nothing is concluded when the account's positions could not be read.** `reconcile` is handed None for them and skips that pass. Read as "holds nothing", every open trade would be written off.
+- **A trade held to expiry is settled at what exercising it paid at that day's close**, which is how a scan scores a contract. Until that day's bar is final the trade waits as it is. The shares an exercise or assignment leaves behind are not followed, and the entry's note says so.
+- **An exit with no price gives no result, and the trade is counted nowhere** (`signals.counted`). Nothing is made up for it.
+- **Paper and real are never mixed.** The desk does not read or write the positions file. What the paper account holds is reviewed through the same `Scanner.review` and `holdings.assess`, as `Position`s built from the account (`PaperDesk._position`). A share class goes by the stock's own spelling from the journal (BRK.B), since an option's symbol has no dot.
+- **The summary of which signals worked keeps four promises** (`analysis/signals.py`). Bought and sold options are never counted together. Below `signals.MIN_TRADES` a row says "too few" on every surface. Each row sits beside the row for every closed trade of its lens. And nothing in it feeds `scoring.score` or `risk.assess`: the journal is beside the score and the rating, never in them.
+- **A trade's standing is worded once, in Python** (`Trade.stands`, from `journal._stands`), as a check on a position is.
+- **A call sold to open is said to need the shares before it is sent**, and the demo's account turns it down as Alpaca does.
+- **What leaves the machine.** A paper order sends its contract, its number of contracts and its limit to Alpaca's paper account. That is the only place a quantity or a price is sent. What the person really holds and paid still never leaves, and the AI brief is given neither the journal nor the paper account.
+- **On the page, an order is sent from one place** (`orderBox`). Send and the button beside it are off from the first click, a failed send leaves Send off because the ticket is used up, and an answer about the paper account that is not the newest load's is dropped (`paperLoads`).
+
 ## What live data looks like
 
 Measured on 2026-11-24 after the close, with paper keys on the free plan. Use these when judging whether a result is a bug.
@@ -210,6 +246,18 @@ Positions, measured on 2026-11-25 at 11 p.m. New York time, with the same keys:
 - **A snapshot by contract can come with no Greeks and no volatility**, as one in a chain can. An at-the-money BRK.B put had neither, and the app solved its own.
 - **A review of three positions on two stocks took 0.6 seconds** with their earnings history and headlines already on file.
 
+Paper trading, from Alpaca's documentation as read on 2026-11-26. None of it has been run against the paper account: see "Verified live, and not yet".
+
+- **An option order** goes to `POST /v2/orders` with `symbol` (the OCC symbol), `qty` as text, `side`, `type`, `time_in_force`, `limit_price` as text, `position_intent` (`buy_to_open`, `sell_to_open`, `buy_to_close`, `sell_to_close`) and `client_order_id` (128 characters at most). The quantity must be whole, extended hours are refused, and a market order is taken only during market hours. The app sends `limit` and `day` only.
+- **The pages disagree with each other in places.** One lists market and limit orders and `day` only, another adds stop orders and `gtc`. One says do-not-exercise goes through the API, another through support. One has orders that open a position stopping at 3:30 p.m. on expiry day, another has a sell-out "within 1 hour before expiry".
+- **The account answers with numbers as text** (`"qty": "2"`, `"filled_avg_price": "2.05"`), and `filled_avg_price` can be null.
+- **An order that will not change again** is `filled`, `canceled`, `expired` or `rejected`. `broker.DONE` adds `replaced`. Everything else is treated as working, `done_for_day` included.
+- **A position** has `asset_class` `us_option`, `side` `long` or `short`, and `avg_entry_price` per share (inferred from the example: 2 contracts at 6.05 have a `cost_basis` of 1210). Whether `qty` is negative for a short position is not stated, so `broker.py` reads the side and takes a negative count as short too.
+- **Options levels.** 1: covered calls and cash-secured puts. 2: also buying calls and puts. 3: also spreads. A paper account has options on by default, at a level the pages do not give. Refusals come with the reason in words ("insufficient options buying power for cash-secured put (required: 20310, available: 9395)", "insufficient underlying qty available for covered call (required: 100, available: 0)"), and the app shows them as they are.
+- **Paper fills.** An order fills only when it becomes marketable, against real-time quotes, whatever its size. One time in ten a fill is partial, for a random amount. The page about paper trading does not mention options at all.
+- **At expiry** an option in the money by a cent or more is exercised or assigned, and a long one the account cannot afford to exercise is sold first. Exercise, assignment and expiry are recorded as account activities (`OPEXC`, `OPASN`, `OPEXP`), which a paper account shows only the next day. The app does not read them.
+- **The reference pages for listing orders, getting one, and cancelling one could not be opened** (404 on 2026-11-26). `GET /v2/orders` with `status`, `limit`, `after` and `direction`, `GET /v2/orders:by_client_order_id`, and `DELETE /v2/orders/{id}` answering 204, or 422 when it is too late, are written from memory of the API.
+
 ## Working agreement
 
 - Branch off `main` for each change. Commit, push, open a pull request, merge, and delete the branch only when asked for that step. Merge with a merge commit.
@@ -217,6 +265,8 @@ Positions, measured on 2026-11-25 at 11 p.m. New York time, with the same keys:
 - Auto-merge is allowed on the repository, and with the rule on `main` it has the two required checks to wait for. Turn it on only when asked, and with the merge-commit method: the default is squash.
 - Auto-merge has to be turned on while a required check is still running. The two checks finish in about a minute, and once they have passed GitHub refuses it ("Pull request is in clean status"). That happened on three pull requests (#15, #17, #18), each time because it was asked for after the pull request was already open. It first took on #19 (2026-11-26), asked for straight after the pull request opened, and GitHub merged it with a merge commit when the second check passed. So if auto-merge is wanted, ask for it with the pull request, and turn it on in the same step that opens it. If it is refused because the checks have already passed, merging directly with a merge commit gives the same result.
 - Do not place trades, and do not say what to trade. Explanations of the numbers are welcome.
+- That covers paper orders. Sending one is the person's step: the Send button on the page, or `--send`. Decided 2026-11-26, when phase 4 was started: asked whether an order should ever be sent without the person pressing a button for that one order, the answer was no. So try the order path on the demo account, on the tests' stand-in (`Account` in `tests/test_paper.py`), or by writing an order out without sending it. Ask before sending one to the real paper account, even to check a fix, and say which order.
+- Reading the paper account (`python -m app paper`, the Paper view) sends nothing, but it does write: it brings the person's journal up to date. That is what it is for, and it is fine to run when the person asks to see the account.
 - There is no screenshot or OCR path, by decision. Do not add one.
 - Keep dependencies minimal, and the dashboard as one vanilla-JS file.
 - When an outside review arrives, reproduce its claims against the code before acting on them.
@@ -242,7 +292,16 @@ The news layer was run live the same evening: the news endpoint with paging, 8-K
 
 The positions review was run live on 2026-11-25 at 11 p.m.: `Scanner.review` on three made-up positions (two on AAPL, one on BRK.B) that were never written to the positions file. All three were priced, with a plan and every check made, and `BRK-B` options came back under the stock's own spelling. The live dashboard's Positions view was opened with nothing on file and showed the empty list and where the file is kept. Python 3.11 ran the whole test suite in a throwaway environment (`uv run --python 3.11`).
 
+Paper trading (2026-11-26) has run on the demo account and on a stand-in in the tests, and nowhere else. On the demo dashboard a trade was closed from the Paper view, another was opened from a scan with a limit that could not fill, and that order was cancelled, each through the page's own buttons. `python -m app paper --demo` ran with `open`, `close` and `cancel`. Python 3.11 ran the whole test suite in a throwaway environment.
+
 Not yet verified:
+
+- **Anything in `broker.AlpacaPaper` against Alpaca.** No request has been made to the paper account for orders, positions or the account, and no order has been sent. The field names come from Alpaca's documentation and three endpoints from memory (see "What live data looks like"). The first run should be the person's: `python -m app paper` to read the account, then one order written out and sent by them.
+- **A paper fill.** Whether an order at the quoted ask fills at once on a delayed quote, what a partial fill looks like in the list, and whether `filled_at` is set on it.
+- **A short position's `qty`**, and whether `position_intent` comes back on an order.
+- **What Alpaca does at expiry, as the app sees it.** Whether a sell-out before expiry shows as an order (it would then be read as a close at that price), and how soon an expired position leaves the account.
+- **A reset of the paper account.** Every open trade should close as "left the account with no order on record".
+- **The Paper view against a live paper account**, and the journal file being written by it.
 
 - **The positions page with a real position in it.** The live review went through `Scanner.review`, not through the page's form, the live `/api/positions` with something on file, or `python -m app positions` with keys.
 - **A single held contract with a quote a day or three old.** With nothing else held there is nothing to compare its quote with, and only the four-day clock rule applies. The quote's time is shown, and that is all.
@@ -273,7 +332,7 @@ In so far: typed headlines and filings, a per-stock study of what followed, the 
 
 In so far: a file of entries, a review that sets each one beside today's quotes, the four checks, the path from the entry price, the stock's news, and all of it on the page and the command line. Ask before building any of these.
 
-- **A record of a position after it is closed.** An entry is removed and nothing of it is kept. The journal that would keep it is part of phase 4, below.
+- **A record of a real position after it is closed.** An entry is removed and nothing of it is kept. The journal (phase 4) records paper trades only, by decision: it is not given the positions file.
 - **Editing an entry.** An entry can be added and removed. To change one it is removed and entered again, or the file is edited by hand.
 - **Positions with more than one leg.** A spread is two entries, and their rules are not combined: the most a vertical can lose, or a covered call's shares, are not known to the page.
 - **The chance of reaching a target before expiry.** It depends on the path. If it is ever shown it needs its own model (first passage or a simulation), never the chance of profit at expiry.
@@ -283,17 +342,32 @@ In so far: a file of entries, a review that sets each one beside today's quotes,
 - **Anything that watches.** A review runs when the view opens or Refresh is pressed. With free delayed quotes a signal is end-of-day quality, so no timer and no alert was built.
 - **The public page in `docs/`** does not mention positions.
 
-## Phases 4 and 5: paper trading, then live trading (not started, not approved)
+## Phase 4: paper trading (started 2026-11-26)
 
-The README roadmap numbers them so, since 2026-11-26:
+Asked for on 2026-11-26. Three things were decided with the person before anything was built:
 
-- **Phase 4** is paper trading on Alpaca, with a journal that records which signals worked.
-- **Phase 5** is live trading, with a human approval on every order.
+- **Every order is the person's.** No order is sent without them pressing a button for that one order. The app may not open a trade from a scan on its own, and may not close one when a rule is reached.
+- **Paper trades have their own view**, read from the paper account. `data/positions.json` stays for what is really held, and the two are never mixed.
+- **The journal follows paper trades only.** Following every ranked contract with no order, priced at later quotes, was offered and turned down for now. It would give far more data, with no bias from what the person picked.
 
-Until then paper trading was the second half of item 3, beside the positions page, and live trading was item 4. Paper trading was given its own number because it is a different kind of step. Everything through phase 3 only reads market data, and phase 4 would add the app's first order endpoint. So phase 3 is the positions page alone, and it is done.
+"What this is" and the working agreement were rewritten on that basis. The wording is a draft until the person has read it.
 
-Neither is a next step to take unasked. Ask before building any of it, and when it is asked for:
+In so far: the broker, the journal, the desk between them, the Paper view, `python -m app paper`, and the summary of which signals worked. Ask before building any of these:
 
-- **"What this is" at the top of this file says the app has no order endpoints and must stay that way, and the working agreement says not to place trades.** Both hold until the person says otherwise. Phase 4 changes them, so they are rewritten with the person as part of that work, not worked around.
-- **Phase 4 is paper orders only.** A real order belongs to phase 5, where every one needs a human approval.
-- **The journal is what phase 3 leaves out.** Nothing records a position after it is removed, so nothing can yet say which signals worked.
+- **A covered call.** A call sold to open needs 100 shares in the paper account, and the app sends no stock orders. So a paper trade under the sell lens is a cash-secured put, unless the person buys the shares at Alpaca first.
+- **Any order but a day limit order for one option.** No market orders, none that lasts past the day, no spreads, no rolling a trade in one step, and no changing an order that is working: it is cancelled and written out again.
+- **Closing part of a trade.** A closing order is for everything that is left.
+- **Shares after expiry.** An option that expires in the money is exercised or assigned, and the paper account then holds shares or is short them. The journal settles the trade at that day's close and says so. Nothing shows or closes the shares.
+- **A position opened at Alpaca itself.** It is listed, and has no journal entry and no way to close it from here.
+- **Anything that watches.** A review runs when the view opens or Refresh is pressed, as for positions.
+- **The readings the summary sorts by.** `signals.GROUPS` has six, with fixed bands (`SCORE_BANDS`, `POP_BANDS`). Delta, days to expiry, the score's components and the size of the spread are in each entry's `signals` and are not summed up yet.
+- **The journal in the AI brief.** It is not given the journal or the paper account.
+- **Real positions in the journal.** See "Positions page: what is left".
+- **The public page in `docs/`** says the app cannot place a real order, and still calls it read-only in its title and its heading. It does not describe paper trading.
+
+## Phase 5: live trading (not started, not approved)
+
+The README roadmap has it as live trading with a human approval on every order. It is not a next step to take unasked. When it is asked for:
+
+- **`app/broker.py` knows one host, and that is the guard.** Phase 5 changes it, so it is changed with the person as part of that work, not worked around. The same goes for "What this is" and the working agreement.
+- **Nothing learned on paper carries over as proof.** Paper fills ignore size and queue, and move nothing.

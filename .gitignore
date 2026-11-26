@@ -6,5 +6,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# What the person holds. Theirs alone: never committed.
+# What the person holds, and the paper trades they have made. Theirs alone: never committed.
 data/positions.json
+data/journal.json

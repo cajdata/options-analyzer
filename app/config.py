@@ -56,6 +56,8 @@ class Settings:
     aliases_file: Path = ROOT / "data" / "aliases.txt"
     # The positions a person holds. Theirs alone, so it is kept out of the cache and out of git.
     positions_file: Path = ROOT / "data" / "positions.json"
+    # The paper trades a person has made, and how each ended. Theirs alone as well, and kept the same way.
+    journal_file: Path = ROOT / "data" / "journal.json"
 
     @property
     def has_alpaca(self) -> bool:
@@ -111,4 +113,5 @@ def load_settings() -> Settings:
         watchlist=tuple(_symbols(_env("WATCHLIST"))),
         risk_free_rate=_rate(),
         positions_file=Path(_env("POSITIONS_FILE") or Settings.positions_file).expanduser(),
+        journal_file=Path(_env("JOURNAL_FILE") or Settings.journal_file).expanduser(),
     )

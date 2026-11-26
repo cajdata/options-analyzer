@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Strike Check: a read-only options scanner</title>
-<meta name="description" content="Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and shows each stock's past earnings moves next to what the options are pricing in. It runs on your own computer and can't place orders.">
+<meta name="description" content="Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and shows each stock's past earnings moves next to what the options are pricing in. It runs on your own computer and can't place a real order.">
 <link rel="canonical" href="https://strikecheck.app/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Strike Check: a read-only options scanner">
-<meta property="og:description" content="Ranks option contracts by rules you can see, with each stock's past earnings moves next to what the options are pricing in. It can't place orders.">
+<meta property="og:description" content="Ranks option contracts by rules you can see, with each stock's past earnings moves next to what the options are pricing in. It can't place a real order.">
 <meta property="og:url" content="https://strikecheck.app/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5fbf'/%3E%3Cpath d='M9 16.5l5 5 9-11' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
@@ -87,7 +87,7 @@
 
 <section class="hero">
   <h1>A read-only options scanner</h1>
-  <p class="lede">Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and puts each stock's past earnings moves next to what the options are pricing in for the next report. It runs on your own computer and it can't place orders.</p>
+  <p class="lede">Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and puts each stock's past earnings moves next to what the options are pricing in for the next report. It runs on your own computer and it can't place a real order.</p>
   <div class="actions">
     <a class="button primary" href="#try">Try the demo</a>
     <a class="button" href="https://github.com/cajdata/strike-check">Source on GitHub</a>
@@ -161,7 +161,7 @@
 <section>
   <h2>What it doesn't do</h2>
   <ul>
-    <li><strong>It can't place orders.</strong> It only reads market data and has no way to send an order.</li>
+    <li><strong>It can't place a real order.</strong> It reads market data. The one kind of order it can send goes to Alpaca's paper account, which holds pretend money, and only after you have confirmed that one order.</li>
     <li><strong>It doesn't tell you what to trade.</strong> The ranking is a screen. It isn't a forecast and it isn't financial advice.</li>
     <li><strong>There's no hosted version.</strong> It runs on your own computer with your own free Alpaca keys.</li>
     <li><strong>Free quotes aren't live.</strong> Alpaca's free option feed is indicative: quotes are modified and trades are 15 minutes delayed. Screen with it, then check the live quote at your broker.</li>

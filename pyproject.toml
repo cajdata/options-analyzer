@@ -1,7 +1,7 @@
 [project]
 name = "strike-check"
 version = "0.2.0"
-description = "Read-only options scanner with earnings context"
+description = "Options scanner with earnings context, and paper trading with a journal"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
