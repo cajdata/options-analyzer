@@ -96,13 +96,27 @@ def _rate() -> float:
     return rate
 
 
+def _paper() -> bool:
+    """Whether the Alpaca keys are a paper account's. It is yes or no, and anything else is said to be wrong.
+
+    Every word that was not "0", "false" or "no" used to count as yes, so `ALPACA_PAPER=off` left the app
+    treating a live account's keys as a paper account's.
+    """
+    text = (_env("ALPACA_PAPER") or "true").lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"ALPACA_PAPER must be true or false, not {text!r}.")
+
+
 def load_settings() -> Settings:
     load_dotenv(ROOT / ".env")
     effort = (_env("AI_EFFORT") or "high").lower()
     return Settings(
         alpaca_key=_env("ALPACA_API_KEY", "APCA_API_KEY_ID"),
         alpaca_secret=_env("ALPACA_SECRET_KEY", "APCA_API_SECRET_KEY"),
-        alpaca_paper=(_env("ALPACA_PAPER") or "true").lower() not in ("0", "false", "no"),
+        alpaca_paper=_paper(),
         options_feed=(_env("ALPACA_OPTIONS_FEED") or "indicative").lower(),
         stock_feed=(_env("ALPACA_STOCK_FEED") or "iex").lower(),
         alphavantage_key=_env("ALPHAVANTAGE_API_KEY"),

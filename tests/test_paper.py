@@ -18,9 +18,9 @@ from fastapi.testclient import TestClient
 from app import broker, journal, paper
 from app.analysis import signals
 from app.broker import AlpacaPaper, BrokerError, DemoBroker
-from app.config import Settings, load_settings
+from app.config import ConfigError, Settings, load_settings
 from app.journal import Journal, StoreError
-from app.models import ClosingOrder, Exit, Order, PaperAccount, PaperHolding, Trade
+from app.models import ClosingOrder, Exit, Order, PaperAccount, PaperHolding, PaperReview, Trade
 from app.paper import PaperDesk, PaperError, reconcile
 from app.providers.demo import DemoMarket
 from app.scanner import ScanRequest, build_scanner
@@ -196,8 +196,8 @@ def test_what_is_not_an_order_never_leaves(symbol, side, intent, quantity, limit
 def test_reading_is_retried_and_reads_what_the_account_sends():
     answers = iter([httpx.Response(503), httpx.Response(200, json=[ROW, {**ROW, "id": "a-stock", "asset_class": "us_equity", "symbol": "XYZ"}, "stray"])])
     account, seen = account_on(lambda request: next(answers))
-    (found,) = account.orders(NOW - timedelta(hours=1))
-    assert len(seen) == 2 and found.id == ROW["id"]  # the stock order and the stray line are passed over
+    (found,), whole = account.orders(NOW - timedelta(hours=1))
+    assert len(seen) == 2 and found.id == ROW["id"] and whole  # the stock order and the stray line are passed over
     assert seen[1].url.params["status"] == "all" and seen[1].url.params["after"] == "2026-11-24T14:00:00Z"
 
     rows = [
@@ -241,9 +241,12 @@ def test_cancelling_says_when_it_is_too_late():
         with pytest.raises(BrokerError, match=said):
             account.cancel(ROW["id"])
     account, seen = account_on(lambda request: httpx.Response(204))
-    with pytest.raises(BrokerError):
+    with pytest.raises(BrokerError) as caught:
         account.cancel("../account")  # not an id, so nothing is asked
-    assert seen == []
+    assert seen == [] and (caught.value.status, caught.value.refused) == (422, True)
+    with pytest.raises(PaperError) as caught:
+        PaperDesk(Journal(None), None, account).cancel("../account")
+    assert caught.value.status == 422  # what was asked is wrong. It used to answer 502, as if Alpaca had failed.
 
 
 def test_the_demo_account_fills_at_its_quote_or_waits_and_holds_no_shares():
@@ -307,7 +310,8 @@ def test_a_result_is_worked_out_from_the_exits():
 
     bought = held(side="long", limit=3.00)
     bought.exits.append(Exit(1, 1.20, NOW + timedelta(days=5), "order", ()))
-    assert (journal.settle(bought).pnl, bought.pnl_pct, bought.stands) == (-180.0, -0.6, "before either rule was reached")
+    # Only a seller has a profit target, so a bought option has one rule to be ahead of, and is not said to have two.
+    assert (journal.settle(bought).pnl, bought.pnl_pct, bought.stands) == (-180.0, -0.6, "before the time stop")
 
     # With no price on record for an exit there is no result, and nothing is made up for one.
     gone = held()
@@ -418,7 +422,8 @@ def test_an_order_still_working_changes_nothing_however_much_has_filled():
 
 
 def test_an_order_whose_answer_was_lost_is_asked_after_and_never_guessed_at():
-    # The account confirmed this one, and the list does not have it: it is waited for, never written off.
+    # The account confirmed this one, and the list does not have it. It is asked after by name, since a long
+    # list can be cut short. But the account took it once, so "no such order" is no answer: it is waited for.
     confirmed = trade()
     confirmed.open_order = "the-account-has-it"
     asked: list[str] = []
@@ -427,7 +432,11 @@ def test_an_order_whose_answer_was_lost_is_asked_after_and_never_guessed_at():
         asked.append(client_id)
         return None
 
-    assert reconcile([confirmed], [], None, TODAY, NOW, lookup=never_arrived) == [] and asked == []
+    assert reconcile([confirmed], [], None, TODAY, NOW, lookup=never_arrived) == [] and asked == [paper.open_id(confirmed)]
+    assert (confirmed.state, confirmed.note) == ("ordered", None)
+    reconcile([confirmed], [], None, TODAY, NOW, lookup=lambda client_id: order(confirmed))
+    assert (confirmed.state, confirmed.entry_price) == ("open", 2.0)  # found by name, though the list did not have it
+    asked.clear()
 
     # No answer came back for this one. Only when the account says it never had it is it taken to have never arrived.
     lost = trade()
@@ -593,6 +602,8 @@ class Account:
         self.sent: list[tuple] = []  # every order submitted, as it was
         self.fills, self.turns_down, self.loses_the_answer, self.arrives = True, None, False, True
         self.readable = True
+        self.whole = True  # False: the list of orders was cut short
+        self.read: list[str] = []  # what a review read, in the order it read it
         self.listed: dict[str, Order] = {}
         self.holds: dict[tuple[str, str], int] = {}
         self.paid: dict[tuple[str, str], float] = {}  # what each position was opened at
@@ -602,12 +613,14 @@ class Account:
         return PaperAccount(3, 50_000.0)
 
     def positions(self) -> list[PaperHolding]:
+        self.read.append("positions")
         if not self.readable:
             raise BrokerError("could not be reached")
         return [PaperHolding(*key, count, self.paid.get(key, 2.0)) for key, count in self.holds.items() if count]
 
-    def orders(self, since: datetime) -> list[Order]:
-        return list(self.listed.values())
+    def orders(self, since: datetime) -> tuple[list[Order], bool]:
+        self.read.append("orders")
+        return list(self.listed.values()), self.whole
 
     def order(self, client_id: str) -> Order | None:
         return next((o for o in self.listed.values() if o.client_id == client_id), None)
@@ -814,9 +827,9 @@ def test_a_review_sets_what_the_account_holds_against_the_exit_rules(desk, scan)
     review = desk.review()
     assert (review.mode, review.can_order, review.account) == ("demo", True, PaperAccount(3, 50_000.0))
     mine, other = review.positions.holdings
-    assert (mine.position.id, mine.position.side, mine.position.quantity) == (idea.symbol, "short", 2)
+    assert (mine.position.id, mine.position.symbol, mine.position.side, mine.position.quantity) == (f"{idea.symbol}:short", idea.symbol, "short", 2)
     assert mine.position.opened == TODAY and mine.close_price == idea.ask and mine.plan is not None
-    assert review.opened_by == {idea.symbol: [made.id], "CRUX270108C00999000": []}
+    assert review.opened_by == {f"{idea.symbol}:short": [made.id], "CRUX270108C00999000:long": []}
     assert other.note and other.position.underlying == "CRUX"  # listed all the same, with no quote to price it
     assert "CRUX" in review.positions.underlyings and review.positions.warnings == []
     json.dumps(asdict(review), default=str, allow_nan=False)  # what a review hands out goes through a strict encoder
@@ -913,8 +926,8 @@ def test_a_paper_trade_from_the_scan_to_the_journal_through_the_api(client, tmp_
     assert client.post("/api/paper/orders", json={"ticket": written.json()["id"]}).status_code == 409
 
     now = client.get("/api/paper").json()
-    assert now["trades"][0]["id"] == made["id"] and made["id"] in now["opened_by"][idea["symbol"]]
-    holding = next(h for h in now["positions"]["holdings"] if h["position"]["id"] == idea["symbol"])
+    assert now["trades"][0]["id"] == made["id"] and made["id"] in now["opened_by"][idea["symbol"] + ":short"]
+    holding = next(h for h in now["positions"]["holdings"] if h["position"]["symbol"] == idea["symbol"])
     assert holding["close_price"] == idea["ask"] and holding["checks"]
 
     closing = client.post("/api/paper/tickets", json={"action": "close", "trade": made["id"], "limit": idea["ask"]}).json()
@@ -1065,3 +1078,372 @@ def test_a_quote_becomes_a_limit_in_whole_cents():
     assert (_cents(3.10, up=True), _cents(3.10, up=False)) == (3.10, 3.10)
     assert (_cents(8.109, up=True), _cents(8.109, up=False)) == (8.11, 8.10)
     assert _cents(0.004, up=False) == 0.01  # never below a cent
+
+
+# -- From the outside review of phase 4 (2026-11-26) -----------------------------------------------------
+#
+# Every point was reproduced on main before anything was changed. Each test below failed there.
+
+
+def test_a_trade_found_open_is_not_looked_for_among_positions_read_before_it_filled():
+    # The positions are read before the orders. An opening order that fills between the two reads is in the
+    # list as filled, with no position yet to show for it, and the new trade was closed on the spot as gone.
+    t = trade()
+    assert reconcile([t], [order(t)], [], TODAY, NOW) == [t]
+    assert (t.state, t.exits, t.stands) == ("open", [], "open")  # and where it stands is worded for the state it is in now
+    assert reconcile([t], [order(t)], [PaperHolding(t.symbol, "short", 1, 2.0)], TODAY, NOW) == []
+    # Only a trade found open in that same look is spared. Missing at the next one, it is accounted for as ever.
+    reconcile([t], [order(t)], [], TODAY, NOW)
+    assert (t.state, t.exits[0].how) == ("closed", "unknown")
+
+
+def test_a_review_reads_the_positions_before_the_orders_and_an_order_that_fills_in_between_costs_nothing(desk, scan):
+    idea = scan.ideas[0]
+    desk.broker.fills = False
+    made = desk.send(desk.write_open(scan, idea.symbol, 1, idea.bid).id)
+    desk.broker.read.clear()
+    # The positions were read, and showed nothing. Then the order filled, and the list of orders says so.
+    (waiting,) = desk.broker.listed.values()
+    desk.broker.listed[waiting.id] = replace(waiting, status="filled", working=False, filled=1, fill_price=idea.bid, filled_at=NOW)
+    first = desk.review()
+    assert desk.broker.read == ["positions", "orders"]  # so whatever the positions show has already reached the orders
+    assert [(t.id, t.state, t.exits) for t in first.trades] == [(made.id, "open", [])]
+    desk.broker.holds[(idea.symbol, "short")] = 1
+    assert desk.review().opened_by == {paper.held_id(idea.symbol, "short"): [made.id]}
+
+
+def test_a_rule_that_cannot_be_read_is_not_on_record_and_never_reads_as_not_reached(desk, scan, monkeypatch):
+    idea = scan.ideas[0]
+    made = desk.send(desk.write_open(scan, idea.symbol, 1, round(idea.ask * 3, 2)).id)  # the profit target is reached
+    ticket = desk.write_close(made.id, idea.ask)
+
+    def down(wanted):
+        raise RuntimeError("quotes are down")
+
+    monkeypatch.setattr(desk.scanner.market, "option_quotes", down)
+    done = desk.send(ticket.id)
+    # With no ask the profit target is "unknown". Left out of the list it read as not reached, and a trade that
+    # kept two thirds of its premium was filed as closed "before either rule was reached".
+    assert done.exits[0].rules is None and done.stands == "rules not on record"
+    assert len(desk.broker.sent) == 2 and done.state == "closed"  # the order went all the same: it is the person's
+
+
+def test_the_rules_are_read_without_the_news_while_an_order_waits_to_leave(desk, scan, monkeypatch):
+    idea = scan.ideas[0]
+    made = desk.send(desk.write_open(scan, idea.symbol, 1, idea.bid).id)
+    ticket = desk.write_close(made.id, idea.ask)
+    with monkeypatch.context() as patch:
+        patch.setattr(desk.scanner, "_add_news", lambda *a, **k: pytest.fail("news was loaded while an order waited to leave"))
+        done = desk.send(ticket.id)
+    assert done.exits[0].rules == () and done.stands == "before either rule was reached"  # read, and none reached
+    held_position = desk._position(idea.symbol, "short", 1, idea.bid, [])
+    assert desk.scanner.review([held_position], news=False).underlyings["CRUX"].news == []
+    assert desk.scanner.review([held_position]).underlyings["CRUX"].news  # a review for the page still has it
+
+
+def many_orders(total: int, stamped: str = "submitted_at") -> tuple[AlpacaPaper, list[httpx.Request], datetime]:
+    """An account with that many orders a second apart, and one more that is still working."""
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    rows = [{**ROW, "id": f"id-{n}", "client_order_id": f"x-{n}", "status": "filled", "submitted_at": None,
+             stamped: (start + timedelta(seconds=n + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")} for n in range(total)]  # fmt: skip
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["status"] == "open":
+            return httpx.Response(200, json=[{**ROW, "id": "working"}])
+        after = datetime.fromisoformat(request.url.params["after"].replace("Z", "+00:00"))
+        return httpx.Response(200, json=[row for row in rows if datetime.fromisoformat(row[stamped].replace("Z", "+00:00")) > after][:500])
+
+    account, seen = account_on(handler)
+    return account, seen, start
+
+
+def test_a_list_of_orders_that_was_cut_short_says_so_and_still_has_the_ones_working():
+    # Read oldest first, four pages of 500. Past that the newest were dropped and the list looked whole.
+    account, seen, start = many_orders(2600)
+    found, whole = account.orders(start)
+    assert not whole and len(found) == 2001 and found[-1].id == "working" and found[-1].working
+    assert [request.url.params["status"] for request in seen] == ["all"] * 4 + ["open"]
+
+    account, seen, start = many_orders(1200)
+    found, whole = account.orders(start)
+    assert whole and len(found) == 1200 and len(seen) == 3  # the last page came back short, so that is all of them
+
+    # A row with no time it was submitted goes by the time it was created, as the order read from it does.
+    account, seen, start = many_orders(1200, stamped="created_at")
+    found, whole = account.orders(start)
+    assert whole and len(found) == 1200
+
+    # A full page with no time on it at all leaves nowhere to go on from: there is more, and that is said.
+    account, seen = account_on(lambda request: httpx.Response(200, json=[{**ROW, "id": f"id-{n}", "submitted_at": None} for n in range(500)]))
+    assert account.orders(start)[1] is False
+
+
+def test_with_part_of_the_orders_unread_nothing_is_concluded_about_contracts_that_have_gone(desk, scan):
+    made = desk.send(desk.write_open(scan, scan.ideas[0].symbol, 1, scan.ideas[0].bid).id)
+    desk.broker.holds.clear()  # closed at Alpaca, by an order in the part of the list that was not read
+    desk.broker.whole = False
+    review = desk.review()
+    assert paper.CUT_SHORT in review.warnings and [(t.id, t.state) for t in review.trades] == [(made.id, "open")]
+    desk.broker.whole = True
+    after = desk.review()
+    assert paper.CUT_SHORT not in after.warnings and after.trades[0].stands == journal.HOW["unknown"]
+
+
+def test_an_answer_for_an_order_that_does_not_read_is_not_the_order_never_arriving():
+    # The account answered 200: it has an order by that name. Read as "no such order", the trade was marked
+    # as never having arrived, with the order still out there.
+    account, _ = account_on(lambda request: httpx.Response(200, json={**ROW, "status": ""}))
+    with pytest.raises(BrokerError, match="does not read as one"):
+        account.order("sc-ab12cd34-o")
+    lost = trade()
+    assert reconcile([lost], [], None, TODAY, NOW, lookup=account.order) == [] and lost.state == "ordered"
+
+
+def test_each_side_of_a_contract_is_a_row_of_its_own(desk):
+    # An account holds a contract one way or the other. A stand-in that says both must still not have one
+    # row's journal entries shown under the other.
+    short, long = held(underlying="CRUX", id="short1"), held(underlying="CRUX", side="long", id="long1")
+    for t in (short, long):
+        desk.journal.add(t)
+        desk.broker.holds[(t.symbol, t.side)] = 1
+    review = desk.review()
+    assert review.opened_by == {f"{short.symbol}:short": ["short1"], f"{short.symbol}:long": ["long1"]}
+    assert sorted(h.position.id for h in review.positions.holdings) == sorted(review.opened_by)
+
+
+def test_the_other_side_of_a_contract_that_is_held_is_not_opened_from_here(desk, scanner):
+    wide = dict(symbols=["CRUX"], kind="put", dte_min=25, dte_max=45, per_side=10_000, top_n=10_000)
+    sells, buys = scanner.scan(ScanRequest(lens="sell", **wide)), scanner.scan(ScanRequest(lens="buy", **wide))
+    both = sorted({c.symbol for c in sells.ideas} & {c.symbol for c in buys.ideas})
+    sold = next(c for c in sells.ideas if c.symbol == both[0])
+    made = desk.send(desk.write_open(sells, sold.symbol, 1, sold.bid).id)
+    # Bought to open, it would be set against the trade that is there, and the journal could not tell which had ended.
+    with pytest.raises(PaperError, match="one way or the other"):
+        desk.write_open(buys, sold.symbol, 1, sold.ask)
+    desk.write_open(sells, sold.symbol, 1, sold.bid)  # more of the same side is another trade on the contract
+    desk.send(desk.write_close(made.id, sold.ask).id)
+    desk.write_open(buys, sold.symbol, 1, sold.ask)  # and once that trade has ended, the other side can be opened
+
+
+def test_the_demos_clock_is_on_the_demos_day_whatever_day_it_really_is(scanner, scan, tmp_path, monkeypatch):
+    # The demo's market is held at TODAY for the tests, and its contracts expire within weeks of that. With the
+    # desk on the wall clock, every test that sends a demo order was due to fail once those weeks had passed.
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2027, 6, 1, 15, 0, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(paper, "datetime", Later)
+    monkeypatch.setattr(broker, "datetime", Later)
+    desk = paper.build_desk(Settings(journal_file=tmp_path / "journal.json"), scanner, demo=True)
+    made = desk.send(desk.write_open(scan, scan.ideas[0].symbol, 1, scan.ideas[0].bid).id)
+    assert made.state == "open" and made.ordered.astimezone(ET).date() == made.opened.astimezone(ET).date() == TODAY
+    assert desk.review().generated_at.astimezone(ET).date() == TODAY
+
+
+def test_a_price_on_file_has_a_positions_bounds_and_a_figure_that_is_not_a_number_does_not_read(tmp_path):
+    done = held(id="done")
+    done.exits.append(Exit(1, 0.5, NOW + timedelta(days=3), "order", ()))
+    plain = journal._plain(journal.settle(done))
+    worthless = {**plain, "id": "worthless", "exits": [{**plain["exits"][0], "price": 0.0}]}
+    rows = [
+        {**plain, "id": "tiny", "entry_price": 1e-310},  # every result against it was infinite
+        {**plain, "id": "nan", "signals": {**SHOWN, "score": float("nan")}},  # Python reads NaN from a file
+        {**plain, "id": "closing", "state": "open", "exits": [], "closing": {"client_id": "sc-x-c1", "quantity": 1, "limit": 0, "sent": NOW.isoformat()}},
+        worthless,  # an exit at nothing is a price: an option can expire worth nothing
+        plain,
+    ]
+    path = tmp_path / "journal.json"
+    path.write_text(json.dumps({"trades": rows}))
+    found, unread = Journal(path).load()
+    assert [t.id for t in found] == ["worthless", "done"] and unread == 3
+    assert (found[0].pnl, found[0].pnl_pct) == (200.0, 1.0)
+    json.dumps([asdict(t) for t in found], default=str, allow_nan=False)
+
+    # And nothing this app writes holds such a figure. The entry is refused before the file is touched.
+    other = Journal(tmp_path / "other.json")
+    with pytest.raises(ValueError):
+        other.add(held(signals={**SHOWN, "pop": float("inf")}))
+    assert not other.path.exists()
+
+
+def test_an_order_that_filled_with_no_price_on_it_is_waited_for():
+    # It was read as "ended filled with nothing filled", with the contracts in the account. And a closing
+    # order that filled so was dropped, and its contracts written off as gone with no order on record.
+    t = trade()
+    assert reconcile([t], [order(t, fill_price=None)], [], TODAY, NOW) == [t]
+    assert (t.state, t.entry_price) == ("ordered", None) and t.note.startswith(paper.NO_PRICE)
+    assert reconcile([t], [order(t, fill_price=None)], [], TODAY, NOW) == []  # said once
+    # A fill at less than a position can cost is no price either. Rounded, it was an entry price of nothing,
+    # and the journal could not read its own entry back.
+    assert reconcile([t], [order(t, fill_price=0.00004)], [], TODAY, NOW) == [] and t.state == "ordered"
+    reconcile([t], [order(t)], None, TODAY, NOW)
+    assert (t.state, t.entry_price, t.note) == ("open", 2.0, None)
+
+    c = held()
+    c.closing = ClosingOrder("sc-x-c1", 1, 0.95, NOW, ())
+    reconcile([c], [order(c, "close", fill_price=None)], [], TODAY, NOW)
+    assert (c.state, c.exits) == ("open", []) and c.closing and c.note.startswith(paper.NO_PRICE)
+    reconcile([c], [order(c, "close", fill_price=0.9)], [], TODAY, NOW)
+    assert (c.state, c.pnl, c.note) == ("closed", 110.0, None)
+
+
+def test_a_reading_typed_into_the_journal_by_hand_never_breaks_the_summary():
+    read = lambda name, **shown: signals.GROUPS[name][1](closed(1.0, **shown))  # noqa: E731
+    assert read("rating", rating=["favorable"]) == "not rated" and read("rating", rating=3) == "not rated"
+    assert read("score", score=float("nan")) is None and read("pop", pop=float("inf")) is None  # NaN fell in the lowest band
+    odd = [closed(1.0, rating=["favorable"]), closed(1.0, score=float("nan")), closed(1.0, lens=["sell"]), closed(1.0)]
+    found = signals.summary(odd)  # a list is no key for a table, and this raised TypeError
+    assert found["sell"][0].trades == 3 and not signals.counted(odd[2])  # with no lens to go by it is counted nowhere
+    assert {row.bucket: row.trades for row in found["sell"] if row.group == "rating"} == {"favorable": 2, "not rated": 1}
+
+
+def test_an_outside_order_from_before_the_trade_is_not_its_exit_though_it_has_no_fill_time():
+    # An order that fills in part and is then cancelled has no time it filled. Taken as "now", it passed for
+    # an order from after the trade opened.
+    t = held()
+    old = order(t, "close", status="canceled", filled=1, fill_price=0.01, id="older", filled_at=None, submitted=t.opened - timedelta(days=1))
+    reconcile([t], [old], [], TODAY, NOW)
+    assert [(e.how, e.price) for e in t.exits] == [("unknown", None)] and t.pnl is None
+    # One sent after the trade opened is its exit, at the time it was sent.
+    since = held()
+    part = order(since, "close", status="canceled", filled=1, fill_price=1.25, id="later", filled_at=None, submitted=since.opened + timedelta(hours=1))
+    reconcile([since], [part], [], TODAY, NOW)
+    assert since.exits == [Exit(1, 1.25, since.opened + timedelta(hours=1), "outside", None, "later")]
+
+
+def test_an_outside_order_that_opens_is_not_taken_as_one_that_closes():
+    # A put sold here left the account, and the same contract was then bought to open at Alpaca.
+    t = held()
+    opens = replace(order(t, "close", id="bought-to-open", fill_price=1.25), intent="open")
+    reconcile([t], [opens], [], TODAY, NOW)
+    assert [(e.how, e.order) for e in t.exits] == [("unknown", "")]
+    # When the account does not say which it was, the side is all there is to go by.
+    unsaid = held()
+    reconcile([unsaid], [replace(order(unsaid, "close", id="typed-in", fill_price=1.25), intent="")], [], TODAY, NOW)
+    assert [(e.how, e.order) for e in unsaid.exits] == [("outside", "typed-in")]
+
+
+def test_an_outside_order_taken_in_part_is_there_for_the_rest():
+    a = held(quantity=2, ordered=NOW - timedelta(days=5), id="aaaa")
+    b = trade(quantity=2, ordered=NOW - timedelta(days=1), id="bbbb")
+    outside = order(a, "close", filled=2, fill_price=1.25, id="typed-in")
+    one_held = [PaperHolding(a.symbol, "short", 1, 2.0)]
+    # B's opening order has filled one so far, so the account holds one where A's two used to be.
+    reconcile([a, b], [outside, order(b, status="partially_filled", filled=1, fill_price=2.0)], one_held, TODAY, NOW)
+    assert [(e.quantity, e.how) for e in a.exits] == [(1, "outside")] and a.state == "open"
+    # B's order ends with that one filled. A's other contract is the rest of the same outside order, where it
+    # used to be written off with no price because the order had "been used".
+    reconcile([a, b], [outside, order(b, status="canceled", filled=1, fill_price=2.0)], one_held, TODAY, NOW)
+    reconcile([a, b], [outside, order(b, status="canceled", filled=1, fill_price=2.0)], one_held, TODAY, NOW)
+    assert [(e.quantity, e.how, e.price) for e in a.exits] == [(1, "outside", 1.25), (1, "outside", 1.25)]
+    assert (a.state, a.pnl, b.state, b.quantity) == ("closed", 150.0, "open", 1)
+
+
+def test_no_order_is_written_or_sent_for_a_contract_that_has_expired(desk, scan):
+    # The account lists an expired contract until it has settled, and an order to close it was written and sent.
+    gone = held(underlying="CRUX", expiry=TODAY - timedelta(days=4), ordered=NOW - timedelta(days=40), id="gone")
+    desk.journal.add(gone)
+    desk.broker.holds[(gone.symbol, "short")] = 1
+    with pytest.raises(PaperError, match="has expired"):
+        desk.write_close("gone", 0.05)
+
+    # Written out late on a contract's last day and confirmed after midnight in New York: the order is no
+    # longer one to send. It used to fail inside the journal, which the server answered with a bare 500.
+    ticket = desk.write_open(scan, scan.ideas[0].symbol, 1, scan.ideas[0].bid)
+    desk.now = datetime(2026, 11, 25, 5, 1, tzinfo=timezone.utc)  # 12:01 a.m. on the 25th
+    desk._tickets[ticket.id] = replace(ticket, expiry=TODAY, made=desk.now - timedelta(minutes=5))
+    with pytest.raises(PaperError, match="expired since") as caught:
+        desk.send(ticket.id)
+    assert caught.value.status == 409 and desk.broker.sent == [] and [t.id for t in desk.journal.load()[0]] == ["gone"]
+
+
+def test_the_stocks_close_is_read_in_turn_with_scans(desk, monkeypatch):
+    # The provider and its notes are shared, and this one read went round the lock that keeps scans apart.
+    friday, real, locked = TODAY - timedelta(days=4), desk.scanner.market.daily_bars, []
+
+    def bars(symbols, start):
+        locked.append(desk.scanner._lock.locked())
+        desk.scanner.market.notes.append("a note with no reader")
+        return real(symbols, start)
+
+    monkeypatch.setattr(desk.scanner.market, "daily_bars", bars)
+    assert desk._close_on("CRUX", friday) is not None
+    assert locked == [True] and desk.scanner.market.notes == [] and not desk.scanner._lock.locked()
+
+
+def test_what_closing_at_the_limit_would_give_is_worded_after_rounding(desk):
+    # $2.004 against $2.00 is 40 cents on a contract: it ended "up $0", or "down $0".
+    for id, side in (("sold", "short"), ("bought", "long"), ("gain", "short")):
+        desk.journal.add(held(underlying="CRUX", side=side, limit=2.004 if id != "gain" else 3.0, id=id))
+    said = {id: desk.write_close(id, 2.0).notes[0] for id in ("sold", "bought", "gain")}
+    assert said["sold"].endswith("the trade ends even.") and said["bought"].endswith("the trade ends even.")
+    assert said["gain"].endswith("the trade ends up $100.")
+
+
+def test_the_page_keeps_what_became_of_an_order_in_sight(client):
+    page = client.get("/").text
+    # A closing order's answer has a line of its own, since reading the account afresh redraws the pane it was sent from.
+    assert 'id="paper-said" role="status"' in page and "(sent) => { say(sentText(sent, false)); loadPaper(); }" in page
+    assert 'if (err.status !== 422) { say("The closing order: " + err.message, true); loadPaper(); }' in page
+    # A send from the scan that failed may have left an entry in the journal, so the paper view is read afresh.
+    assert "() => { paper = null; }));" in page and "failure.status = response.status;" in page
+    assert page.count("whichTrade(trade, mine)") == 3  # two trades on one contract are told apart, twice, and the function itself
+    assert 'day: "numeric", timeZone: "America/New_York" }) : "–";' in page  # a day in the journal is New York's
+    assert "} else if (holding.dte < 0) {" in page and "This contract has expired, so no order can close it." in page
+    assert 'problem.textContent = "Sending…";' in page
+
+
+def test_what_is_typed_for_an_order_is_checked_before_anything_is_scanned(capsys, monkeypatch):
+    from app.__main__ import main
+    from app.scanner import Scanner
+
+    expiry = (TODAY + timedelta(days=24)).isoformat()
+    assert main(["paper", "--demo", "close", "nope"]) == 2  # with no --limit it used to say there was no quote
+    assert "no trade with that id" in capsys.readouterr().err
+
+    monkeypatch.setattr(Scanner, "scan", lambda self, request: pytest.fail("a scan was run"))
+    for typed, said in (
+        (["   ", expiry, "395", "put", "--sell"], "not a ticker symbol"),  # blank, it was a scan of every stock
+        (["CRUX", expiry, "inf", "put", "--sell"], "strike must be"),  # a traceback
+        (["CRUX", expiry, "nan", "put", "--sell"], "strike must be"),
+        (["CRUX", expiry, "-5", "put", "--sell"], "strike must be"),  # CRUX270101P-0005000
+        (["CRUX", expiry, "395", "put", "--sell", "--qty", "0"], "whole number of contracts"),
+        (["CRUX", expiry, "395", "put", "--sell", "--limit", "1.005"], "whole cents"),
+    ):
+        assert main(["paper", "--demo", "open", *typed]) == 2
+        assert said in capsys.readouterr().err
+
+
+def test_with_the_keys_of_a_live_account_the_command_line_says_so_before_it_scans(scanner, tmp_path, capsys, monkeypatch):
+    import argparse
+
+    from app.__main__ import _open_ticket, print_paper
+
+    live = Settings(alpaca_key="k", alpaca_secret="s", alpaca_paper=False, journal_file=tmp_path / "journal.json")
+    desk = paper.build_desk(live, scanner)
+    typed = argparse.Namespace(underlying="CRUX", expiry=(TODAY + timedelta(days=24)).isoformat(), strike=395.0, kind="put", lens="sell", qty=1, limit=None)
+    with monkeypatch.context() as patch:
+        patch.setattr(scanner, "scan", lambda request: pytest.fail("a scan was run for an order that cannot be sent"))
+        with pytest.raises(PaperError, match="paper account only"):
+            _open_ticket(typed, desk, scanner)
+
+    # And the account is said to be missing, not to have failed to read.
+    print_paper(PaperReview(NOW, "live", False, PaperAccount(None, None), None, {}, [], [], {}, [paper.LIVE_KEYS]))
+    out = capsys.readouterr().out
+    assert "Data: no paper account" in out and "No paper account is set up" in out
+    assert "could not be read" not in out and "Account:" not in out
+
+
+@pytest.mark.parametrize(
+    "written, read",
+    [("true", True), ("1", True), ("YES", True), ("on", True), ("false", False), ("0", False), ("no", False), ("Off", False), ("", True), ("maybe", None)],
+)
+def test_whether_the_keys_are_a_paper_accounts_is_yes_or_no(monkeypatch, written, read):
+    # Every word but "0", "false" and "no" used to count as yes, "off" among them.
+    monkeypatch.setenv("ALPACA_PAPER", written)
+    if read is None:
+        with pytest.raises(ConfigError, match="ALPACA_PAPER must be true or false"):
+            load_settings()
+    else:
+        assert load_settings().alpaca_paper is read

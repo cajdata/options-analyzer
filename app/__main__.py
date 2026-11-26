@@ -10,8 +10,8 @@ import textwrap
 from dataclasses import asdict
 from datetime import date, datetime
 
-from app import ai, journal, occ, paper, positions
-from app.config import ConfigError, load_settings, tidy
+from app import ai, journal, paper, positions
+from app.config import ConfigError, load_settings
 from app.analysis import events, exits, holdings, signals
 from app.models import (
     ContractAnalysis,
@@ -374,16 +374,19 @@ def _signal_lines(summary: dict) -> list[str]:
 
 def print_paper(review: PaperReview, kept: object = None, every: bool = False) -> None:
     """The paper account: what it holds, the orders still working, the journal, and which signals worked."""
-    feed = {"demo": "SYNTHETIC DEMO DATA", "live": "Alpaca's paper account"}.get(review.mode, "no market data")
+    # With the keys of a live account there is market data and no paper account, and the heading says which is missing.
+    feed = "SYNTHETIC DEMO DATA" if review.mode == "demo" else "Alpaca's paper account" if review.can_order else "no paper account"
     print(f"\nPaper trading   Data: {feed}")
     if review.account:
         level, power = review.account.options_level, review.account.buying_power
         said = [f"options level {level}" if level is not None else "", f"${power:,.0f} to put into options" if power is not None else ""]
-        print("Account: " + ", ".join(text for text in said if text) + ".")
+        if any(said):
+            print("Account: " + ", ".join(text for text in said if text) + ".")
     held = review.positions
     print()
     if held is None:
-        print("What the paper account holds could not be read.")
+        # A read that failed is not the same as there being nothing to read.
+        print("What the paper account holds could not be read." if review.can_order else "No paper account is set up, so there are no positions to list.")
     elif not held.holdings:
         print("The paper account holds no options.")
     else:
@@ -443,7 +446,8 @@ def _open_ticket(args, desk: paper.PaperDesk, scanner) -> Ticket:
     """Scan the one stock, so the journal has what the scan showed for the contract, and write the order out."""
     if scanner is None:
         raise paper.PaperError(desk.why or "No market data is set up.")
-    (symbol,) = tidy([args.underlying]) or [""]
+    if not desk.available:
+        raise paper.PaperError(desk.why or "No paper account is set up.")  # said before a scan is spent on it
     try:
         expiry = date.fromisoformat(args.expiry)
     except ValueError:
@@ -451,12 +455,16 @@ def _open_ticket(args, desk: paper.PaperDesk, scanner) -> Ticket:
     days = (expiry - scanner.today).days
     if days < 0:
         raise paper.PaperError("That contract has expired.")
+    # What was typed is checked before anything is asked of the market. A blank ticker used to be a scan of
+    # every stock, and a strike that is not a number a symbol that is not one. This raises ValueError, in words.
+    wanted = positions.make(args.underlying, args.kind, args.strike, expiry, "long" if args.lens == "buy" else "short", 1, 1.0, scanner.today)
+    paper.PaperDesk.sized(args.qty, args.limit if args.limit is not None else 0.01)
+    symbol, contract = wanted.underlying, wanted.symbol
     request = ScanRequest(
         symbols=[symbol], lens=args.lens, kind=args.kind, dte_min=days, dte_max=days,
         strike_window=MAX_STRIKE_WINDOW, per_side=10_000, top_n=10_000,
     )  # fmt: skip
     result = scanner.scan(request)
-    contract = occ.build(symbol.replace(".", ""), expiry, args.kind, args.strike)
     idea = next((c for c in result.ideas if c.symbol == contract), None)
     if idea is None:
         raise paper.PaperError(
@@ -471,7 +479,8 @@ def _close_ticket(args, desk: paper.PaperDesk) -> Ticket:
     limit = args.limit
     if limit is None:
         # Where closing now would be priced: the bid for a holder, the ask to buy back.
-        review = desk.review()
+        review = desk.review()  # which brings the journal up to date first
+        desk.closable(args.id)  # no such trade, or one that cannot be closed, is said before "no quote"
         held = review.positions.holdings if review.positions else []
         holding = next((h for h in held if args.id in review.opened_by.get(h.position.id, [])), None)
         if holding is None or holding.close_price is None:
