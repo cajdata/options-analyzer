@@ -46,6 +46,9 @@ class OptionQuote:
     theta: float | None = None
     vega: float | None = None
     quote_time: datetime | None = None
+    # True when the provider's latest quote is from an earlier day than the latest session. Such a
+    # quote is not a quote: its prices are left out, and only when it was made is handed on.
+    outdated: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,7 +204,9 @@ class ExitPlan:
     notes: list[str] = field(default_factory=list)
     half_life_day: date | None = None  # buyer: when half the time value is gone
     target_price: float | None = None  # seller: buy back at or below this to hit the profit target
-    target_day: date | None = None  # seller: when decay alone gets there, if it does before expiry
+    # Seller: when decay alone gets there, if it does before expiry. Today, for a contract
+    # already held whose ask is at the target now.
+    target_day: date | None = None
 
 
 @dataclass(frozen=True)

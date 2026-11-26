@@ -10,7 +10,8 @@ Four things keep the page honest:
 
 * A result is what closing now would give. A holder sells at the bid and a
   seller buys back at the ask, so the spread is counted, as it is in the exit
-  plan.
+  plan. A quote that is out of date against the stock, or crossed, gives no
+  result at all: it is not a price anything can be closed at.
 * A check that cannot be made says so. It never passes quietly: with no
   earnings date, a report before expiry cannot be ruled out.
 * A position is always listed, priced or not. Whatever is missing is left
@@ -25,6 +26,7 @@ fetching.
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 
 from app.analysis import exits
@@ -54,10 +56,60 @@ def _in_days(days: int) -> str:
     return "today" if days == 0 else "tomorrow" if days == 1 else f"in {days} days"
 
 
+def dollars(price: float) -> str:
+    """A price per share: to the cent, or finer when it is not a whole cent ($0.515)."""
+    whole, _, rest = f"{price:.4f}".rstrip("0").partition(".")
+    return f"${whole}.{rest.ljust(2, '0')}"
+
+
+def at_most(price: float) -> str:
+    """A price to be at or below, cut off and never rounded up.
+
+    Half of $1.03 is $0.515. Shown as "$0.52 or less" it reads as reached at an
+    ask of $0.52, which it is not.
+    """
+    return dollars(math.floor(price * 10_000 + 1e-6) / 10_000)
+
+
+def unusable(p: Position, quote: OptionQuote | None, spot: float | None) -> str | None:
+    """Why a quote is not a price to close at, or None when it is one.
+
+    Two kinds of quote are turned away, as the scan's own pricing turns them
+    away (`contracts.analyze_contract`):
+
+    * A crossed one, with the ask below the bid.
+    * One that is below exercise value even at its ask. An option is never
+      offered for less than exercising it would pay, so such a quote is out of
+      date against the stock. It is what an evening looks like after a stock
+      has dropped on earnings: the stock trades on after the close and the
+      option's quote does not. Read as it stands, a put sold for $2.00 and now
+      $20 in the money showed its profit target as reached.
+
+    A bid below exercise value with the ask above it is an ordinary deep
+    in-the-money quote, and no bid at all is an ordinary nearly worthless one.
+    Neither is turned away. With no stock price nothing can be told, and the
+    quote stands.
+    """
+    if quote is None:
+        return None
+    bid, ask = quote.bid or 0.0, quote.ask or 0.0
+    if bid > 0 and 0 < ask < bid:
+        return "This quote is crossed: its ask is below its bid. That is not a price anything can be closed at, so no result is shown."
+    if ask > 0 and spot and spot > 0:
+        exercise = max(spot - p.strike, 0.0) if p.kind == "call" else max(p.strike - spot, 0.0)
+        if ask < exercise:
+            return (
+                f"This quote is out of date against the stock. Even its ask ({dollars(ask)}) is below the "
+                f"{dollars(exercise)} that exercising the {p.kind} would pay with the stock at ${spot:,.2f}. No result is shown."
+            )
+    return None
+
+
 def result(p: Position, quote: OptionQuote | None) -> tuple[float, float, float] | None:
     """What closing now gives: (price per share, dollars across every contract, share of the premium).
 
-    None when the side that closing needs is not quoted.
+    None when the side that closing needs is not quoted. Whether the quote is
+    one to close at is `unusable`'s question, and `assess` asks it first.
     """
     price = (quote.bid if p.side == "long" else quote.ask) if quote else None
     if not price or price <= 0:
@@ -66,21 +118,31 @@ def result(p: Position, quote: OptionQuote | None) -> tuple[float, float, float]
     return price, gain * SHARES * p.quantity, gain / p.entry_price
 
 
-def profit_target(p: Position, ask: float | None) -> PositionCheck:
+def _kept(kept: float, reached: bool) -> str:
+    """The share of the premium kept, never rounded up to the target while the target is not reached."""
+    if not reached and round(kept * 100) >= exits.PROFIT_TARGET * 100:
+        return f"{math.floor(kept * 1000) / 10:.1f}%"
+    return f"{kept:.0%}"
+
+
+def profit_target(p: Position, ask: float | None, usable: bool = True) -> PositionCheck:
     """A seller's target: buying back costs no more than what is left after keeping `exits.PROFIT_TARGET`."""
     share = f"{exits.PROFIT_TARGET:.0%}"
     target = p.entry_price * (1.0 - exits.PROFIT_TARGET)
-    aim = f"The {share} target is ${target:.2f} or less."
+    aim = f"The {share} target is {at_most(target)} or less."
+    if not usable:
+        text = f"The quote is not a price to buy back at: it is crossed, or out of date against the stock. {aim}"
+        return PositionCheck("profit_target", "unknown", "profit target unknown", text)
     if not ask or ask <= 0:
         return PositionCheck("profit_target", "unknown", "profit target unknown", f"There is no ask to buy back at. {aim}")
-    kept = (p.entry_price - ask) / p.entry_price
+    kept, collected = (p.entry_price - ask) / p.entry_price, dollars(p.entry_price)
     if ask <= target:
-        text = f"Buying back at ${ask:.2f} keeps {kept:.0%} of the ${p.entry_price:.2f} collected. {aim}"
+        text = f"Buying back at {dollars(ask)} keeps {_kept(kept, True)} of the {collected} collected. {aim}"
         return PositionCheck("profit_target", "reached", "profit target reached", text)
     if kept >= 0:
-        text = f"Buying back at ${ask:.2f} would keep {kept:.0%} of the ${p.entry_price:.2f} collected. {aim}"
+        text = f"Buying back at {dollars(ask)} would keep {_kept(kept, False)} of the {collected} collected. {aim}"
     else:
-        text = f"Buying back at ${ask:.2f} costs ${ask - p.entry_price:.2f} a share more than the ${p.entry_price:.2f} collected. {aim}"
+        text = f"Buying back at {dollars(ask)} costs {dollars(ask - p.entry_price)} a share more than the {collected} collected. {aim}"
     return PositionCheck("profit_target", "clear", "profit target not reached", text)
 
 
@@ -131,8 +193,13 @@ def earnings(p: Position, ctx: UnderlyingContext | None, today: date, margin: ti
     if days > EARNINGS_SOON + room.days:
         text = f"The next report is {when} ({_in_days(days)}), before this contract expires.{estimated}"
         return PositionCheck("earnings", "clear", "report before expiry", text)
-    label = f"earnings {'today' if days <= 0 else f'in {days}d'}{'' if event.confirmed else ' (est.)'}"
-    text = f"Reports {when} ({_in_days(max(days, 0))}), and this contract is still open then.{estimated}"
+    if days < 0:
+        # Out after an earlier day's close, with no session since to reflect it: a weekend, most likely.
+        felt = _day(reaction_day(event))
+        text = f"Reported {when}. The first session to reflect it is {felt}, and this contract is still open then."
+        return PositionCheck("earnings", "reached", "earnings out, not yet felt", text)
+    label = f"earnings {'today' if days == 0 else f'in {days}d'}{'' if event.confirmed else ' (est.)'}"
+    text = f"Reports {when} ({_in_days(days)}), and this contract is still open then.{estimated}"
     return PositionCheck("earnings", "reached", label, text)
 
 
@@ -176,9 +243,13 @@ def assess(
     if dte < 0:
         text = f"Expired on {_day(p.expiry)}. It is no longer quoted, so nothing here can be checked. Remove it once it has settled."
         return Holding(p, dte, [PositionCheck("expired", "reached", "expired", text)])
-    checks = [profit_target(p, quote.ask if quote else None)] if p.side == "short" else []
+    # A quote that is no price to close at gives no result and settles no target. Why it is
+    # turned away takes the place of any other note: it is the one thing to know about the row.
+    turned_away = unusable(p, quote, spot)
+    note = turned_away or note
+    checks = [profit_target(p, quote.ask if quote else None, usable=not turned_away)] if p.side == "short" else []
     checks += [time_stop(p, today), earnings(p, ctx, today, margin), strike(p, spot)]
-    closing = result(p, quote)
+    closing = None if turned_away else result(p, quote)
     return Holding(
         position=p,
         dte=dte,

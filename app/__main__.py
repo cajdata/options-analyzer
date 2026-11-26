@@ -203,7 +203,7 @@ def _exit_line(c: ContractAnalysis, plan: ExitPlan, ctx: UnderlyingContext) -> s
     parts = []
     if plan.lens == "sell":
         when = f"decay alone gets there about {plan.target_day:%b %d}" if plan.target_day else "decay alone does not get there before expiry"
-        parts.append(f"buy back at ${plan.target_price:.2f} or less to keep {exits.PROFIT_TARGET:.0%} ({when})")
+        parts.append(f"buy back at {holdings.at_most(plan.target_price)} or less to keep {exits.PROFIT_TARGET:.0%} ({when})")
     elif plan.half_life_day:
         parts.append(f"half the time value is gone by {plan.half_life_day:%b %d}")
     stop_shown = False
@@ -247,10 +247,12 @@ def _held(p: Position) -> str:
 
 
 def _result(h: Holding) -> str:
+    """A result in whole dollars and percent. Signs are settled after rounding, so nothing prints as "+$0" or "-0%"."""
     if h.pnl is None:
         return "-"
-    sign = "-" if round(h.pnl) < 0 else "+"
-    return f"{sign}${abs(h.pnl):,.0f} ({h.pnl_pct:+.0%})"
+    whole, share = round(h.pnl), round(h.pnl_pct * 100)
+    money = f"{'-' if whole < 0 else '+' if whole > 0 else ''}${abs(whole):,}"
+    return f"{money} ({'+' if share > 0 else ''}{share}%)"
 
 
 def print_positions(review: PositionsReview) -> None:
@@ -266,7 +268,8 @@ def print_positions(review: PositionsReview) -> None:
         print("-" * len(header))
         for h in review.holdings:
             p = h.position
-            ctx = review.underlyings.get(p.underlying)
+            # An expired position is not set beside its stock's news, whether or not something else on the stock is held.
+            ctx = review.underlyings.get(p.underlying) if h.dte >= 0 else None
             look = [c.label for c in h.checks if c.state != "clear"]
             look += [f"news: {kind}" for kind in (ctx.recent_events if ctx else {}) if kind in events.FLAGGED]
             close = "-" if h.close_price is None else f"{h.close_price:.2f}"

@@ -24,7 +24,7 @@ import re
 import tempfile
 import threading
 import uuid
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +35,9 @@ from app.models import Position
 KINDS = ("call", "put")
 SIDES = ("long", "short")
 MAX_QUANTITY = 10_000
+# What an option can have cost a share. A price outside this is a slip of the hand, and one
+# near zero turns every result measured against it into infinity.
+MIN_PRICE, MAX_PRICE = 0.0001, 1_000_000
 # One to six letters or digits, optionally a class suffix: AAPL, F, BRK.B.
 _SYMBOL = re.compile(r"[A-Z0-9]{1,6}(\.[A-Z0-9]{1,3})?")
 _FIELDS = ("underlying", "kind", "strike", "expiry", "side", "quantity", "entry_price", "opened")
@@ -51,6 +54,9 @@ def _number(value: Any, what: str) -> float:
 
 
 def _date(value: Any, what: str) -> date:
+    if isinstance(value, datetime):
+        # A time of day is a date too, as Python has it, but the two cannot be compared with each other.
+        raise ValueError(f"{what} must be a date such as 2026-12-18, with no time of day")
     if isinstance(value, date):
         return value
     try:
@@ -83,7 +89,9 @@ def make(
         raise ValueError("strike must be at least 0.001 and below 100,000")
     if type(quantity) is not int or not 1 <= quantity <= MAX_QUANTITY:
         raise ValueError(f"quantity must be a whole number of contracts from 1 to {MAX_QUANTITY:,}")
-    entry_price = _number(entry_price, "entry price")
+    entry_price = round(_number(entry_price, "entry price"), 4)  # finer than an average of fills ever needs
+    if not MIN_PRICE <= entry_price <= MAX_PRICE:
+        raise ValueError(f"entry price must be from {MIN_PRICE} to {MAX_PRICE:,} a share")
     expiry, opened = _date(expiry, "expiry"), _date(opened, "opened")
     if not 2000 <= expiry.year <= 2099:
         raise ValueError("expiry must be a date in this century")
@@ -148,7 +156,9 @@ class PositionStore:
         if self.path is None:
             return list(self._memory)
         try:
-            text = self.path.read_text(encoding="utf-8")
+            # "utf-8-sig" reads a file with or without a byte order mark. An older Notepad and
+            # PowerShell's Set-Content both put one in front, and this file is meant to be edited by hand.
+            text = self.path.read_text(encoding="utf-8-sig")
         except FileNotFoundError:
             return []
         except (OSError, UnicodeError) as err:
@@ -188,25 +198,49 @@ class PositionStore:
 
     # -- What callers use ----------------------------------------------------
 
+    @staticmethod
+    def _read(rows: list[Any]) -> list[Position | None]:
+        """Each entry as a position. None where it does not read as one, or repeats an earlier entry's id.
+
+        An entry copied by hand keeps its id unless the id is changed too. Two
+        entries with one id cannot be told apart by anything that acts on an
+        id, and removing one would take both. So the later one is left where
+        it is and counted with the entries that could not be read.
+        """
+        seen: set[str] = set()
+        found: list[Position | None] = []
+        for row in rows:
+            held = _position(row)
+            if held is not None and held.id in seen:
+                held = None
+            if held is not None:
+                seen.add(held.id)
+            found.append(held)
+        return found
+
     def load(self) -> tuple[list[Position], int]:
-        """The positions on file, in the order they were entered, and how many entries could not be read."""
+        """The positions on file, in the order they were entered, and how many entries could not be used."""
         with self._lock:
-            found = [_position(row) for row in self._rows()]
+            found = self._read(self._rows())
         return [p for p in found if p is not None], sum(1 for p in found if p is None)
 
     def add(self, position: Position) -> Position:
         with self._lock:
             rows = self._rows()
+            # Checked against every entry that reads, a repeated one included.
             if any((held := _position(row)) and held.id == position.id for row in rows):
                 raise ValueError(f"there is already a position with the id {position.id}")
             self._write(rows + [_plain(position)])
         return position
 
     def remove(self, id: str) -> bool:
-        """Take the position with this id off the file. False when there is none."""
+        """Take the position with this id off the file. False when there is none.
+
+        Only an entry that `load` hands out can be removed, so this never takes more than one.
+        """
         with self._lock:
             rows = self._rows()
-            kept = [row for row in rows if not ((held := _position(row)) and held.id == id)]
+            kept = [row for row, held in zip(rows, self._read(rows)) if not (held and held.id == id)]
             if len(kept) == len(rows):
                 return False
             self._write(kept)
@@ -221,7 +255,8 @@ def open_store(settings, market=None) -> PositionStore:
 
 
 def unread_note(count: int, path: Path | None) -> str:
-    """What to say when entries on file do not read as positions."""
-    what = "1 entry" if count == 1 else f"{count} entries"
-    verb = "does" if count == 1 else "do"
-    return f"{what} in {path or 'the positions on file'} {verb} not read as a position, and {'is' if count == 1 else 'are'} left there untouched."
+    """What to say when entries on file cannot be used as positions."""
+    where = path or "the positions on file"
+    if count == 1:
+        return f"1 entry in {where} does not read as a position, or repeats another entry's id. It is left there untouched."
+    return f"{count} entries in {where} do not read as positions, or repeat another entry's id. They are left there untouched."
