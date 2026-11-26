@@ -306,6 +306,9 @@ class UnderlyingContext:
     pooled_studies: dict[str, PooledStudy] = field(default_factory=dict)  # by event type, across its group
     event_studies: dict[str, EventStudy] = field(default_factory=dict)  # by event type
     news_note: str | None = None  # set when a source could not answer
+    # Set when most of the headlines tagged with the stock never name it. Kept apart from
+    # `news_note`: it is for the person at the screen, and not for the AI brief.
+    naming_note: str | None = None
 
 
 @dataclass

@@ -4,15 +4,23 @@
 # headline aside as another company's news when it never names the company. That is
 # right for a look-alike ticker (Reckitt, RKT in London, under Rocket Companies) and
 # wrong for a company the press calls by a brand. No rule can tell the two apart, so a
-# brand has to be listed here.
+# brand has to be listed here. A scan says when most of a stock's headlines never name it.
 #
-# The app already works out the usual cases without help: a later word of the name
-# ("Lilly", "Disney"), the name with its dots and spaces moved ("J.P. Morgan"), a word
-# built on the first word ("SpaceX", "Citi"), and names the company had before, which
-# the SEC supplies. A scan says when most of a stock's headlines never name it.
+# The app works out only the plain cases itself: a later word of the name ("Lilly",
+# "Disney"), the name with its dots and spaces moved ("J.P. Morgan"), and a name the
+# company had within the last three years or so, which the SEC supplies. It does not
+# guess from part of a word: "SpaceX" for Space Exploration Technologies has to be here.
 #
-# One company to a line: SYMBOL: name, name. '#' starts a comment.
-C: Citibank
+# These names say a headline is about the company. They are never used to decide that
+# the company is being bought, because a brand is often one unit of it: "to Acquire
+# Citibank" is not a takeover of Citigroup.
+#
+# One company to a line: SYMBOL: name, name. '#' starts a comment. The file is read for
+# each scan, so a name added here counts on the next one.
+BAC: BofA
+C: Citi, Citibank
+SPCX: SpaceX, SpaceXAI
 NU: Nubank
+GOOG: Google
 GOOGL: Google
 META: Facebook, Instagram, WhatsApp

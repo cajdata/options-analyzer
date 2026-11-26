@@ -232,20 +232,37 @@ def test_a_filing_time_with_no_zone_is_no_time():
     assert _accepted("2026-11-24T21:05:12") is None and _accepted("yesterday") is None and _accepted(None) is None
 
 
-def test_edgar_notes_the_names_a_company_had_before(tmp_path):
+def test_edgar_notes_the_names_a_company_had_before_and_until_when(tmp_path):
     def handler(request):
         if request.url.path.endswith("company_tickers.json"):
-            return httpx.Response(200, json={"0": {"ticker": "SRTM", "cik_str": 77, "title": "Stratum Holdings Corp."}})
-        former = [{"name": "La Rosa Holdings Corp.", "from": "2021-08-01", "to": "2026-09-30"}, {"name": ""}, "odd", {"name": "Older Name Inc"}]
-        return httpx.Response(200, json={"formerNames": former, "filings": {"recent": {"form": ["8-K"], "items": ["5.02"], "acceptanceDateTime": ["2026-11-20T21:05:12.000Z"], "accessionNumber": ["0001-26-000001"], "primaryDocument": ["a.htm"]}}})
+            return httpx.Response(200, json={"0": {"ticker": "C", "cik_str": 77, "title": "CITIGROUP INC"}})
+        former = [
+            {"name": "La Rosa Holdings Corp.", "from": "2021-08-01T00:00:00.000Z", "to": "2026-09-30T00:00:00.000Z"},
+            {"name": ""},
+            "odd",
+            {"name": "TRAVELERS GROUP INC", "from": "1995-01-01T00:00:00.000Z", "to": "1998-10-08T00:00:00.000Z"},
+            {"name": "No Dates Inc"},
+            {"name": "A Fourth Name", "to": "2025-01-01T00:00:00.000Z"},
+        ]
+        recent = {"form": ["8-K"], "items": ["5.02"], "acceptanceDateTime": ["2026-11-20T21:05:12.000Z"], "accessionNumber": ["0001-26-000001"], "primaryDocument": ["a.htm"]}
+        return httpx.Response(200, json={"formerNames": former, "filings": {"recent": recent}})
 
     edgar = EdgarEarnings("test agent", DiskCache(tmp_path), client=httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda _: None)
-    assert edgar.former_names("SRTM") == []  # nothing on file yet, and it asks for nothing
-    assert len(edgar.filings("SRTM")) == 1
-    assert edgar.former_names("SRTM") == ["La Rosa Holdings Corp.", "Older Name Inc"]
+    assert edgar.former_names("C") == []  # nothing on file yet, and it asks for nothing
+    assert len(edgar.filings("C")) == 1
+    # Three are kept, each with the day it was last in use.
+    assert edgar.former_names("C") == ["La Rosa Holdings Corp.", "TRAVELERS GROUP INC", "No Dates Inc"]
+    # Asked for the ones still in use since a day, a name from decades ago is left out, and so is one with no date.
+    # Travelers is somebody else today.
+    assert edgar.former_names("C", since=date(2023, 8, 12)) == ["La Rosa Holdings Corp."]
+    assert edgar.former_names("C", since=date(2026, 10, 1)) == []
     # Read back by another instance, with no request.
     again = EdgarEarnings("test agent", DiskCache(tmp_path), client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500))), sleep=lambda _: None)
-    assert again.former_names("SRTM") == ["La Rosa Holdings Corp.", "Older Name Inc"]
+    assert again.former_names("C", since=date(2023, 8, 12)) == ["La Rosa Holdings Corp."]
+
+    # A record from before the dates were kept says nothing of when, so it gives no names.
+    DiskCache(tmp_path).set("edgar_former_BAC", ["BANKAMERICA CORP/DE/", "NATIONSBANK CORP"])
+    assert edgar.former_names("BAC") == [] and edgar.former_names("BAC", since=date(2023, 8, 12)) == []
 
 
 # -- Symbols and aliases ----------------------------------------------------------------
@@ -281,3 +298,5 @@ def test_other_names_a_company_goes_by_are_read_from_a_file(tmp_path):
     # The file that ships with the app reads cleanly.
     shipped = Settings().aliases()
     assert shipped["NU"] == ("Nubank",) and all(names and all(names) for names in shipped.values())
+    # The brands a rule once guessed at are listed, and both of Alphabet's share classes are.
+    assert shipped["SPCX"] == ("SpaceX", "SpaceXAI") and shipped["C"] == ("Citi", "Citibank") and shipped["GOOG"] == shipped["GOOGL"] == ("Google",)

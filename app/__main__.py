@@ -105,10 +105,11 @@ def _news_lines(symbol: str, ctx: UnderlyingContext) -> list[str]:
         if kind in events.CAUTIONS:
             caution = f"{events.EVENT_TYPES[kind]}: {events.CAUTIONS[kind]}"
             lines.append(textwrap.fill(caution, 110, initial_indent=" " * 8, subsequent_indent=" " * 8))
-    if ctx.news_note:
-        # With no headline line above to carry the ticker, the note carries it.
-        lead = " " * 8 if telling else f"  {symbol:<6}"
-        lines.append(textwrap.fill(ctx.news_note, 110, initial_indent=lead, subsequent_indent=" " * 8))
+    for note in (ctx.news_note, ctx.naming_note):
+        if note:
+            # With no headline line above to carry the ticker, the note carries it.
+            lead = " " * 8 if lines else f"  {symbol:<6}"
+            lines.append(textwrap.fill(note, 110, initial_indent=lead, subsequent_indent=" " * 8))
     return lines
 
 

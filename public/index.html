@@ -467,6 +467,7 @@ function newsBlock(ctx) {
   const parts = [el("h3", {}, "News and filings")];
   if (!status.news_sources.length) return parts.concat(el("p", { class: "sub" }, "No news source is configured."));
   if (ctx.news_note) parts.push(el("p", { class: "sub" }, ctx.news_note));
+  if (ctx.naming_note) parts.push(el("p", { class: "sub" }, ctx.naming_note));
   if (!ctx.news.length) {
     const none = (ctx.news_elsewhere || []).length ? "Nothing of this company's own in the last " : "Nothing in the last ";
     return parts.concat(el("p", { class: "sub" }, none + rules.recent_days + " days. An exchange-traded fund usually has none."), elsewhereBlock(ctx));
