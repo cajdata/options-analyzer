@@ -249,8 +249,13 @@ COMPANIES = {
 }
 
 
+# Brands a registered name does not give, as data/aliases.txt lists them.
+LISTED = {"C": ("Citi", "Citibank"), "SPCX": ("SpaceX",), "NU": ("Nubank",), "META": ("Facebook", "Instagram", "WhatsApp")}
+
+
 def typed(symbol: str, text: str, summary: str = "") -> str:
-    return events.headline_type(text, events.aliases(symbol, COMPANIES[symbol]), summary)
+    also = events.also_called(LISTED.get(symbol, ()))
+    return events.headline_type(text, events.aliases(symbol, COMPANIES[symbol]), summary, also)
 
 
 @pytest.mark.parametrize(
@@ -470,8 +475,8 @@ def test_a_notice_filed_with_the_results_keeps_its_own_type():
     "symbol, text, named",
     [
         # Seen live: each of these companies had most of its own headlines set aside.
-        ("SPCX", "SpaceX to Launch Starship Flight 14", True),  # a word built on the first word of the name
-        ("C", "Citi Launches New Card for Small Businesses", True),  # the first four letters or more of it
+        ("SPCX", "SpaceX to Launch Starship Flight 14", True),  # a brand, listed for it
+        ("C", "Citi Launches New Card for Small Businesses", True),
         ("SLSN", "Sol\u00e9sence, Inc. Reports Third Quarter 2026 Financial Results", True),  # an accent
         ("BBD", "Bradesco Launches New Marketing Campaign", True),  # the telling word after a common one
         ("GEV", "GE Vernova Wins Turbine Order", True),  # a two-letter first word is not the whole name
@@ -504,25 +509,148 @@ def test_how_much_of_a_name_is_needed_when_it_opens_with_a_letter_or_two():
 
 
 def test_a_company_also_goes_by_the_names_it_had_and_the_brands_listed_for_it():
-    names = events.aliases("SRTM", "Stratum Holdings Corp.", ("La Rosa Holdings Corp.", "Stratum Holdings Corp.", ""))
-    assert names == ("SRTM", "stratum holdings", "la rosa holdings")  # cleaned like the name, and none twice
+    names = events.aliases("SRTM", "Stratum Holdings Corp.")
+    also = events.also_called(("La Rosa Holdings Corp.", "La Rosa Holdings Corp.", "", "Sol\u00e9sence, Inc."))
+    assert names == ("SRTM", "stratum holdings")
+    assert also == ("la rosa holdings", "solesence")  # cleaned like a name, accents off, and none twice
     old = "La Rosa Holdings Launches 'JAEME' AI Technology System"
-    assert events.headline_type(old, names, NOBODY) == "product"
-    assert events.headline_type(old, events.aliases("SRTM", "Stratum Holdings Corp."), NOBODY) == "another"
+    assert events.headline_type(old, names, NOBODY, also) == "product"
+    assert events.headline_type(old, names, NOBODY) == "another"
 
-    nubank = events.aliases("NU", "Nu Holdings Ltd.", ("Nubank",))
-    assert nubank == ("nu holdings", "nubank")
-    assert events.headline_type("Nubank Raises Full-Year Revenue Guidance", nubank, NOBODY) == "guidance"
-    assert events.headline_type("Tidewell to Acquire Nubank for $40 Billion", nubank, NOBODY) == "takeover"
-    assert events.aliases("C", "CITIGROUP INC", ("Sol\u00e9sence",)) == ("citigroup", "solesence")  # accents taken off
+    nubank = events.aliases("NU", "Nu Holdings Ltd."), events.also_called(("Nubank",))
+    assert nubank == (("nu holdings",), ("nubank",))
+    assert events.headline_type("Nubank Raises Full-Year Revenue Guidance", nubank[0], NOBODY, nubank[1]) == "guidance"
 
     # A service with nowhere to look former names up has none, and a lookup that fails gives none.
-    def down(symbol):
+    def down(symbol, since):
         raise httpx.ConnectError("down")
 
-    assert NewsService(NullCache()).former_names("ACME") == ()
-    assert NewsService(NullCache(), former_names=down).former_names("ACME") == ()
-    assert NewsService(NullCache(), former_names=lambda s: ["Old Acme Inc"]).former_names("ACME") == ("Old Acme Inc",)
+    since = date(2023, 8, 1)
+    assert NewsService(NullCache()).former_names("ACME", since) == ()
+    assert NewsService(NullCache(), former_names=down).former_names("ACME", since) == ()
+    asked = []
+    service = NewsService(NullCache(), former_names=lambda symbol, day: asked.append((symbol, day)) or ["Old Acme Inc"])
+    assert service.former_names("ACME", since) == ("Old Acme Inc",) and asked == [("ACME", since)]
+
+
+@pytest.mark.parametrize(
+    "given, plain",
+    [
+        ("COSTCO WHOLESALE CORP /NEW", "costco wholesale"),  # what the SEC adds to tell registrants apart
+        ("BANK OF AMERICA CORP /DE/", "bank of america"),
+        ("BANKAMERICA CORP/DE/", "bankamerica"),
+        ("APPLE COMPUTER INC/ FA", "apple computer"),
+        ("M/I HOMES, INC.", "m i homes"),  # a slash inside a name is part of it
+        ("PRICE/COSTCO INC", "price costco"),  # seen live: this had become the alias "price"
+        ("20/20 Biolabs, Inc.", "20 20 biolabs"),
+        ("The Cigna Group", "cigna group"),
+        ("Sol\u00e9sence, Inc.", "solesence"),
+        ("", ""),
+        ("/DE/", ""),
+    ],
+)
+def test_a_registered_name_is_cleaned_without_losing_what_follows_a_slash(given, plain):
+    assert events._plain_name(given) == plain
+    assert events.aliases("ZZZZ", given) == (("ZZZZ", plain) if plain else ("ZZZZ",))
+
+
+def test_a_name_with_a_slash_in_it_is_found_as_headlines_write_it():
+    names = events.aliases("MHO", "M/I HOMES, INC.")
+    assert names == ("MHO", "m i homes") and events._named(names) is not None
+    assert events.headline_type("M/I Homes Opens New Community in Tampa", names, NOBODY) == "product"
+    assert events.headline_type("Tidewell to Acquire M/I Homes for $4 Billion", names, NOBODY) == "takeover"
+    assert events.headline_type("Tidewell Homes Opens New Community", names, NOBODY) == "another"  # "homes" names nobody
+
+
+@pytest.mark.parametrize(
+    "symbol, name, text",
+    [
+        # Seen live in the cache after a word built on the name was allowed to stand for it.
+        ("META", "Meta Platforms, Inc.", "Inderes Lowers Price Target for Metacon"),
+        ("META", "Meta Platforms, Inc.", "Metacon Awarded EU Funding for Hydrogen Project"),
+        ("BAC", "BANK OF AMERICA CORP /DE/", "Bank of England Cuts 2026 Growth Forecast"),
+        ("BAC", "BANK OF AMERICA CORP /DE/", "Bank of Japan Raises Inflation Outlook"),
+        ("GS", "GOLDMAN SACHS GROUP INC", "Gold Miner Raises Full-Year Production Outlook"),
+        ("INTC", "INTEL CORP", "Intelligence Firm Raises Full-Year Revenue Guidance"),
+        ("CRM", "Salesforce, Inc.", "Sales Forecast Raised at Tidewell Systems"),
+        ("COST", "COSTCO WHOLESALE CORP /NEW", "Cost of Living Forecast Raised by Tidewell Research"),
+        ("SHOP", "SHOPIFY INC.", "Shop Owners Raise Full-Year Sales Outlook"),
+        ("GME", "GameStop Corp.", "Game Maker Raises Full-Year Revenue Guidance"),
+        ("COIN", "Coinbase Global, Inc.", "Coin Issuer Prices $500 Million Notes Offering"),
+    ],
+)
+def test_a_word_that_only_starts_like_the_name_does_not_name_the_company(symbol, name, text):
+    names = events.aliases(symbol, name)
+    assert events.headline_type(text, names, NOBODY) == "another"
+    # In particular it is not the company opening the headline, which would turn a flagged type on.
+    assert events._named(names)[0].match(text) is None
+
+
+@pytest.mark.parametrize(
+    "symbol, text",
+    [
+        # Seen live: a brand that is one unit of the company, and a name it had decades ago.
+        ("C", "Banorte to Acquire Citibank for $5 Billion"),
+        ("META", "Tidewell to Acquire WhatsApp for $30 Billion"),
+        ("NU", "Tidewell to Acquire Nubank for $40 Billion"),
+    ],
+)
+def test_a_takeover_by_name_goes_by_the_companys_own_name_and_no_other(symbol, text):
+    COMPANIES.setdefault("META", "Meta Platforms, Inc.")
+    COMPANIES.setdefault("NU", "Nu Holdings Ltd.")
+    kind = typed(symbol, text, NOBODY)
+    # The headline is about the company, so it is not set aside. But no buyout caution is raised on it.
+    assert kind not in ("takeover", "another")
+    # Under its registered name it is a takeover as before.
+    assert events.headline_type("Tidewell to Acquire Citigroup for $200 Billion", events.aliases("C", COMPANIES["C"]), NOBODY) == "takeover"
+
+
+@pytest.mark.parametrize(
+    "symbol, text",
+    [
+        # Seen live for every company with a name of two words or more: the check passed on the name's own second word.
+        ("COST", "Costco Wholesale Supplier Foxconn Cuts Full-Year Revenue Outlook"),
+        ("COST", "Costco Wholesale's Supplier Foxconn Cuts Full-Year Revenue Outlook"),
+        ("COST", "Costco Supplier Foxconn Cuts Full-Year Revenue Outlook"),
+        ("GS", "Goldman Sachs Partner Firm Cuts Full-Year Revenue Outlook"),
+        ("JPM", "JPMorgan Chase Rival Bank Cuts Full-Year Revenue Outlook"),
+        ("PLTR", "Palantir Technologies Customer Tidewell Seeks $1 Billion Financing"),
+        ("AAPL", "Apple's Top Chip Supplier Cuts Full-Year Revenue Outlook"),
+    ],
+)
+def test_someone_else_after_the_name_is_seen_however_long_the_name_is(symbol, text):
+    names = events.aliases(symbol, COMPANIES[symbol])
+    opens = events._named(names)[0]
+    lead = opens.match(text)
+    assert lead is not None and events._SOMEONE_ELSE.match(text, lead.end())
+    assert events.headline_type(text, names, NOBODY) not in events.IN_FRONT
+    # The company's own news, under the same long name, still counts.
+    own = text.split(" Supplier ")[0].split("'s ")[0].split(" Partner ")[0].split(" Rival ")[0].split(" Customer ")[0]
+    assert events.headline_type(own + " Raises Full-Year Revenue Guidance", names, NOBODY) == "guidance"
+
+
+def test_another_name_is_given_whole():
+    # Seen live: SunPower was Complete Solaria until this year, and "Complete" alone is anybody.
+    names, also = events.aliases("SPWR", "SunPower Inc."), events.also_called(("Complete Solaria, Inc.",))
+    assert also == ("complete solaria",)
+    opens, _ = events._named(names, also)
+    other = "Complete Energy Announces $50 Million Share Offering"
+    assert events.headline_type(other, names, NOBODY, also) == "another" and opens.match(other) is None
+    assert events.headline_type("Complete Solaria Announces $50 Million Share Offering", names, NOBODY, also) == "financing"
+    assert events.headline_type("SunPower Announces $50 Million Share Offering", names, NOBODY, also) == "financing"
+    # A brand of one word is the whole of it, and the company's own name still goes by its first word.
+    assert events._named(events.aliases("C", "CITIGROUP INC"), ("citi",))[0].match("Citi Launches New Card")
+    assert events._named(events.aliases("PXD", "PIONEER NATURAL RESOURCES CO"))[0].match("Pioneer Raises Guidance")
+    assert events._named((), ("k wave media",))[0].match("K Wave Media Executes 1-for-30 Reverse Stock Split")
+    assert events._named((), ("k wave media",))[0].match("K Street Lobbyists Gather") is None
+
+
+def test_a_plain_word_of_a_name_names_nobody():
+    rocket = events.aliases("RKT", "Rocket Companies, Inc.")
+    # Seen live: "companies" stood for Rocket Companies, and let two of Reckitt's headlines through.
+    assert events.headline_type("Reckitt Named Among Best Companies to Work for in Asia", rocket, "Reckitt was named.") == "another"
+    assert events.headline_type("Rocket Companies Named Among Best Places to Work", rocket, NOBODY) != "another"
+    assert {"companies", "company", "sales", "games", "homes"} <= events._PLAIN_WORDS
 
 
 def test_every_rule_points_at_a_type_with_a_label():

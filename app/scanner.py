@@ -122,7 +122,6 @@ class Scanner:
         self.earnings = earnings
         self.news = news  # None leaves the news section out of every scan
         self.pool = pool  # None leaves pooled studies out of the news section
-        self._also = settings.aliases()  # brands and other names the registered name does not give
         self.settings = settings
         self.universe = universe or []  # symbols a discovery scan always considers
         self._today = today
@@ -262,19 +261,23 @@ class Scanner:
             return []
 
         tallies: dict[str, dict[str, list[int]]] = {}
+        listed = self.settings.aliases()  # read for each scan, so a name added to the file counts on the next one
 
         def load(symbol: str) -> str | None:
             ctx = underlyings[symbol]
             try:
                 items, ctx.news_note, failed = self.news.items(symbol, today)
-                found = events.context(items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, self._called(symbol))
+                names, also = self._called(symbol, listed, today)
+                found = events.context(items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, names, also)
                 ctx.news, ctx.recent_events, ctx.event_studies, ctx.news_elsewhere = found[:4]
                 ctx.coverage = found.coverage
                 missing, of = found.unnamed
                 if of >= UNNAMED_LEAST and missing > of * UNNAMED_SHARE:
-                    said = f"{missing} of the {of} headlines the feed tags with {symbol} never name {self.news.name(symbol) or 'the company'}, and are set aside."
-                    said += " If it goes by another name, add that to data/aliases.txt."
-                    ctx.news_note = " ".join(n for n in (ctx.news_note, said) if n)
+                    ctx.naming_note = (
+                        f"{missing} of the {of} headlines the feed tags with {symbol} never name "
+                        f"{self.news.name(symbol) or 'the company'}, and are set aside. "
+                        "If it goes by another name, add that to data/aliases.txt."
+                    )
                 # A lookup that failed has left part of the news out. A tally built from the rest
                 # would take the place of a full one, and could move the stock to the other group.
                 if not failed and events.unpoolable(items, bars.get(symbol, []), earnings_days.get(symbol, set())) is None:
@@ -292,10 +295,11 @@ class Scanner:
         # One note for all of them. A failure is usually the same one for every stock.
         return [f"News could not be loaded for {_names(failed)}. {underlyings[failed[0]].news_note}"]
 
-    def _called(self, symbol: str) -> tuple[str, ...]:
-        """Everything a headline may call the company: its ticker, its name, names it had before, and listed aliases."""
-        also = (*self.news.former_names(symbol), *self._also.get(symbol, ()))
-        return events.aliases(symbol, self.news.name(symbol), also)
+    def _called(self, symbol: str, listed: dict[str, tuple[str, ...]], today: date) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Who the company is, and what else a headline may call it: a name it had within the price history, a listed brand."""
+        since = today - timedelta(days=HISTORY_DAYS)
+        also = events.also_called((*self.news.former_names(symbol, since), *listed.get(symbol, ())))
+        return events.aliases(symbol, self.news.name(symbol)), also
 
     def _pool_studies(self, shown: list[UnderlyingContext], tallies: dict[str, dict[str, list[int]]]) -> None:
         """Add what this scan's stocks bring to the pool, then give each its pooled studies.
@@ -343,11 +347,12 @@ class Scanner:
 
             added = {group: 0 for group in events.GROUPS}
             passed_over: dict[str, int] = {}
+            listed = self.settings.aliases()
 
             def skip(why: str) -> None:
                 passed_over[why] = passed_over.get(why, 0) + 1
 
-            ready: dict[str, tuple[list, list[EarningsEvent], tuple[str, ...]]] = {}
+            ready: dict[str, tuple[list, list[EarningsEvent], tuple[tuple[str, ...], tuple[str, ...]]]] = {}
             for n, symbol in enumerate(wanted, 1):
                 if progress:
                     progress(n, len(wanted), symbol)
@@ -369,7 +374,7 @@ class Scanner:
                 if not reports:
                     skip("no report days")
                     continue
-                ready[symbol] = (items, reports, self._called(symbol))
+                ready[symbol] = (items, reports, self._called(symbol, listed, today))
 
             batch = list(ready)
             for i in range(0, len(batch), WIDEN_BARS):
@@ -379,14 +384,14 @@ class Scanner:
                 except Exception:
                     bars = {}
                 for symbol in group_of:
-                    items, reports, names = ready[symbol]
+                    items, reports, (names, also) = ready[symbol]
                     history = bars.get(symbol) or []
                     report_days = earnings_math.reaction_days(reports, history)
                     why = events.unpoolable(items, history, report_days)
                     if why:
                         skip(why)
                         continue
-                    found = events.context(items, history, report_days, today, names)
+                    found = events.context(items, history, report_days, today, names, also)
                     self.pool.add(symbol, found.coverage, found.tally)
                     added[found.coverage] += 1
             self.market.notes.clear()  # nobody is shown a scan here, so its notes have no reader

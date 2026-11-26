@@ -226,20 +226,32 @@ class EdgarEarnings:
         found = self._company(symbol)
         return found[1] or None if found else None
 
-    def former_names(self, symbol: str) -> list[str]:
+    def former_names(self, symbol: str, since: date | None = None) -> list[str]:
         """Names the company had before, newest first, as far as they are on file. It costs no request.
 
         A renamed company goes on being called by its old name in headlines
         ("La Rosa Holdings" for Stratum Holdings). The SEC gives former names
         with a company's filings, so they are noted whenever those are read.
+
+        With `since`, only a name still in use on or after that day is given.
+        The SEC keeps every name a registrant ever had, and an old one may be
+        somebody else's today: Citigroup was Travelers Group until 1998, and
+        Travelers is a company in its own right.
         """
         found = self._cache.get(f"edgar_former_{symbol}", self.FORMER_TTL)
-        return [str(n) for n in found] if isinstance(found, list) else []
+        out = []
+        for row in found if isinstance(found, list) else []:
+            if not isinstance(row, list) or len(row) != 2:
+                continue  # a record from before the dates were kept: it says nothing of when
+            name, until = str(row[0]), str(row[1] or "")
+            if since is None or until[:10] >= since.isoformat():
+                out.append(name)
+        return out
 
     def _note_names(self, symbol: str, data: Any) -> None:
         former = data.get("formerNames") if isinstance(data, dict) else None
-        names = [str(row.get("name") or "").strip() for row in former or [] if isinstance(row, dict)]
-        self._cache.set(f"edgar_former_{symbol}", [n for n in names if n][: self.FORMER_NAMES])
+        rows = [[str(row.get("name") or "").strip(), str(row.get("to") or "")[:10]] for row in former or [] if isinstance(row, dict)]
+        self._cache.set(f"edgar_former_{symbol}", [row for row in rows if row[0]][: self.FORMER_NAMES])
 
     def history(self, symbol: str, want: int = 12) -> list[EarningsEvent]:
         cik = self._cik(symbol)

@@ -61,7 +61,7 @@ class NewsService:
         headline_source: HeadlineSource | None = None,
         filing_source: FilingSource | None = None,
         names: Callable[[str], str | None] | None = None,
-        former_names: Callable[[str], list[str]] | None = None,
+        former_names: Callable[[str, date], list[str]] | None = None,
     ) -> None:
         self._cache = cache
         self._headline_source = headline_source
@@ -78,12 +78,12 @@ class NewsService:
         except _FAILURES:
             return None
 
-    def former_names(self, symbol: str) -> tuple[str, ...]:
-        """Names the company had before. Empty when there is nowhere to look, or the lookup fails."""
+    def former_names(self, symbol: str, since: date) -> tuple[str, ...]:
+        """Names the company still had on or after `since`. Empty when there is nowhere to look, or the lookup fails."""
         if self._former_names is None:
             return ()
         try:
-            return tuple(self._former_names(symbol))
+            return tuple(self._former_names(symbol, since))
         except _FAILURES:
             return ()
 

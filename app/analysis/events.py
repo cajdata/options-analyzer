@@ -576,27 +576,47 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
 
 
-def aliases(symbol: str, name: str | None = None, also: Iterable[str] = ()) -> tuple[str, ...]:
-    """What a headline may call a company: its ticker, its name without the legal ending, and any other names given.
+# What the SEC puts after a name to tell two registrants apart: " /NEW", "/DE/", "/ FA", "/ADR".
+# Only at the end. A slash inside a name is part of it: "M/I Homes", "Price/Costco".
+_REGISTRY_TAG = re.compile(r"\s*/\s*[A-Za-z0-9]{1,4}\s*/?\s*$")
+
+
+def _plain_name(given: str) -> str:
+    """A company name as it is matched: no accents, no registry tag, no legal ending, in lower case. Empty if nothing is left."""
+    plain = _LEGAL_ENDING.sub("", _REGISTRY_TAG.sub("", _fold(given).strip()).replace("/", " ").strip())
+    words = re.findall(r"[a-z0-9][a-z0-9'&-]*", plain.lower())
+    if words[:1] == ["the"]:
+        words = words[1:]
+    return " ".join(words[:MAX_NAME_WORDS])
+
+
+def aliases(symbol: str, name: str | None = None) -> tuple[str, ...]:
+    """Who the company is: its ticker, and its registered name without the legal ending.
 
     An entry in capitals is a ticker and has to match exactly, so COST is not
-    "cost". A one- or two-letter ticker is left out. A name is in lower case
+    "cost". A one- or two-letter ticker is left out. The name is in lower case
     and matches in any case. How much of it a headline has to give is settled
     where it is matched (`_spelled`).
 
-    `also` are names the company goes by that its registered name does not
-    give: a name it had before ("La Rosa Holdings" for Stratum Holdings, from
-    the SEC), or a brand ("Nubank" for Nu Holdings, from data/aliases.txt).
+    These are the names the by-name takeover rule goes by, and nothing else
+    is: see `also_called`.
     """
     out = [symbol.upper()] if len(symbol) >= 3 and symbol.isalpha() else []
-    for given in (name or "", *also):
-        plain = _LEGAL_ENDING.sub("", given.split("/")[0].strip())
-        words = re.findall(r"[a-z0-9][a-z0-9'&-]*", _fold(plain).lower())
-        if words[:1] == ["the"]:
-            words = words[1:]
-        if words and " ".join(words[:MAX_NAME_WORDS]) not in out:
-            out.append(" ".join(words[:MAX_NAME_WORDS]))
-    return tuple(out)
+    plain = _plain_name(name or "")
+    return tuple(out + [plain]) if plain else tuple(out)
+
+
+def also_called(names: Iterable[str]) -> tuple[str, ...]:
+    """Other names a company goes by, cleaned like its own: a name it had before, a brand.
+
+    They tell whether a headline is about the company at all ("La Rosa
+    Holdings" for Stratum Holdings, "Nubank" for Nu Holdings). They are never
+    given to the by-name takeover rule. A brand is often one part of the
+    company: "to Acquire Citibank" or "to Acquire WhatsApp" is a sale of a
+    unit, and read as a takeover of Citigroup or Meta it would raise the
+    buyout caution on the wrong company.
+    """
+    return tuple(dict.fromkeys(plain for plain in map(_plain_name, names) if plain))
 
 
 def _needed(words: list[str]) -> int | None:
@@ -622,7 +642,7 @@ def _spelled(name: str) -> str | None:
     need = _needed(words)
     if need is None:
         return None
-    gap = r"(?:[\s.]*&)?[\s.]+"  # "Procter & Gamble" is on file as two words, "W.W. Grainger" as three
+    gap = r"(?:[\s./]*&)?[\s./]+"  # "Procter & Gamble" is on file as two words, "W.W. Grainger" as three, "M/I Homes" too
     rest = ""
     for word in reversed(words[need:]):
         rest = rf"(?:{gap}{re.escape(word)}{rest})?"
@@ -649,35 +669,32 @@ def _bought(names: tuple[str, ...]) -> re.Pattern[str] | None:
 # Words in a company's name that name nobody by themselves ("Palantir Technologies",
 # "Costco Wholesale"), so a headline that has only that word does not name the company.
 _PLAIN_WORDS = frozenset(
-    "aerospace airlines airways america automotive bancorp biosciences biotech brands capital communications company "
-    "connectivity corporation devices electric electronics enterprises entertainment exploration express financial foods "
-    "global group health healthcare holdings industries instruments interactive international laboratories labs lines "
-    "logistics materials medical micro minerals mining motor motors networks partners petroleum pharma pharmaceuticals "
-    "platforms power properties realty resources restaurants sciences semiconductor semiconductors services software "
-    "solutions steel stores systems technologies technology therapeutics trust wholesale wireless worldwide".split()
+    "acquisition aerospace airlines airways america associates automotive bancorp bancshares biosciences biotech brands "
+    "capital cloud communications communities companies company connectivity corporation data devices electric electronics "
+    "enterprises entertainment equity exploration express financial foods fund games global group growth health healthcare "
+    "holdings homes hotels income industries instruments insurance interactive international investments laboratories labs "
+    "lines logistics management materials media medical micro minerals mining mobile motor motors networks online partners "
+    "petroleum pharma pharmaceuticals pictures platforms power products properties realty resorts resources restaurants "
+    "sales sciences semiconductor semiconductors services software solutions steel stores studios supply systems "
+    "technologies technology therapeutics trust value ventures wholesale wireless works worldwide".split()
 )
-# After the name these make someone else the subject: "Apple Supplier Foxconn Cuts Outlook".
+# After a name these make someone else the subject: "Apple Supplier Foxconn Cuts Outlook",
+# "Apple's Top Supplier Foxconn". This is asked once the whole name has been matched and
+# never inside the name's own pattern. There, a miss sent the matcher back to a shorter
+# reading of the name ("Costco" out of "Costco Wholesale"), after which the next word was
+# the company's own and the check passed.
 _OF_ANOTHER = r"supplier|rival|competitor|partner|backer|investor|customer|peer|spin-?off"
-
-
-def _stem(word: str) -> str:
-    """A pattern for a word built on `word`: the whole of it with more letters after, or its first four letters or more.
-
-    So "SpaceX" is found for "space" and "Citi" for "citigroup". "Costain" is
-    neither for "costco", and "Pharos" is neither for "pharming": both are
-    other companies with a ticker like this one's.
-    """
-    if len(word) < 6:
-        return re.escape(word) + r"\w*"
-    rest = r"\w*"
-    for letter in reversed(word[4:]):
-        rest = f"(?:{re.escape(letter)}{rest})?"
-    return re.escape(word[:4]) + rest
+_SOMEONE_ELSE = re.compile(rf"(?:\s+(?:{_OF_ANOTHER})\b|'s\s+(?:\S+\s+){{0,2}}?(?:{_OF_ANOTHER})\b)", re.IGNORECASE)
 
 
 @lru_cache(maxsize=512)
-def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | None:
+def _named(names: tuple[str, ...], also: tuple[str, ...] = ()) -> tuple[re.Pattern[str], re.Pattern[str]] | None:
     """Two patterns for a company: its name opening a headline, and its name anywhere in a text.
+
+    `names` are who it is and `also` what else it goes by. One of the others
+    has to be given with its first two words when it has two: a headline says
+    "Complete Solaria", the name SunPower had, and a headline that opens
+    "Complete Energy ..." is somebody else.
 
     None when no name is known, only a ticker. Headlines rarely give the
     ticker, so with nothing else to go by every headline would look like
@@ -685,27 +702,30 @@ def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | 
 
     Both are looser than the spelling a takeover needs (`_spelled`). They take
     the name with its dots and spaces moved ("J.P. Morgan" and "JPMorganChase"
-    for "jpmorgan chase"), a later word of the name alone ("Lilly", "Chase")
-    unless that word is a plain one, and a word built on the first word
-    ("SpaceX", "Citi"). Looser is the safe side here: a headline wrongly taken
-    to name the company is typed as it always was. A headline wrongly taken
-    not to name it is set aside, which for a company the feed calls by a brand
-    was most of its news.
+    for "jpmorgan chase") and a later word of the name alone ("Lilly",
+    "Chase"), unless that word is a plain one.
+
+    They go no further than that, and in particular take no word merely built
+    on the name. That was tried: "SpaceX" for "space" also made "Metacon" Meta,
+    "Intelligence" Intel and "Bank" the former BankAmerica, and a wrong match
+    at the front of a headline is not harmless. It turns on every rule that
+    asks whether the company opens the headline. A brand is listed instead
+    (data/aliases.txt).
     """
     ways = []
-    for name in names:
+    for name, own in [*((n, True) for n in names), *((n, False) for n in also)]:
         words = name.split()
         need = None if name.isupper() else _needed(words)
         if need is None:
             continue
-        gap = r"[\s&.,']*"  # the apostrophe for "O'Reilly", on file as "O REILLY"
+        if not own:
+            need = max(need, min(2, len(words)))
+        gap = r"[\s&.,'/]*"  # the apostrophe for "O'Reilly", on file as "O REILLY", and the slash for "M/I Homes"
         loosely = [r"[.\s]*".join(map(re.escape, word)) if len(word) >= 6 else re.escape(word) for word in words]
         rest = ""
         for word in reversed(loosely[need:]):
             rest = rf"(?:{gap}{word}{rest})?"
         ways.append(gap.join(loosely[:need]) + rest)
-        if need == 1 and len(words[0]) >= 4:
-            ways.append(_stem(words[0]))
         telling = lambda w, least: len(w) >= least and w not in _COMMON and w not in _PLAIN_WORDS and w not in _JOINING  # noqa: E731
         # A later word of the name alone ("Lilly"), and a needed word after the first when it
         # could hardly be anyone else ("Bradesco" for Bank Bradesco, "Grainger" for W.W. Grainger).
@@ -715,10 +735,7 @@ def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | 
         return None
     tickers = [re.escape(n) for n in names if n.isupper()]
     who = "|".join([f"(?i:{way})" for way in ways] + tickers)
-    # Not the company's own news when someone else follows the name: "Apple Supplier Foxconn",
-    # "Apple's Top Supplier Foxconn".
-    another = rf"(?!\s+(?i:{_OF_ANOTHER})\b)(?!'s\s+(?:\S+\s+){{0,2}}?(?i:{_OF_ANOTHER})\b)"
-    opens = re.compile(rf"(?:(?i:the)\s+)?(?:{who})(?![A-Za-z0-9-]){another}")
+    opens = re.compile(rf"(?:(?i:the)\s+)?(?:{who})(?![A-Za-z0-9-])")
     anywhere = re.compile(rf"(?<![A-Za-z0-9])(?:{who})(?![A-Za-z0-9])")
     return opens, anywhere
 
@@ -755,8 +772,8 @@ _HOLDS = re.compile(r"\b(?:stake|holdings?|shareholding|voting rights)\s+in\s+(.
 _ITSELF = re.compile(r"(?:the company|itself|its own)\b", re.IGNORECASE)
 
 
-def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> str:
-    """A headline's event type. `names` are what the company may be called (see `aliases`).
+def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "", also: tuple[str, ...] = ()) -> str:
+    """A headline's event type. `names` are who the company is (see `aliases`), `also` what else it goes by (`also_called`).
 
     The feed tags the buyer, its bankers and the company being bought with the
     same headline, and the keyword rules cannot tell them apart. With the
@@ -783,15 +800,17 @@ def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> 
     Where one of the last two does not hold, the rest of the table decides.
     """
     text, summary = _fold(text), _fold(summary)
-    bought = _bought(names)
+    bought = _bought(names)  # the company's own names only: a brand may be one unit of it
     if bought is not None and bought.search(text):
         return "takeover"
-    known = _named(names)
+    known = _named(names, also)
     lead = None
     if known is not None:
         opens, anywhere = known
         if anywhere.search(text):
             lead = opens.match(text)
+            if lead and _SOMEONE_ELSE.match(text, lead.end()):
+                lead = None
         elif summary and not anywhere.search(summary):
             return ELSEWHERE
         if lead:
@@ -814,10 +833,10 @@ def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> 
     return "other"
 
 
-def classify(item: NewsItem, names: tuple[str, ...] = ()) -> NewsItem:
+def classify(item: NewsItem, names: tuple[str, ...] = (), also: tuple[str, ...] = ()) -> NewsItem:
     """The item with its event type set. A filing also gets a title that spells out its items."""
     if item.kind != "filing":
-        return replace(item, event=headline_type(item.title, names, item.summary))
+        return replace(item, event=headline_type(item.title, names, item.summary, also))
     carried = [FILING_ITEMS[code] for code in FILING_ITEMS if code in item.items]
     if not carried:
         return replace(item, event="other")
@@ -1055,14 +1074,20 @@ class NewsContext(NamedTuple):
 
 
 def context(
-    items: list[NewsItem], bars: list[Bar], earnings_days: set[date], today: date, names: tuple[str, ...] = ()
+    items: list[NewsItem],
+    bars: list[Bar],
+    earnings_days: set[date],
+    today: date,
+    names: tuple[str, ...] = (),
+    also: tuple[str, ...] = (),
 ) -> NewsContext:
     """One stock's news for a scan: the latest items, a count of recent ones by type, the studies,
     the recent items that are another company's news, and its place in a pool.
 
-    `items` are everything on record for the stock, classified or not, and
-    `names` are what a headline may call the company. A study is built for
-    each type seen in the last `RECENT_DAYS` days, from the whole record.
+    `items` are everything on record for the stock, classified or not.
+    `names` are who the company is and `also` what else a headline may call
+    it. A study is built for each type seen in the last `RECENT_DAYS` days,
+    from the whole record.
 
     The list holds the newest `MAX_RECENT` items, plus the newest item of each
     flagged type that a busy week pushed out of them. A chip that says
@@ -1075,7 +1100,7 @@ def context(
     The tally is over the whole record and every type in it, not only the
     recent ones: it is this stock's share of a pool that other stocks draw on.
     """
-    classified = sorted((classify(i, names) for i in items), key=lambda i: i.when, reverse=True)
+    classified = sorted((classify(i, names, also) for i in items), key=lambda i: i.when, reverse=True)
     cutoff = today - timedelta(days=RECENT_DAYS)
     recent = [i for i in classified if _felt(i.when)[0] >= cutoff]
     counts = Counter(i.event for i in recent)
@@ -1093,11 +1118,11 @@ def context(
         elsewhere=elsewhere,
         coverage=coverage(classified, today),
         tally=tally(classified, bars, earnings_days),
-        unnamed=_unnamed(items, names),
+        unnamed=_unnamed(items, names, also),
     )
 
 
-def _unnamed(items: Iterable[NewsItem], names: tuple[str, ...]) -> tuple[int, int]:
+def _unnamed(items: Iterable[NewsItem], names: tuple[str, ...], also: tuple[str, ...] = ()) -> tuple[int, int]:
     """How many of a stock's headlines name the company nowhere, headline or summary, out of how many.
 
     A large share means one of two things, and no rule can say which: the feed
@@ -1105,7 +1130,7 @@ def _unnamed(items: Iterable[NewsItem], names: tuple[str, ...]) -> tuple[int, in
     under Rocket Companies), or the company goes by a name that is not on file
     (Nubank for Nu Holdings). The scan says so when it is most of them.
     """
-    known = _named(names)
+    known = _named(names, also)
     heads = [i for i in items if i.kind == "headline" and i.summary]
     if known is None:
         return 0, len(heads)

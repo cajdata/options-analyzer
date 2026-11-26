@@ -424,7 +424,7 @@ def test_reports_that_fall_outside_the_price_history_do_not_qualify_a_stock():
     assert pool.totals()["light"]["stocks"] == 0
 
 
-def test_the_scan_says_when_most_of_a_stocks_headlines_never_name_it(capsys):
+def test_the_scan_says_when_most_of_a_stocks_headlines_never_name_it(capsys, tmp_path):
     from app.__main__ import print_scan
 
     class Feed:
@@ -451,10 +451,15 @@ def test_the_scan_says_when_most_of_a_stocks_headlines_never_name_it(capsys):
     feed = NewsService(NullCache(), headline_source=Feed(), filing_source=NoFilings(), names=NAMES.get)
     result = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed).scan(ScanRequest(symbols=["ACME"]))
     acme = result.underlyings["ACME"]
-    assert acme.news_note == (
+    assert acme.naming_note == (
         "12 of the 15 headlines the feed tags with ACME never name Acme, and are set aside. "
         "If it goes by another name, add that to data/aliases.txt."
     )
+    # It is not a note about a source: that one is kept for a lookup that failed or cannot answer.
+    assert acme.news_note is None
+    # And it is not sent to the AI brief, which is given neither the set-aside headlines nor a count of them.
+    payload = json.dumps(ai.scan_payload(result))
+    assert "never name" not in payload and "aliases.txt" not in payload
     assert acme.recent_events["another"] == 12 and len(acme.news) == 3
     # It is a note about one stock, not a failed lookup, so it is not among the scan's warnings.
     assert not any("never name" in w for w in result.warnings)
@@ -464,7 +469,38 @@ def test_the_scan_says_when_most_of_a_stocks_headlines_never_name_it(capsys):
     assert "12 of the 15 headlines the feed tags with ACME never name Acme" in out
 
     # A listed alias settles it: the same headlines are the company's own, and nothing is said.
-    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed)
-    scanner._also = {"ACME": ("Brandco",)}
+    # The file is read for each scan, so a server that has been running for days picks the name up.
+    listed = tmp_path / "aliases.txt"
+    listed.write_text("# nothing yet\n")
+    scanner = Scanner(market, earnings, Settings(aliases_file=listed), universe=list(SPECS), today=TODAY, news=feed)
+    assert scanner.scan(ScanRequest(symbols=["ACME"])).underlyings["ACME"].naming_note is not None
+    listed.write_text("ACME: Brandco\n")
     named = scanner.scan(ScanRequest(symbols=["ACME"])).underlyings["ACME"]
-    assert named.news_note is None and "another" not in named.recent_events and len(named.news) == events.MAX_RECENT
+    assert named.naming_note is None and "another" not in named.recent_events and len(named.news) == events.MAX_RECENT
+
+
+def test_a_failed_lookup_is_reported_without_the_remark_about_names():
+    class Feed:
+        name = "test"
+
+        def headlines(self, symbol, since):
+            def at(n, title, summary):
+                when = datetime.combine(TODAY - timedelta(days=1 + n % 9), clock(10, 0), tzinfo=ET)
+                return NewsItem(when, "headline", title, "test", ref=str(n), summary=summary)
+
+            return [at(n, f"Brandco Launches Product {n}", "Brandco said it launched a product.") for n in range(12)]
+
+    class Down:
+        name = "SEC EDGAR"
+
+        def filings(self, symbol):
+            raise httpx.ConnectError("down")
+
+    market = DemoMarket(TODAY)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=TODAY)
+    feed = NewsService(NullCache(), headline_source=Feed(), filing_source=Down(), names=NAMES.get)
+    result = Scanner(market, earnings, Settings(), universe=list(SPECS), today=TODAY, news=feed).scan(ScanRequest(symbols=["ACME"]))
+    acme = result.underlyings["ACME"]
+    # Both things are true of this stock, and each is said in its own place.
+    assert acme.news_note == "SEC EDGAR filings were unavailable (ConnectError)." and "never name" in acme.naming_note
+    assert result.warnings.count("News could not be loaded for ACME. SEC EDGAR filings were unavailable (ConnectError).") == 1
