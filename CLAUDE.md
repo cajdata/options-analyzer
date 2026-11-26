@@ -273,7 +273,7 @@ In so far: typed headlines and filings, a per-stock study of what followed, the 
 
 In so far: a file of entries, a review that sets each one beside today's quotes, the four checks, the path from the entry price, the stock's news, and all of it on the page and the command line. Ask before building any of these.
 
-- **Paper trading and the journal.** The README roadmap puts them next in item 3: paper orders on Alpaca, and a record of which signals worked. Nothing here places an order, and nothing records a position after it is removed. Paper trading would be the first order endpoint in the app, so it is a decision for the person and not a next step to take unasked.
+- **A record of a position after it is closed.** An entry is removed and nothing of it is kept. The journal that would keep it is part of phase 4, below.
 - **Editing an entry.** An entry can be added and removed. To change one it is removed and entered again, or the file is edited by hand.
 - **Positions with more than one leg.** A spread is two entries, and their rules are not combined: the most a vertical can lose, or a covered call's shares, are not known to the page.
 - **The chance of reaching a target before expiry.** It depends on the path. If it is ever shown it needs its own model (first passage or a simulation), never the chance of profit at expiry.
@@ -282,3 +282,18 @@ In so far: a file of entries, a review that sets each one beside today's quotes,
 - **A stock price from after hours.** After 4 p.m. the strike check compares the strike with an after-hours trade while the option's quote is from the close. Where the move puts an option's whole quote under exercise value, the position now shows no result and says the quote is out of date. A smaller move leaves a quote that is just as old and looks fine, and nothing catches that. This is the scan's open problem too (see "What live data looks like").
 - **Anything that watches.** A review runs when the view opens or Refresh is pressed. With free delayed quotes a signal is end-of-day quality, so no timer and no alert was built.
 - **The public page in `docs/`** does not mention positions.
+
+## Phases 4 and 5: paper trading, then live trading (not started, not approved)
+
+The README roadmap numbers them so, since 2026-11-26:
+
+- **Phase 4** is paper trading on Alpaca, with a journal that records which signals worked.
+- **Phase 5** is live trading, with a human approval on every order.
+
+Until then paper trading was the second half of item 3, beside the positions page, and live trading was item 4. Paper trading was given its own number because it is a different kind of step. Everything through phase 3 only reads market data, and phase 4 would add the app's first order endpoint. So phase 3 is the positions page alone, and it is done.
+
+Neither is a next step to take unasked. Ask before building any of it, and when it is asked for:
+
+- **"What this is" at the top of this file says the app has no order endpoints and must stay that way, and the working agreement says not to place trades.** Both hold until the person says otherwise. Phase 4 changes them, so they are rewritten with the person as part of that work, not worked around.
+- **Phase 4 is paper orders only.** A real order belongs to phase 5, where every one needs a human approval.
+- **The journal is what phase 3 leaves out.** Nothing records a position after it is removed, so nothing can yet say which signals worked.

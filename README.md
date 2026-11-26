@@ -304,6 +304,6 @@ Demo mode shows made-up positions held in memory and never touches the file.
    shows what followed its own earlier events of the same type, and the AI brief reads
    the recent ones. Rules decide whose news a headline is, and each type is
    also counted across the stocks covered about as much.
-3. **Started:** a positions page that checks what you hold against the exit rules. Still
-   to come: paper trading on Alpaca with a journal that records which signals worked.
-4. Live trading with a human approval on every order.
+3. **Done:** a positions page that checks what you hold against the exit rules.
+4. Paper trading on Alpaca, with a journal that records which signals worked.
+5. Live trading with a human approval on every order.
