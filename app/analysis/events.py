@@ -684,7 +684,12 @@ _PLAIN_WORDS = frozenset(
 # reading of the name ("Costco" out of "Costco Wholesale"), after which the next word was
 # the company's own and the check passed.
 _OF_ANOTHER = r"supplier|rival|competitor|partner|backer|investor|customer|peer|spin-?off"
-_SOMEONE_ELSE = re.compile(rf"(?:\s+(?:{_OF_ANOTHER})\b|'s\s+(?:\S+\s+){{0,2}}?(?:{_OF_ANOTHER})\b)", re.IGNORECASE)
+# What may stand between a company's name and what follows it: "JPMorgan Chase & Co. Adjusts ...",
+# "Apple Inc.'s Supplier ...".
+_UNIT = r"(?:\s*&\s*co\b\.?|,?\s+(?:inc|corp|co|ltd|plc|llc|group|holdings|securities|research)\b\.?)*"
+_SOMEONE_ELSE = re.compile(
+    _UNIT + rf"(?:\s+(?:{_OF_ANOTHER})\b|'s\s+(?:\S+\s+){{0,2}}?(?:{_OF_ANOTHER})\b)", re.IGNORECASE
+)
 
 
 @lru_cache(maxsize=512)
@@ -752,8 +757,6 @@ _RECEIVING = re.compile(
     r"|to (?:merge|combine) with|merger (?:agreement|with)\b|agrees? to merge)",
     re.IGNORECASE,
 )
-# What may stand between a company's name and its verb: "JPMorgan Chase & Co. Adjusts ...".
-_UNIT = r"(?:\s*&\s*co\b\.?|,?\s+(?:inc|corp|co|ltd|plc|llc|group|holdings|securities|research)\b\.?)*"
 # The verbs an analyst's note opens with. Straight after the company's own name they make
 # it the writer of the note, and the news is about the company it rates.
 _WRITES = re.compile(

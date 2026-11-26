@@ -243,9 +243,12 @@ class EdgarEarnings:
         for row in found if isinstance(found, list) else []:
             if not isinstance(row, list) or len(row) != 2:
                 continue  # a record from before the dates were kept: it says nothing of when
-            name, until = str(row[0]), str(row[1] or "")
-            if since is None or until[:10] >= since.isoformat():
-                out.append(name)
+            try:
+                until = date.fromisoformat(str(row[1])[:10])
+            except ValueError:
+                until = None  # no day, or something that is not one: it cannot be shown to be recent
+            if since is None or (until is not None and until >= since):
+                out.append(str(row[0]))
         return out
 
     def _note_names(self, symbol: str, data: Any) -> None:

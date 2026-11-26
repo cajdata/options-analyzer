@@ -260,6 +260,12 @@ def test_edgar_notes_the_names_a_company_had_before_and_until_when(tmp_path):
     again = EdgarEarnings("test agent", DiskCache(tmp_path), client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500))), sleep=lambda _: None)
     assert again.former_names("C", since=date(2023, 8, 12)) == ["La Rosa Holdings Corp."]
 
+    # A day that is not a day cannot be shown to be recent. Compared as text, "unknown" would
+    # come after any date and count as still in use.
+    DiskCache(tmp_path).set("edgar_former_ODD", [["Recent Name Inc", "2026-09-30"], ["Undated Oddity Inc", "unknown"], ["Bad Month Inc", "2026-13-45"], ["No Day Inc", None]])
+    assert edgar.former_names("ODD", since=date(2023, 8, 12)) == ["Recent Name Inc"]
+    assert edgar.former_names("ODD") == ["Recent Name Inc", "Undated Oddity Inc", "Bad Month Inc", "No Day Inc"]
+
     # A record from before the dates were kept says nothing of when, so it gives no names.
     DiskCache(tmp_path).set("edgar_former_BAC", ["BANKAMERICA CORP/DE/", "NATIONSBANK CORP"])
     assert edgar.former_names("BAC") == [] and edgar.former_names("BAC", since=date(2023, 8, 12)) == []
