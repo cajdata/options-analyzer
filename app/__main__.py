@@ -1,4 +1,4 @@
-"""Command line: `python -m app scan ...` or `python -m app serve`."""
+"""Command line: `python -m app scan ...`, `python -m app positions` or `python -m app serve`."""
 
 from __future__ import annotations
 
@@ -7,12 +7,23 @@ import json
 import sys
 import textwrap
 from dataclasses import asdict
+from datetime import datetime
 
-from app import ai
+from app import ai, positions
 from app.config import ConfigError, load_settings
-from app.analysis import events, exits
-from app.models import ContractAnalysis, EventStudy, ExitPlan, PooledStudy, ScanResult, UnderlyingContext
-from app.scanner import PRESETS, ScanRequest, build_scanner
+from app.analysis import events, exits, holdings
+from app.models import (
+    ContractAnalysis,
+    EventStudy,
+    ExitPlan,
+    Holding,
+    PooledStudy,
+    Position,
+    PositionsReview,
+    ScanResult,
+    UnderlyingContext,
+)
+from app.scanner import ET, PRESETS, ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
 
@@ -230,6 +241,92 @@ def print_exits(result: ScanResult) -> None:
     print(f"  {exits.PROFIT_TARGET:.0%} target and {exits.TIME_STOP_DTE}-day time stop are rules of thumb, not signals.")
 
 
+def _held(p: Position) -> str:
+    """A position in a few words: FLUX Jan 08 87.5 put, sold."""
+    return f"{p.underlying} {p.expiry:%b %d} {p.strike:g} {p.kind}, {'bought' if p.side == 'long' else 'sold'}"
+
+
+def _result(h: Holding) -> str:
+    if h.pnl is None:
+        return "-"
+    sign = "-" if round(h.pnl) < 0 else "+"
+    return f"{sign}${abs(h.pnl):,.0f} ({h.pnl_pct:+.0%})"
+
+
+def print_positions(review: PositionsReview) -> None:
+    """Each position with what closing now would give, and what the exit rules say about it."""
+    feed = {"demo": "SYNTHETIC DEMO DATA", "live": f"Alpaca, {review.options_feed} option quotes"}.get(review.mode, "no market data")
+    print(f"\nPositions   Data: {feed}\n")
+    if not review.holdings:
+        print("No positions on file. Add one with:")
+        print("  python -m app positions add SYMBOL YYYY-MM-DD STRIKE call|put --sold --price 1.25")
+    else:
+        header = f"{'ID':<9} {'Position':<32} {'Qty':>3}  {'Entry':>7}  {'Close at':>8}  {'Result':>15}  {'DTE':>4}  To look at"
+        print(header)
+        print("-" * len(header))
+        for h in review.holdings:
+            p = h.position
+            ctx = review.underlyings.get(p.underlying)
+            look = [c.label for c in h.checks if c.state != "clear"]
+            look += [f"news: {kind}" for kind in (ctx.recent_events if ctx else {}) if kind in events.FLAGGED]
+            close = "-" if h.close_price is None else f"{h.close_price:.2f}"
+            print(
+                f"{p.id:<9} {_held(p):<32} {p.quantity:>3}  {p.entry_price:>7.2f}  {close:>8}  {_result(h):>15}  "
+                f"{h.dte:>4}  {', '.join(look) or '-'}"
+            )
+
+        said = False
+        for h in review.holdings:
+            lines = [f"{holdings.RULES[c.rule]}: {c.detail}" for c in h.checks if c.state != "clear"]
+            lines += [h.note] if h.note else []
+            if not lines:
+                continue
+            if not said:
+                print("\nWhat the rules say")
+                said = True
+            print(f"  {_held(h.position)}")
+            for line in lines:
+                print(textwrap.fill(line, 110, initial_indent=" " * 6, subsequent_indent=" " * 6))
+
+    # Only the stocks with a recent event of a type that tends to move a stock in one jump. That
+    # is what a holder has to see, and every held stock's news would bury it.
+    telling = [s for s, ctx in sorted(review.underlyings.items()) if any(kind in events.FLAGGED for kind in ctx.recent_events)]
+    news = [line for symbol in telling for line in _news_lines(symbol, review.underlyings[symbol])]
+    if news:
+        print(f"\nNews on what is held, last {events.RECENT_DAYS} days, where an event of a flagged type is among it")
+        print("\n".join(news))
+    if review.warnings:
+        print("\nNotes")
+        for warning in review.warnings:
+            print(f"  - {warning}")
+    print("\nResult is what closing now would give across every contract: selling at the bid, or buying back")
+    print("at the ask. A rule that is reached is a fact about the position, not advice, and the")
+    delayed = " Quotes on this feed are delayed." if review.options_feed == "indicative" else ""
+    print(f"{exits.PROFIT_TARGET:.0%} target and {exits.TIME_STOP_DTE}-day time stop are rules of thumb.{delayed}")
+
+
+def _change_positions(args, settings) -> int:
+    """Add or remove an entry. This touches the positions file only, so it needs no keys."""
+    if args.demo:
+        print("The demo's positions are kept in memory, so there is nothing to add to or remove from.", file=sys.stderr)
+        return 2
+    store = positions.PositionStore(settings.positions_file)
+    try:
+        if args.action == "remove":
+            if not store.remove(args.id):
+                print(f"There is no position with the id {args.id}.", file=sys.stderr)
+                return 2
+            print(f"Removed {args.id} from {store.path}.")
+            return 0
+        opened = args.opened or datetime.now(ET).date()
+        made = store.add(positions.make(args.underlying, args.kind, args.strike, args.expiry, args.side, args.qty, args.price, opened))
+    except (ValueError, positions.StoreError) as err:
+        print(err, file=sys.stderr)
+        return 2
+    print(f"Added {made.id}: {made.quantity} x {_held(made)} at {made.entry_price:.2f} ({made.symbol}), in {store.path}.")
+    return 0
+
+
 def _print_brief(brief: ai.BriefResult) -> None:
     print(f"\nAI brief ({brief.model or 'no model call'})\n{brief.summary}")
     for pick in brief.picks:
@@ -273,6 +370,24 @@ def main(argv: list[str] | None = None) -> int:
     pool.add_argument("symbols", nargs="*", help="tickers to add; leave empty for the universe and the day's most active stocks and movers")
     pool.add_argument("--demo", action="store_true", help="use synthetic data; no keys needed")
 
+    held = sub.add_parser("positions", help="check the positions you hold against the exit rules")
+    held.add_argument("--json", action="store_true", help="print the full result as one JSON document")
+    held.add_argument("--demo", action="store_true", help="use synthetic data and made-up positions; no keys needed")
+    actions = held.add_subparsers(dest="action")
+    add = actions.add_parser("add", help="record a position you hold")
+    add.add_argument("underlying", help="the stock's ticker")
+    add.add_argument("expiry", help="the contract's expiry, as YYYY-MM-DD")
+    add.add_argument("strike", type=float)
+    add.add_argument("kind", choices=["call", "put"])
+    side = add.add_mutually_exclusive_group(required=True)
+    side.add_argument("--bought", dest="side", action="store_const", const="long", help="you bought it (long)")
+    side.add_argument("--sold", dest="side", action="store_const", const="short", help="you sold it (short)")
+    add.add_argument("--price", type=float, required=True, help="what you paid or collected, per share")
+    add.add_argument("--qty", type=int, default=1, help="contracts (default 1)")
+    add.add_argument("--opened", help="the day it was opened, as YYYY-MM-DD (default today)")
+    remove = actions.add_parser("remove", help="take a position off the file")
+    remove.add_argument("id", help="its id, as the list shows it")
+
     args = parser.parse_args(argv)
     if args.command == "scan":
         # A preset fills in whatever was not given on the command line.
@@ -308,11 +423,29 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(settings, demo=args.demo), host="127.0.0.1", port=args.port, log_level="warning")
         return 0
 
+    if args.command == "positions" and args.action:
+        return _change_positions(args, settings)
+
     try:
         scanner = build_scanner(settings, demo=args.demo)
     except ConfigError as err:
         print(err, file=sys.stderr)
         return 2
+    if args.command == "positions":
+        store = positions.open_store(settings, scanner.market)
+        try:
+            found, unread = store.load()
+        except positions.StoreError as err:
+            print(err, file=sys.stderr)
+            return 2
+        review = scanner.review(found)
+        if unread:
+            review.warnings.insert(0, positions.unread_note(unread, store.path))
+        if args.json:
+            print(json.dumps(asdict(review), default=str, indent=2))
+        else:
+            print_positions(review)
+        return 0
     if args.command == "pool":
         def progress(n: int, of: int, symbol: str) -> None:
             if n == 1 or n % 25 == 0 or n == of:

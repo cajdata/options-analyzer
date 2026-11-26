@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+
+# What the person holds. Theirs alone: never committed.
+data/positions.json

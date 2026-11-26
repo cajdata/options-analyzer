@@ -228,19 +228,59 @@ class AlpacaData:
             # stock, whose own last trade is just as old. Only the clock can tell.
             self.notes.append(f"{symbol}: the newest option quote is from {session:%b %d}, so none was used.")
             return []
-        quotes: list[OptionQuote] = []
-        for quote, snap in parsed:
-            if session and quote.quote_time and quote.quote_time.astimezone(ET).date() < session:
-                continue  # not quoted in the latest session: see _session_day
-            traded = _bar_day(snap)
-            if session and traded and traded < session:
-                quote.volume = 0  # the daily bar is the last day it traded, which was not this one
-            quotes.append(quote)
+        quotes = _from_session(parsed, session)
         old = len(parsed) - len(quotes)
         if old:
             what = "1 contract was" if old == 1 else f"{old} contracts were"
             self.notes.append(f"{symbol}: {what} left out because the latest quote is from an earlier day.")
         return quotes
+
+    def option_quotes(self, contracts: dict[str, str]) -> dict[str, OptionQuote]:
+        """The latest quote for each named contract, by OCC symbol. `contracts` maps each to its underlying.
+
+        This is for positions already held. One request covers a hundred
+        contracts whatever their underlyings, where a chain costs a request or
+        more for every stock.
+
+        The same two rules as for a chain decide what counts as a quote. Options
+        on every stock trade the same sessions, so the newest quote among the
+        contracts asked for says which day is current, and a quote from an
+        earlier day is left out. With a single contract there is nothing to
+        compare it with, and only the clock rule applies: a quote up to
+        `MAX_QUOTE_AGE_DAYS` old gets through. Its time goes with it, so that
+        can be seen.
+        """
+        parsed = [
+            (quote, snap)
+            for chunk in _chunks(list(contracts), 100)
+            for contract, snap in self._contract_snapshots(chunk).items()
+            if contract in contracts
+            and (quote := _option_quote(contracts[contract], contracts[contract].replace(".", ""), contract, snap or {}))
+        ]
+        session = _session_day(q.quote_time for q, _ in parsed if q.quote_time)
+        if session and (self._now().date() - session).days > MAX_QUOTE_AGE_DAYS:
+            self.notes.append(f"The newest quote for the contracts held is from {session:%b %d}, so none was used.")
+            return {}
+        return {quote.symbol: quote for quote in _from_session(parsed, session)}
+
+    def _contract_snapshots(self, symbols: list[str]) -> dict[str, dict]:
+        params = {"symbols": ",".join(symbols), "feed": self.options_feed, "limit": 1000}
+        try:
+            pages, _ = self._paged(f"{DATA_URL}/v1beta1/options/snapshots", params, MAX_CHAIN_PAGES)
+        except AlpacaError as err:
+            if err.status not in (400, 404, 422):
+                raise
+            # One unknown stock rejects a whole batch of stock snapshots. In case a
+            # mistyped contract does the same here, ask one at a time and pass over it.
+            if len(symbols) == 1:
+                return {}
+            return {contract: snap for symbol in symbols for contract, snap in self._contract_snapshots([symbol]).items()}
+        return {
+            contract: snap
+            for page in pages
+            for contract, snap in (page.get("snapshots") or {}).items()
+            if isinstance(snap, dict)
+        }
 
     def open_interest(
         self, symbol: str, *, expiry_from: date, expiry_to: date, strike_from: float, strike_to: float
@@ -315,6 +355,19 @@ def _session_day(times: Iterable[datetime]) -> date | None:
     """
     local = (t.astimezone(ET) for t in times)
     return max((t.date() for t in local if t.time() >= SESSION_OPEN), default=None)
+
+
+def _from_session(parsed: list[tuple[OptionQuote, dict]], session: date | None) -> list[OptionQuote]:
+    """The quotes that are from the latest session, each with that session's volume."""
+    quotes: list[OptionQuote] = []
+    for quote, snap in parsed:
+        if session and quote.quote_time and quote.quote_time.astimezone(ET).date() < session:
+            continue  # not quoted in the latest session: see _session_day
+        traded = _bar_day(snap)
+        if session and traded and traded < session:
+            quote.volume = 0  # the daily bar is the last day it traded, which was not this one
+        quotes.append(quote)
+    return quotes
 
 
 def _bar_day(snap: dict | None) -> date | None:

@@ -12,10 +12,24 @@ from zoneinfo import ZoneInfo
 
 from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
-from app.analysis import events, exits, risk, scoring
+from app.analysis import events, exits, holdings, risk, scoring
 from app.cache import DiskCache, MemoryCache, NullCache
 from app.config import ConfigError, Settings, tidy
-from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, TermPoint, UnderlyingContext
+from app.models import (
+    Bar,
+    ContractAnalysis,
+    EarningsEvent,
+    ExitPlan,
+    Holding,
+    OptionQuote,
+    Position,
+    PositionsReview,
+    Reaction,
+    ScanResult,
+    StockQuote,
+    TermPoint,
+    UnderlyingContext,
+)
 from app.providers import MarketData
 from app.providers.earnings import AlphaVantageEarnings, EarningsService, EdgarEarnings
 from app.pool import EventPool
@@ -99,6 +113,19 @@ class _Found:
     earnings_days: set[date] = field(default_factory=set)  # sessions that carry an earnings reaction
 
 
+@dataclass
+class _Reports:
+    """A stock's earnings reports set beside its prices: what a scan and a held position both start from."""
+
+    upcoming: EarningsEvent | None
+    moves: list[Reaction]  # how the stock moved across past reports, newest first
+    note: str | None  # set when a source could not answer
+    unknown: bool  # the stock reports, and there is no date to go on
+    days: set[date]  # sessions that carry an earnings reaction
+    ordinary: float | None  # realized volatility with those sessions removed
+    event_var: float | None  # variance of past report-day moves
+
+
 def _names(symbols: list[str], limit: int = 8) -> str:
     """A readable list of symbols, cut short when it is long."""
     symbols = sorted(symbols)
@@ -126,6 +153,11 @@ class Scanner:
         self.universe = universe or []  # symbols a discovery scan always considers
         self._today = today
         self._lock = threading.Lock()
+
+    @property
+    def today(self) -> date:
+        """The trading date now, unless one was fixed for a test or the demo."""
+        return self._today or datetime.now(ET).date()
 
     def scan(self, req: ScanRequest) -> ScanResult:
         if req.lens not in scoring.LENSES:
@@ -193,7 +225,8 @@ class Scanner:
         # News comes last and only for the stocks that made the list, so a stock
         # nobody will look at costs no request. It runs before the provider's notes
         # are collected, because loading headlines can add one.
-        warnings.extend(self._add_news(ideas, underlyings, bars, earnings_days, today))
+        shown = list(dict.fromkeys(c.underlying for c in ideas))
+        warnings.extend(self._add_news(shown, underlyings, bars, earnings_days, today))
         warnings.extend(dict.fromkeys(self.market.notes))
         self.market.notes.clear()
         if req.budget is not None and not ideas:
@@ -250,13 +283,16 @@ class Scanner:
 
     def _add_news(
         self,
-        ideas: list[ContractAnalysis],
+        shown: list[str],
         underlyings: dict[str, UnderlyingContext],
         bars: dict[str, list[Bar]],
         earnings_days: dict[str, set[date]],
         today: date,
     ) -> list[str]:
-        """Give each stock with a ranked contract its recent news and what followed events like it."""
+        """Give each stock in `shown` its recent news and what followed events like it.
+
+        For a scan these are the stocks with a ranked contract. For a review they are the stocks held.
+        """
         if self.news is None:
             return []
 
@@ -286,7 +322,6 @@ class Scanner:
                 ctx.news_note, failed = f"News lookup failed: {type(err).__name__}.", True
             return symbol if failed else None
 
-        shown = list(dict.fromkeys(c.underlying for c in ideas))
         with ThreadPoolExecutor(max_workers=4) as workers:
             failed = [symbol for symbol in workers.map(load, shown) if symbol]
         self._pool_studies([underlyings[symbol] for symbol in shown], tallies)
@@ -396,6 +431,170 @@ class Scanner:
                     added[found.coverage] += 1
             self.market.notes.clear()  # nobody is shown a scan here, so its notes have no reader
             return {"asked": len(wanted), "added": added, "passed_over": passed_over, "totals": self.pool.totals()}
+
+    # -- Positions already held ---------------------------------------------
+
+    def review(self, positions: list[Position]) -> PositionsReview:
+        """Set each position beside today's quotes and check it against the exit rules.
+
+        The held contracts are asked for by name, in one request however many
+        stocks they are on, so no chain is pulled. Each stock held then costs what
+        it costs a scan: its price, its price history, its earnings dates and its
+        news.
+
+        Every position comes back, priced or not. A source that fails leaves its
+        numbers out and adds a warning, and a check that needed them says it could
+        not be made (`analysis/holdings.py`).
+        """
+        # One at a time with scans, for the same reason: the provider and its notes are shared.
+        with self._lock:
+            return self._review(positions)
+
+    def _review(self, positions: list[Position]) -> PositionsReview:
+        today = self.today
+        rate = self.settings.risk_free_rate
+        warnings: list[str] = []
+        self.market.notes.clear()
+        current = [p for p in positions if p.expiry >= today]  # an expired contract is no longer quoted
+        symbols = list(dict.fromkeys(p.underlying for p in current))
+
+        def fetch(what: str, call, nothing):
+            try:
+                return call(), True
+            except Exception as err:  # the positions are still shown, with whatever could be read
+                warnings.append(f"{what} could not be loaded: {err}")
+                return nothing, False
+
+        quotes: dict[str, StockQuote] = {}
+        option_quotes: dict[str, OptionQuote] = {}
+        bars: dict[str, list[Bar]] = {}
+        options_answered = True
+        if symbols:
+            quotes, answered = fetch("Stock prices", lambda: self.market.stock_snapshots(symbols), {})
+            if answered:
+                warnings.extend(f"{symbol}: no stock quote found." for symbol in symbols if symbol not in quotes)
+            wanted = {p.symbol: p.underlying for p in current}
+            option_quotes, options_answered = fetch("Option quotes", lambda: self.market.option_quotes(wanted), {})
+            priced = [symbol for symbol in symbols if symbol in quotes]
+            if priced:
+                start = today - timedelta(days=HISTORY_DAYS)
+                bars, _ = fetch("Price history", lambda: self.market.daily_bars(priced, start), {})
+
+        def context(symbol: str) -> tuple[UnderlyingContext, _Reports] | str:
+            try:
+                quote, history = quotes[symbol], bars.get(symbol, [])
+                reports = self._reports(symbol, history)
+                ctx = UnderlyingContext(
+                    symbol=symbol,
+                    price=quote.price,
+                    change_pct=quote.change_pct,
+                    realized_vol_20d=metrics.realized_vol(history, 20),
+                    realized_vol_60d=metrics.realized_vol(history, 60),
+                    atm_iv=None,  # that needs the chain, which a review does not pull
+                    reasons=["held"],
+                    next_earnings=reports.upcoming,
+                    days_to_earnings=(reports.upcoming.day - today).days if reports.upcoming else None,
+                    reactions=reports.moves,
+                    earnings_stats=earnings_math.summarize(reports.moves),
+                    earnings_note=reports.note,
+                    earnings_unknown=reports.unknown,
+                    ordinary_vol=reports.ordinary,
+                    event_var=reports.event_var,
+                )
+                return ctx, reports
+            except Exception as err:  # one stock's lookups must not hide the other positions
+                return f"{symbol}: {err}"
+
+        underlyings: dict[str, UnderlyingContext] = {}
+        reports_for: dict[str, _Reports] = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for outcome in pool.map(context, [symbol for symbol in symbols if symbol in quotes]):
+                if isinstance(outcome, str):
+                    warnings.append(outcome)
+                    continue
+                underlyings[outcome[0].symbol], reports_for[outcome[0].symbol] = outcome
+        if symbols and self.earnings.calendar_note:
+            warnings.append(self.earnings.calendar_note)
+
+        held: list[Holding] = []
+        for p in positions:
+            ctx, quote = underlyings.get(p.underlying), option_quotes.get(p.symbol)
+            contract = plan = note = None
+            if p.expiry < today:
+                pass  # the one check an expired position gets says all there is to say
+            elif quote is None:
+                note = (
+                    "No quote from the latest session was found for this contract. Check its expiry and strike."
+                    if options_answered
+                    else "Option quotes could not be loaded, so this position is not priced."
+                )
+            elif ctx is None:
+                note = f"There is no stock price for {p.underlying}, so the Greeks and the path ahead are left out."
+            else:
+                contract = metrics.analyze_contract(quote, ctx.price, today, rate)
+                if contract is None:
+                    note = (
+                        "This quote cannot be priced: it has no bid, or it sits below what exercising the option "
+                        "would pay at the stock's price. The Greeks and the path ahead are left out."
+                    )
+                else:
+                    plan = self._held_plan(p, contract, ctx, reports_for[p.underlying], rate, today)
+                    ctx.contracts_scanned += 1
+            spot = ctx.price if ctx else None
+            held.append(
+                holdings.assess(
+                    p, today, spot=spot, quote=quote, ctx=ctx, contract=contract, plan=plan, margin=ESTIMATE_MARGIN, note=note
+                )
+            )
+
+        # News for every stock held, flagged events above all. As in a scan it runs
+        # before the provider's notes are collected, because loading headlines can add one.
+        earnings_days = {symbol: reports.days for symbol, reports in reports_for.items()}
+        warnings.extend(self._add_news(list(underlyings), underlyings, bars, earnings_days, today))
+        warnings.extend(dict.fromkeys(self.market.notes))
+        self.market.notes.clear()
+        return PositionsReview(
+            generated_at=datetime.now(timezone.utc),
+            mode=self.market.mode,
+            options_feed=self.market.options_feed,
+            holdings=held,
+            underlyings=underlyings,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _held_plan(
+        p: Position, c: ContractAnalysis, ctx: UnderlyingContext, reports: _Reports, rate: float, today: date
+    ) -> ExitPlan | None:
+        """The standing-still path from here for a held contract, measured against the price it was opened at."""
+        c.lens = holdings.LENS[p.side]
+        c.spans_earnings = bool(reports.upcoming and earnings_math.spans(c.expiry, reports.upcoming))
+        c.history_vol = risk.history_vol(c, reports.ordinary, reports.event_var, reports.upcoming)
+        plan = exits.build(c, ctx, c.lens, rate, today, entry=p.entry_price)
+        if plan and plan.earnings:
+            # What the options price for the report takes the chain around it to read, and
+            # a review reads one contract. So the step is the size past reports were.
+            plan.notes.append(
+                "The step across earnings is sized from this stock's past reports. What the options "
+                "price in for it takes the whole chain to read, and only this contract's quote was."
+            )
+        return plan
+
+    def _reports(self, symbol: str, bars: list[Bar]) -> _Reports:
+        """A stock's next report, how it moved across past ones, and its ordinary volatility without them."""
+        history, note = self.earnings.history(symbol)
+        upcoming = self.earnings.upcoming(symbol, history)
+        moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
+        # A stock that reports, with no date to go on: the lookup failed, nothing is
+        # configured, the only source cannot answer for this company, or the reports
+        # on file are too old to estimate from. A date from the calendar is a date,
+        # even when the history lookup behind it failed.
+        unknown = upcoming is None and (note is not None or bool(history))
+        # The stock's own history: ordinary days with earnings reactions removed,
+        # and the typical size of a report-day move.
+        days = earnings_math.reaction_days(history, bars)
+        ordinary = metrics.realized_vol(bars, 60, days) or metrics.realized_vol(bars, 20, days)
+        return _Reports(upcoming, moves, note, unknown, days, ordinary, risk.event_variance(moves, ordinary))
 
     # -- Choosing symbols ---------------------------------------------------
 
@@ -528,20 +727,9 @@ class Scanner:
         atm = metrics.atm_by_expiry(analyzed, spot)
         metrics.apply_expected_moves(analyzed, atm, spot, today, rate)
 
-        history, note = self.earnings.history(symbol)
-        upcoming = self.earnings.upcoming(symbol, history)
-        moves = earnings_math.reactions(history, bars)[:MAX_REPORTS]
-        # A stock that reports, with no date to go on: the lookup failed, nothing is
-        # configured, the only source cannot answer for this company, or the reports
-        # on file are too old to estimate from. A date from the calendar is a date,
-        # even when the history lookup behind it failed.
-        unknown = upcoming is None and (note is not None or bool(history))
-
-        # The stock's own history: ordinary days with earnings reactions removed,
-        # and the typical size of a report-day move.
-        earnings_days = earnings_math.reaction_days(history, bars)
-        ordinary = metrics.realized_vol(bars, 60, earnings_days) or metrics.realized_vol(bars, 20, earnings_days)
-        event_var = risk.event_variance(moves, ordinary)
+        reports = self._reports(symbol, bars)
+        upcoming, moves, note, unknown = reports.upcoming, reports.moves, reports.note, reports.unknown
+        earnings_days, ordinary, event_var = reports.days, reports.ordinary, reports.event_var
 
         implied = earnings_math.implied_move(spot, atm, upcoming, ordinary, today) if upcoming and atm else None
         for c in analyzed:
