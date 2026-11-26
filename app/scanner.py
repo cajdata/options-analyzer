@@ -480,10 +480,20 @@ class Scanner:
                 start = today - timedelta(days=HISTORY_DAYS)
                 bars, _ = fetch("Price history", lambda: self.market.daily_bars(priced, start), {})
 
-        def context(symbol: str) -> tuple[UnderlyingContext, _Reports] | str:
+        def context(symbol: str) -> tuple[UnderlyingContext, _Reports, str | None] | str:
             try:
                 quote, history = quotes[symbol], bars.get(symbol, [])
-                reports = self._reports(symbol, history)
+                failed = None
+                try:
+                    reports = self._reports(symbol, history)
+                except Exception as err:
+                    # The stock's price is in hand, and its earnings dates failing takes nothing from
+                    # it. What is lost is the dates: no report can be ruled out, and the context says so.
+                    # The first version dropped the whole stock here and told the person it had no price.
+                    failed = f"{symbol}: its earnings dates could not be looked up ({err})."
+                    ordinary = metrics.realized_vol(history, 60) or metrics.realized_vol(history, 20)
+                    lost = f"Earnings lookup failed: {type(err).__name__}."
+                    reports = _Reports(None, [], lost, True, set(), ordinary, None)
                 ctx = UnderlyingContext(
                     symbol=symbol,
                     price=quote.price,
@@ -501,7 +511,7 @@ class Scanner:
                     ordinary_vol=reports.ordinary,
                     event_var=reports.event_var,
                 )
-                return ctx, reports
+                return ctx, reports, failed
             except Exception as err:  # one stock's lookups must not hide the other positions
                 return f"{symbol}: {err}"
 
@@ -512,8 +522,13 @@ class Scanner:
                 if isinstance(outcome, str):
                     warnings.append(outcome)
                     continue
-                underlyings[outcome[0].symbol], reports_for[outcome[0].symbol] = outcome
-        if symbols and self.earnings.calendar_note:
+                ctx, reports, failed = outcome
+                underlyings[ctx.symbol], reports_for[ctx.symbol] = ctx, reports
+                if failed:
+                    warnings.append(failed)
+        # Only when a stock's dates were looked up just now. A note left by an earlier scan says
+        # nothing about this review if the calendar was never asked.
+        if underlyings and self.earnings.calendar_note:
             warnings.append(self.earnings.calendar_note)
 
         held: list[Holding] = []
@@ -524,12 +539,21 @@ class Scanner:
                 pass  # the one check an expired position gets says all there is to say
             elif quote is None:
                 note = (
-                    "No quote from the latest session was found for this contract. Check its expiry and strike."
+                    "No quote was found for this contract. Check its expiry and strike."
                     if options_answered
                     else "Option quotes could not be loaded, so this position is not priced."
                 )
+            elif quote.outdated:
+                when = quote.quote_time.astimezone(ET) if quote.quote_time else None
+                day = f"on {when:%b} {when.day}" if when else "on an earlier day"
+                note = f"This contract was last quoted {day}. A quote from an earlier day is not used, so the position is not priced."
             elif ctx is None:
-                note = f"There is no stock price for {p.underlying}, so the Greeks and the path ahead are left out."
+                # Say which it is: no price for the stock, or a price and a lookup that failed after it.
+                note = (
+                    f"{p.underlying} could not be looked up, so the Greeks and the path ahead are left out."
+                    if p.underlying in quotes
+                    else f"There is no stock price for {p.underlying}, so the Greeks and the path ahead are left out."
+                )
             else:
                 contract = metrics.analyze_contract(quote, ctx.price, today, rate)
                 if contract is None:
@@ -540,7 +564,8 @@ class Scanner:
                 else:
                     plan = self._held_plan(p, contract, ctx, reports_for[p.underlying], rate, today)
                     ctx.contracts_scanned += 1
-            spot = ctx.price if ctx else None
+            # The strike is set against the stock's price whenever there is one, whatever else failed.
+            spot = quotes[p.underlying].price if p.underlying in quotes else None
             held.append(
                 holdings.assess(
                     p, today, spot=spot, quote=quote, ctx=ctx, contract=contract, plan=plan, margin=ESTIMATE_MARGIN, note=note

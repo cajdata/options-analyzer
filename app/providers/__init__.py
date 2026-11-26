@@ -28,8 +28,10 @@ class MarketData(Protocol):
     def option_quotes(self, contracts: dict[str, str]) -> dict[str, OptionQuote]:
         """Quotes for named contracts, for positions already held: no chain is pulled.
 
-        `contracts` maps each OCC symbol to its underlying. A contract with no
-        quote from the latest session is left out of the answer.
+        `contracts` maps each OCC symbol to its underlying. A contract the
+        provider has no quote for is left out of the answer. One whose latest
+        quote is from an earlier day comes back marked `outdated`, with the
+        time of that quote and no prices.
         """
         ...
 

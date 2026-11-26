@@ -245,10 +245,16 @@ class AlpacaData:
         The same two rules as for a chain decide what counts as a quote. Options
         on every stock trade the same sessions, so the newest quote among the
         contracts asked for says which day is current, and a quote from an
-        earlier day is left out. With a single contract there is nothing to
+        earlier day is not used. With a single contract there is nothing to
         compare it with, and only the clock rule applies: a quote up to
         `MAX_QUOTE_AGE_DAYS` old gets through. Its time goes with it, so that
         can be seen.
+
+        A chain says how many quotes it left out. Here each one belongs to a
+        position somebody holds, so it is handed back marked `outdated`, with
+        its time and without its prices. The position can then say when it was
+        last quoted, where "no quote found" would send the person to check a
+        strike that is perfectly right.
         """
         parsed = [
             (quote, snap)
@@ -258,10 +264,17 @@ class AlpacaData:
             and (quote := _option_quote(contracts[contract], contracts[contract].replace(".", ""), contract, snap or {}))
         ]
         session = _session_day(q.quote_time for q, _ in parsed if q.quote_time)
+        current: dict[str, OptionQuote] = {}
         if session and (self._now().date() - session).days > MAX_QUOTE_AGE_DAYS:
             self.notes.append(f"The newest quote for the contracts held is from {session:%b %d}, so none was used.")
-            return {}
-        return {quote.symbol: quote for quote in _from_session(parsed, session)}
+        else:
+            current = {quote.symbol: quote for quote in _from_session(parsed, session)}
+        for quote, _ in parsed:
+            if quote.symbol not in current:
+                current[quote.symbol] = OptionQuote(
+                    quote.symbol, quote.underlying, quote.kind, quote.strike, quote.expiry, quote_time=quote.quote_time, outdated=True
+                )
+        return current
 
     def _contract_snapshots(self, symbols: list[str]) -> dict[str, dict]:
         params = {"symbols": ",".join(symbols), "feed": self.options_feed, "limit": 1000}

@@ -271,9 +271,12 @@ Demo mode shows made-up positions held in memory and never touches the file.
 - **The positions page is as good as its quotes.** On the free feed they are delayed and
   modified, so treat a result as end-of-day quality and check your broker before acting.
   After 4 p.m. the strike is compared with an after-hours stock price while the option's
-  quote is from the close. Each quote's time is shown: with several positions a quote
-  from an earlier day than the newest is left out, but a single position's quote can be
-  up to four days old before the page can tell.
+  quote is from the close. If the stock has moved so far that even the option's ask is
+  below what exercising it would pay, the page shows no result and says the quote is out
+  of date. A smaller move it cannot see. Each quote's time is shown: with several
+  positions a quote from an earlier day than the newest is not used, and the position
+  says when it was last quoted, but a single position's quote can be up to four days old
+  before the page can tell.
 - **A position is one contract type.** A spread is entered as two positions, and their
   rules are not combined. An entry cannot be edited, only removed and entered again, and
   nothing records a position after it is closed.

@@ -59,7 +59,7 @@ class PositionBody(BaseModel):
     expiry: date
     side: Literal["long", "short"]
     quantity: int = Field(1, ge=1, le=positions.MAX_QUANTITY)
-    entry_price: float = Field(gt=0, le=1_000_000)
+    entry_price: float = Field(ge=positions.MIN_PRICE, le=positions.MAX_PRICE)
     opened: date | None = None  # today, when left out
 
 

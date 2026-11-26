@@ -1,7 +1,12 @@
-"""Positions: what a person holds, kept on file and set against the exit rules."""
+"""Positions: what a person holds, kept on file and set against the exit rules.
+
+The tests marked as coming from the outside review of phase 3 were each first reproduced
+against the code as a failure.
+"""
 
 import json
 import threading
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -11,10 +16,10 @@ from fastapi.testclient import TestClient
 
 from app import positions, pricing
 from app.analysis import contracts as metrics
-from app.analysis import exits, holdings
+from app.analysis import exits, holdings, risk
 from app.cache import NullCache
 from app.config import Settings, load_settings
-from app.models import EarningsEvent, OptionQuote, Position, UnderlyingContext
+from app.models import EarningsEvent, Holding, ImpliedMove, OptionQuote, Position, Reaction, UnderlyingContext
 from app.positions import PositionStore, StoreError
 from app.providers.alpaca import AlpacaData
 from app.providers.demo import SPECS, DemoMarket
@@ -112,7 +117,11 @@ def test_a_position_round_trips_through_the_file(tmp_path):
         {"quantity": True},
         {"entry_price": -1.0},
         {"entry_price": float("inf")},
+        {"entry_price": 1e-310},  # a slip of the hand that turned every result measured against it into infinity
+        {"entry_price": 0.00004},
+        {"entry_price": 1e308},
         {"expiry": "next Friday"},
+        {"expiry": datetime(2026, 12, 18, 16, 0)},  # a time of day cannot be compared with a date
         {"opened": TODAY + timedelta(days=60)},  # after the contract has expired
         {"id": " "},
     ],
@@ -171,6 +180,39 @@ def test_a_write_that_fails_is_an_error(tmp_path):
         PositionStore(tmp_path / "taken" / "positions.json").add(position())
 
 
+def test_an_entry_price_is_kept_to_a_hundredth_of_a_cent():
+    assert position(entry_price=1.2550000001).entry_price == 1.255  # an average of two fills
+    assert position(entry_price=positions.MIN_PRICE).entry_price == 0.0001
+    assert position(entry_price=positions.MAX_PRICE).entry_price == 1_000_000
+
+
+def test_a_file_saved_with_a_byte_order_mark_still_reads(tmp_path):
+    # An older Notepad and PowerShell's Set-Content both put one in front, and the file is meant to be edited by hand.
+    path = tmp_path / "positions.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"positions": [positions._plain(position(id="mine"))]}).encode())
+    store = PositionStore(path)
+    assert [held.id for held in store.load()[0]] == ["mine"]
+    store.add(position())
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf") and len(store.load()[0]) == 2
+
+
+def test_an_entry_that_repeats_an_id_is_never_removed_with_the_first(tmp_path):
+    # An entry copied by hand keeps its id unless that is changed too. Removing one used to take both.
+    path = tmp_path / "positions.json"
+    first, copy = positions._plain(position(id="same")), positions._plain(position(id="same", strike=90.0))
+    path.write_text(json.dumps({"positions": [first, copy]}))
+    store = PositionStore(path)
+    found, unread = store.load()
+    assert [(held.id, held.strike) for held in found] == [("same", 95.0)] and unread == 1
+    assert "repeats another entry's id" in positions.unread_note(unread, path)
+    with pytest.raises(ValueError, match="already"):
+        store.add(position(id="same", strike=80.0))
+
+    assert store.remove("same")
+    assert json.loads(path.read_text())["positions"] == [copy]  # the copy is still there, and now it reads
+    assert [(held.id, held.strike) for held in store.load()[0]] == [("same", 90.0)] and store.load()[1] == 0
+
+
 def test_removing_takes_one_entry_and_says_when_there_is_none(tmp_path):
     store = PositionStore(tmp_path / "positions.json")
     first, second = store.add(position()), store.add(position(strike=90.0))
@@ -221,12 +263,67 @@ def test_the_profit_target_is_measured_at_the_ask():
     reached = holdings.profit_target(p, 1.00)
     assert reached.state == "reached" and "keeps 50% of the $2.00 collected" in reached.detail
     short_of_it = holdings.profit_target(p, 1.01)
-    assert short_of_it.state == "clear" and "would keep 50%" in short_of_it.detail and "$1.00 or less" in short_of_it.detail
+    assert short_of_it.state == "clear" and "would keep 49.5%" in short_of_it.detail and "$1.00 or less" in short_of_it.detail
     losing = holdings.profit_target(p, 2.60)
     assert losing.state == "clear" and "costs $0.60 a share more" in losing.detail
     # A bid alone says nothing about what buying back would cost.
     assert holdings.profit_target(p, None).state == "unknown"
     assert exits.PROFIT_TARGET == 0.50
+
+
+def test_the_profit_target_never_reads_as_reached_when_it_is_not():
+    # From the outside review. Half of $1.03 is $0.515. Rounded for show, an ask of $0.52 "would keep 50%"
+    # against a target of "$0.52 or less", and the check beside those words said not reached.
+    p = position(entry_price=1.03)
+    short_of_it = holdings.profit_target(p, 0.52)
+    assert short_of_it.state == "clear"
+    assert short_of_it.detail == "Buying back at $0.52 would keep 49.5% of the $1.03 collected. The 50% target is $0.515 or less."
+    there = holdings.profit_target(p, 0.515)  # the free feed's quotes are not always whole cents
+    assert there.state == "reached" and there.detail.startswith("Buying back at $0.515 keeps 50% of the $1.03 collected.")
+    assert holdings.profit_target(p, 0.51).state == "reached"
+
+    assert [holdings.dollars(v) for v in (2.0, 4.19, 0.515, 0.05, 1234.5)] == ["$2.00", "$4.19", "$0.515", "$0.05", "$1234.50"]
+    # Cut off, never rounded up: 8.38 / 2 is 4.19 exactly, and 1.2555 / 2 is 0.62775.
+    assert [holdings.at_most(v) for v in (4.19, 0.515, 0.62775, 1.0)] == ["$4.19", "$0.515", "$0.6277", "$1.00"]
+
+
+def test_a_quote_out_of_date_against_the_stock_gives_no_result():
+    # From the outside review. A put sold for $2.00 at a $95 strike, and the stock has dropped to $75 after the
+    # close: exercising would pay $20. The option's quote is still the close's, 0.40 x 0.50. Read as it stands,
+    # the position showed +$150 and "profit target reached" on the night it was deepest under water.
+    p = position()
+    stale = holdings.assess(p, TODAY, spot=75.0, quote=quoted(p, 0.40, 0.50), ctx=context(price=75.0))
+    assert stale.pnl is None and stale.pnl_pct is None and stale.close_price is None
+    assert (stale.bid, stale.ask) == (0.40, 0.50)  # the quote is still shown, as what it is
+    states = {c.rule: c.state for c in stale.checks}
+    assert states["profit_target"] == "unknown" and states["strike"] == "reached"
+    assert "out of date against the stock" in stale.note and "$0.50" in stale.note and "$20.00" in stale.note
+    assert "not a price to buy back at" in stale.checks[0].detail
+
+    # A holder's result goes the same way: the whole quote is under exercise value.
+    owned = position(side="long")
+    assert holdings.assess(owned, TODAY, spot=75.0, quote=quoted(owned, 0.40, 0.50)).pnl is None
+
+    # A bid under exercise value with the ask above it is an ordinary deep in-the-money quote. It stands.
+    deep = quoted(p, 19.20, 20.60)
+    assert holdings.unusable(p, deep, 75.0) is None
+    assert holdings.assess(p, TODAY, spot=75.0, quote=deep).pnl == pytest.approx((2.00 - 20.60) * 100)
+    assert holdings.assess(owned, TODAY, spot=75.0, quote=quoted(owned, 19.20, 20.60)).close_price == 19.20
+    # So does a quote at exercise value to the cent, and one with no stock price to hold it against.
+    assert holdings.unusable(p, quoted(p, 19.90, 20.00), 75.0) is None
+    assert holdings.assess(p, TODAY, quote=quoted(p, 0.40, 0.50)).pnl == pytest.approx(150.0)
+
+
+def test_a_crossed_quote_gives_no_result():
+    # From the outside review: a bid of 5.00 over an ask of 0.50 gave a seller "profit target reached".
+    for side in ("short", "long"):
+        p = position(side=side)
+        crossed = holdings.assess(p, TODAY, spot=105.0, quote=quoted(p, 5.00, 0.50), ctx=context(price=105.0))
+        assert crossed.pnl is None and "crossed" in crossed.note
+    assert holdings.assess(position(), TODAY, spot=105.0, quote=quoted(position(), 5.00, 0.50)).checks[0].state == "unknown"
+    # No bid at all is not crossed: it is what a nearly worthless option looks like.
+    assert holdings.unusable(position(), quoted(position(), None, 0.05), 105.0) is None
+    assert holdings.unusable(position(), None, 105.0) is None
 
 
 def test_only_a_seller_has_a_profit_target():
@@ -274,6 +371,16 @@ def test_a_report_is_pointed_out_when_it_is_close_and_the_contract_is_still_open
     check = holdings.earnings(p, context(next_earnings=event), TODAY, ESTIMATE_MARGIN)
     assert (check.state, check.label) == (state, label)
     assert holdings.EARNINGS_SOON == 7 and ESTIMATE_MARGIN == timedelta(days=7)
+
+
+def test_a_report_that_is_out_and_not_yet_felt_is_not_called_today():
+    # From the outside review. No source hands the app such a date today (EarningsService.upcoming gives none
+    # that is past), but the check is plain arithmetic and has to be right for whatever it is handed.
+    saturday = date(2026, 11, 21)
+    p = position(expiry=saturday + timedelta(days=30), opened=saturday - timedelta(days=5))
+    check = holdings.earnings(p, context(next_earnings=EarningsEvent(date(2026, 11, 20), "post")), saturday)
+    assert (check.state, check.label) == ("reached", "earnings out, not yet felt")
+    assert check.detail == "Reported Nov 20, after the close. The first session to reflect it is Nov 23, and this contract is still open then."
 
 
 def test_no_earnings_date_is_never_read_as_no_report():
@@ -348,6 +455,33 @@ def test_an_exit_plan_for_a_held_contract_is_measured_against_its_entry_price():
     assert held.checkpoints[0].pnl_pct == pytest.approx(held.checkpoints[0].pnl / 400.0)
     assert exits.build(c, context(), "sell", RATE, TODAY, entry=0.0) is None
 
+    # From the outside review: "decay alone gets there" answered tomorrow for a target met today.
+    not_yet = exits.build(c, context(), "sell", RATE, TODAY, entry=1.5 * c.ask)  # the ask is above three quarters of itself
+    assert not_yet.target_day is None or not_yet.target_day > TODAY
+    already = exits.build(c, context(), "sell", RATE, TODAY, entry=2 * c.ask)
+    assert c.ask <= already.target_price and already.target_day == TODAY
+    assert opening_now.target_day != TODAY  # opened now it never is: the ask is above the bid it was sold at
+
+
+def test_a_step_that_history_cannot_size_is_not_blamed_on_the_options():
+    # From the outside review. A review reads no chain, so the options give no reading. When past reports then
+    # size the step at nothing, the note said "the options price no extra move", which nobody had looked at.
+    fair = pricing.price("put", 100.0, 95.0, 45 / 365, RATE, 0.30)
+    quote = OptionQuote("X", "XYZ", "put", 95.0, TODAY + timedelta(days=45), bid=fair - 0.05, ask=fair + 0.05, iv=0.30)
+    c = metrics.analyze_contract(quote, 100.0, TODAY, RATE)
+    c.spans_earnings = True
+    report = EarningsEvent(TODAY + timedelta(days=9), "post")
+    tiny = [Reaction(TODAY - timedelta(days=91 * n), "unknown", 0.0005, sessions=2) for n in range(1, 6)]
+    assert risk.event_variance(tiny, 0.30) == 0.0
+
+    unread = exits.build(c, context(next_earnings=report, event_var=0.0), "sell", RATE, TODAY)
+    assert unread.earnings is None
+    assert unread.notes[0] == "Past reports were too small to size a step for the coming one, so none is shown."
+    # When the options were read and price nothing, that is still what is said.
+    priced = ImpliedMove(c.expiry, None, 0.0, 0.30, "test", event_var=0.0)
+    read = exits.build(c, context(next_earnings=report, implied_move=priced, event_var=0.01), "sell", RATE, TODAY)
+    assert read.notes[0] == "The options price no extra move for the coming report, so no step is shown for it."
+
 
 # -- A review on the demo market ---------------------------------------------------------------
 
@@ -378,6 +512,10 @@ def test_a_review_sets_each_demo_position_against_the_rules(scanner):
         assert h.plan.entry_price == p.entry_price and h.plan.lens == h.contract.lens
         assert h.plan.checkpoints[-1].label == "at expiry"
     assert review.underlyings["EMBR"].contracts_scanned == 1 and review.underlyings["EMBR"].reasons == ["held"]
+    # CRUX is at its target now, and its plan says so too.
+    assert review.holdings[0].plan.target_day == TODAY
+    # What a review hands out is plain JSON: no figure in it is infinite or not a number.
+    json.dumps(asdict(review), default=str, allow_nan=False)
 
 
 def test_a_review_carries_the_earnings_and_the_news_of_what_is_held(scanner):
@@ -422,7 +560,7 @@ def test_a_contract_with_no_quote_is_still_listed(scanner):
     review = scanner.review([far_out])
     (h,) = review.holdings
     assert h.bid is None and h.pnl is None and h.contract is None and h.plan is None
-    assert h.note == "No quote from the latest session was found for this contract. Check its expiry and strike."
+    assert h.note == "No quote was found for this contract. Check its expiry and strike."
     # What does not need the option's quote is still checked.
     assert {c.rule: c.state for c in h.checks} == {"profit_target": "unknown", "time_stop": "clear", "earnings": "clear", "strike": "clear"}
     assert "ACME" in review.underlyings
@@ -436,6 +574,36 @@ def test_a_quote_that_cannot_be_priced_still_gives_a_result(scanner):
     # Buying back needs only the ask, and at five cents the target is plainly reached.
     assert h.close_price == 0.05 and h.pnl == pytest.approx(295.0)
     assert next(c for c in h.checks if c.rule == "profit_target").state == "reached"
+
+
+def test_a_stale_quote_in_a_review_is_named_as_stale(scanner):
+    # From the outside review, through the whole review: the reason is the out-of-date quote, not a general
+    # "cannot be priced", and nothing is shown as a result.
+    p = position(underlying="ACME", strike=220.0, side="short", entry_price=3.00)  # the demo's ACME is at 184
+    scanner.market.option_quotes = lambda contracts: {p.symbol: quoted(p, 0.40, 0.50)}
+    (h,) = scanner.review([p]).holdings
+    assert h.pnl is None and h.contract is None and h.note.startswith("This quote is out of date against the stock.")
+    assert {c.rule: c.state for c in h.checks}["profit_target"] == "unknown"
+
+
+def test_a_contract_last_quoted_on_an_earlier_day_says_when(scanner):
+    # From the outside review. The provider's answer for such a contract used to be nothing at all, and the
+    # position was told to check a strike that was perfectly right.
+    old, fresh = position(underlying="ACME", strike=170.0), position(underlying="ACME", strike=175.0)
+    real = scanner.market.option_quotes
+    friday = datetime(2026, 11, 20, 15, 59, tzinfo=ET)
+
+    def one_is_old(contracts):
+        quotes = real(contracts)
+        quotes[old.symbol] = OptionQuote(old.symbol, "ACME", "put", 170.0, old.expiry, quote_time=friday, outdated=True)
+        return quotes
+
+    scanner.market.option_quotes = one_is_old
+    stale, live = scanner.review([old, fresh]).holdings
+    assert stale.note == "This contract was last quoted on Nov 20. A quote from an earlier day is not used, so the position is not priced."
+    assert stale.pnl is None and stale.bid is None and stale.contract is None and stale.quote_time == friday
+    assert {c.rule: c.state for c in stale.checks}["strike"] == "clear"  # what needs no option quote is still checked
+    assert live.pnl is not None and live.note is None
 
 
 def test_every_position_is_listed_when_a_source_fails(scanner):
@@ -469,10 +637,59 @@ def test_one_stock_that_fails_does_not_hide_the_others(scanner):
 
     scanner.earnings.history = flaky
     review = scanner.review(scanner.market.sample_positions())
-    assert "BOLT: lookup broke" in review.warnings and "BOLT" not in review.underlyings
-    bolt = next(h for h in review.holdings if h.position.underlying == "BOLT")
-    assert bolt.pnl is not None and bolt.contract is None  # the quote still gives a result
+    assert "BOLT: its earnings dates could not be looked up (lookup broke)." in review.warnings
     assert flagged(review)["CRUX"] == ["profit_target"]
+
+    # From the outside review. The first version dropped the stock whole and told the person "There is no
+    # stock price for BOLT", with the price in hand. Only the dates are lost, and the checks say so.
+    bolt, ctx = next(h for h in review.holdings if h.position.underlying == "BOLT"), review.underlyings["BOLT"]
+    assert ctx.price == SPECS["BOLT"]["price"] and ctx.earnings_unknown and ctx.next_earnings is None
+    assert ctx.earnings_note == "Earnings lookup failed: RuntimeError."
+    assert bolt.note is None and bolt.pnl is not None and bolt.contract is not None and bolt.plan is not None
+    states = {c.rule: c.state for c in bolt.checks}
+    assert states["strike"] == "clear" and states["earnings"] == "unknown"
+    assert any("No earnings date is known" in note for note in bolt.plan.notes)
+    assert ctx.news  # and its news is still read
+
+
+def test_a_stock_that_cannot_be_looked_up_is_not_said_to_have_no_price(scanner, monkeypatch):
+    # Whatever else goes wrong for one stock, the note names what happened, and the strike is still set
+    # against the price that did arrive.
+    real = metrics.realized_vol
+
+    def breaks_for_bolt(bars, window, exclude=frozenset()):
+        if bars and bars[-1].close == round(SPECS["BOLT"]["price"] / (1 + SPECS["BOLT"]["change"]), 2):
+            raise ZeroDivisionError("bad bar")
+        return real(bars, window, exclude)
+
+    monkeypatch.setattr(metrics, "realized_vol", breaks_for_bolt)
+    review = scanner.review(scanner.market.sample_positions())
+    bolt = next(h for h in review.holdings if h.position.underlying == "BOLT")
+    assert "BOLT" not in review.underlyings and "BOLT: bad bar" in review.warnings
+    assert bolt.note == "BOLT could not be looked up, so the Greeks and the path ahead are left out."
+    assert {c.rule: c.state for c in bolt.checks}["strike"] == "clear" and bolt.pnl is not None
+    assert review.holdings[0].pnl is not None
+
+
+def test_a_calendar_note_from_an_earlier_scan_is_not_repeated_by_a_review_that_asked_nothing(scanner):
+    # From the outside review. The note stays on the earnings service between scans. With the stock prices
+    # down no stock's dates are looked up, so nothing here has asked the calendar.
+    held = scanner.market.sample_positions()
+
+    def timed_out(today):
+        raise httpx.ReadTimeout("slow")
+
+    scanner.market.calendar = timed_out  # the demo market is the demo's calendar
+    left_over = "demo data earnings calendar unavailable (ReadTimeout); upcoming dates are estimates."
+    assert left_over in scanner.review(held).warnings  # dates were looked up just now, and the note is about them
+    assert scanner.earnings.calendar_note == left_over
+
+    def down(*args, **kwargs):
+        raise httpx.ConnectError("no route")
+
+    scanner.market.stock_snapshots = down
+    review = scanner.review(held)
+    assert review.underlyings == {} and review.warnings == ["Stock prices could not be loaded: no route"]
 
 
 def test_an_unknown_stock_is_named_and_its_position_kept(scanner):
@@ -586,8 +803,13 @@ def test_a_held_contracts_quote_from_an_earlier_day_is_not_a_quote():
     market = alpaca(handler)
     quotes = market.option_quotes({"AAPL261218P00200000": "AAPL", "COST261218C00900000": "COST", "NVDA261218C00150000": "NVDA"})
     # Options on every stock trade the same sessions, so the newest quote among them sets the day.
-    assert set(quotes) == {"AAPL261218P00200000", "NVDA261218C00150000"}
+    assert not quotes["AAPL261218P00200000"].outdated and not quotes["NVDA261218C00150000"].outdated
     assert quotes["NVDA261218C00150000"].volume == 0  # its last trade was on an earlier day
+    # From the outside review: the old quote used to vanish without a word. It comes back marked, with
+    # the time it was made and none of its prices, so the position can say when it was last quoted.
+    old = quotes["COST261218C00900000"]
+    assert old.outdated and (old.bid, old.ask, old.iv, old.delta, old.volume) == (None, None, None, None, None)
+    assert old.quote_time == datetime.fromisoformat("2026-11-20T20:59:59+00:00") and old.underlying == "COST"
 
 
 def test_held_contracts_nobody_has_quoted_for_days_are_left_out_whole():
@@ -595,11 +817,13 @@ def test_held_contracts_nobody_has_quoted_for_days_are_left_out_whole():
         return httpx.Response(200, json={"snapshots": {"AAPL261218P00200000": snapshot("2026-11-17T20:59:59Z")}})
 
     market = alpaca(handler)
-    assert market.option_quotes({"AAPL261218P00200000": "AAPL"}) == {}
+    (old,) = market.option_quotes({"AAPL261218P00200000": "AAPL"}).values()
+    assert old.outdated and old.bid is None and old.ask is None and old.quote_time.day == 17
     assert market.notes == ["The newest quote for the contracts held is from Nov 17, so none was used."]
     # Within four days there is nothing to compare a single contract with, so it gets through with its time.
     friday = alpaca(lambda request: httpx.Response(200, json={"snapshots": {"AAPL261218P00200000": snapshot("2026-11-20T20:59:59Z")}}))
-    assert friday.option_quotes({"AAPL261218P00200000": "AAPL"})["AAPL261218P00200000"].quote_time.day == 20
+    kept = friday.option_quotes({"AAPL261218P00200000": "AAPL"})["AAPL261218P00200000"]
+    assert kept.quote_time.day == 20 and not kept.outdated and kept.bid == 6.1
 
 
 def test_one_mistyped_contract_does_not_cost_the_others_their_quotes():
@@ -669,6 +893,7 @@ def test_positions_reach_the_api_and_the_page(client, tmp_path):
         {"kind": "both"},
         {"quantity": 0},
         {"entry_price": -2},
+        {"entry_price": 1e-310},  # from the outside review: accepted, stored, and infinite in every answer after
         {"expiry": "soon"},
         {"opened": "2027-03-01"},  # after the contract expires
     ],
@@ -676,6 +901,19 @@ def test_positions_reach_the_api_and_the_page(client, tmp_path):
 def test_the_api_turns_away_what_is_not_a_position(client, changes):
     assert client.post("/api/positions", json={**ENTRY, **changes}).status_code == 422
     assert len(client.get("/api/positions").json()["holdings"]) == 5
+
+
+def test_the_page_guards_what_the_review_found_in_it(client):
+    # From the outside review. The page has no test runner, so these hold the fixes in place by their text.
+    page = client.get("/").text
+    assert "[...new Set(lines.concat(notices[view]))]" in page  # one setup note, not the status's and the review's
+    assert "if (ticket !== loads) return;" in page  # an answer that is not the newest load's is dropped
+    assert "could not be loaded. Press Refresh to try again." in page  # the loading line does not stay up after a failure
+    assert "buttons(true);" in page  # one remove request, however many clicks
+    assert 'id="p_entry_price" type="number" min="0.0001" step="any"' in page  # an average of fills is not a whole cent
+    assert page.count("holding.dte < 0 ? null : review.underlyings[p.underlying]") == 2  # an expired row has no stock context
+    assert "atMost(plan.target_price)" in page  # the plan's target is cut off as the check's is, never rounded up
+    assert page.count("exact(p.entry_price)") == 2 and "exact(plan.entry_price)" in page  # $1.255 is not shown as $1.25
 
 
 def test_a_page_on_another_site_cannot_add_a_position(client):
@@ -742,3 +980,29 @@ def test_positions_on_the_command_line(capsys, tmp_path, monkeypatch):
     assert "kept in memory" in capsys.readouterr().err
     with pytest.raises(SystemExit):  # which side it is has to be said
         main(["positions", "add", "ACME", "2026-12-18", "170", "put", "--price", "1"])
+
+
+def test_a_result_that_rounds_to_nothing_has_no_sign():
+    # From the outside review: a loss of thirty cents printed as "+$0 (-0%)".
+    from app.__main__ import _result
+
+    blank = lambda pnl, pct: Holding(position(), 45, [], pnl=pnl, pnl_pct=pct)  # noqa: E731
+    assert _result(blank(-0.30, -0.001)) == "$0 (0%)" and _result(blank(0.0, 0.0)) == "$0 (0%)"
+    assert _result(blank(477.0, 0.569)) == "+$477 (+57%)" and _result(blank(-1110.6, -0.726)) == "-$1,111 (-73%)"
+    assert _result(blank(None, None)) == "-"
+
+
+def test_an_expired_position_is_not_given_its_stocks_news(scanner, capsys):
+    # From the outside review. An expired position alone has no stock beside it. With another position open on
+    # the same stock it picked that one's news chips up.
+    from app.__main__ import print_positions
+
+    gone = position(underlying="CRUX", strike=395.0, expiry=TODAY - timedelta(days=4), opened=TODAY - timedelta(days=40))
+    live = position(underlying="CRUX", strike=395.0)
+    review = scanner.review([gone, live])
+    assert "split" in review.underlyings["CRUX"].recent_events
+    print_positions(review)
+    rows = [line for line in capsys.readouterr().out.splitlines() if "CRUX" in line and "395 put, sold" in line and "$" not in line[:60]]
+    expired_row, live_row = rows[0], rows[1]
+    assert expired_row.rstrip().endswith("expired") and "news:" not in expired_row
+    assert "news: split" in live_row

@@ -92,7 +92,13 @@ class _Model:
         elif size is None:
             self.report_note = "This contract spans an earnings report that could not be sized, so these figures ignore it."
         elif size <= 0:
-            self.report_note = "The options price no extra move for the coming report, so no step is shown for it."
+            # Say whose reading of zero it is. With no reading from the options (a review of
+            # positions reads no chain) the zero is history's, and the options said nothing.
+            self.report_note = (
+                "The options price no extra move for the coming report, so no step is shown for it."
+                if priced is not None
+                else "Past reports were too small to size a step for the coming one, so none is shown."
+            )
         else:
             self.report = day
             self.event_var = min(size, MAX_EVENT_SHARE * total)
@@ -188,7 +194,13 @@ def build(
             )
     else:
         plan.target_price = entry * (1.0 - PROFIT_TARGET)
-        plan.target_day = next((d for d in days_ahead if close_price(d) <= plan.target_price), None)
+        if c.ask <= plan.target_price:
+            # Already there, at the ask as quoted. Only a contract held from an earlier, higher price
+            # can be: opened now, the ask is above the bid it was sold at. The search below starts
+            # tomorrow, and used to answer "tomorrow" for a target that was met today.
+            plan.target_day = today
+        else:
+            plan.target_day = next((d for d in days_ahead if close_price(d) <= plan.target_price), None)
     return plan
 
 

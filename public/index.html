@@ -159,7 +159,7 @@
   </label>
   <label>Contracts <input id="p_quantity" type="number" min="1" max="10000" step="1" value="1" required></label>
   <label title="What you paid or collected for one share. A contract is 100 shares, so 1.25 here is $125 a contract.">Price per share ($)
-    <input id="p_entry_price" type="number" min="0.01" step="0.01" required>
+    <input id="p_entry_price" type="number" min="0.0001" step="any" required>
   </label>
   <label title="Leave blank for today.">Opened <input id="p_opened" type="date"></label>
   <button class="primary" id="p_add" type="submit">Add position</button>
@@ -202,6 +202,7 @@ const $ = (id) => document.getElementById(id);
 let status = null, scan = null, selected = null;
 // The positions view: what the last check returned, and the id of the position that is open.
 let view = "scan", review = null, held = null;
+let loads = 0;  // each load of the positions takes a number, and only the newest one's answer is shown
 const notices = { scan: [], positions: [] };
 
 function el(tag, attrs, ...children) {
@@ -227,6 +228,12 @@ function signedPct(v, digits = 1) {
 }
 const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
 const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
+// A price as it was entered: to the cent, or finer when it is not a whole cent (an average of two fills).
+const exact = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(4).replace(/0{1,2}$/, "");
+// A price to be at or below: cut off, never rounded up, and finer than a cent when it is.
+// Half of $1.03 is $0.515. Shown as "$0.52 or less" it reads as reached at an ask of $0.52.
+const atMost = (v) => v === null || v === undefined ? "–"
+  : "$" + (Math.floor(v * 10000 + 1e-6) / 10000).toFixed(4).replace(/0{1,2}$/, "");
 const whole = (v) => v === null || v === undefined ? "–" : v.toLocaleString();
 function dollars(v, signed = false) {
   if (v === null || v === undefined) return "–";
@@ -285,7 +292,7 @@ function showNotices(extra, of) {
   if (status && status.mode === "live" && !status.earnings_sources.length) {
     lines.push("No earnings data source is configured, so earnings context is missing. Set SEC_USER_AGENT or ALPHAVANTAGE_API_KEY in .env.");
   }
-  $("notice").replaceChildren(...lines.concat(notices[view]).map((text) => el("p", {}, text)));
+  $("notice").replaceChildren(...[...new Set(lines.concat(notices[view]))].map((text) => el("p", {}, text)));
 }
 
 function earningsChips(ctx, idea) {
@@ -395,7 +402,7 @@ function planBlock(plan, ctx, mine) {
     : pct(Math.abs(plan.strike_distance_pct)) + (plan.strike_distance_pct < 0 ? " below the stock" : " above the stock");
   const rows = [];
   if (seller) {
-    rows.push(["Buy back to keep " + pct(rules.profit_target, 0), money(plan.target_price) + " or less"]);
+    rows.push(["Buy back to keep " + pct(rules.profit_target, 0), atMost(plan.target_price) + " or less"]);
     rows.push(["Decay alone gets there", mine && mine.reached ? "already there"
       : plan.target_day ? "about " + dayMonth(plan.target_day) : "not before expiry"]);
   } else if (plan.half_life_day) {
@@ -407,7 +414,7 @@ function planBlock(plan, ctx, mine) {
   const parts = [
     el("h3", {}, mine ? "From here, if the stock stands still" : "Exit plan"),
     facts(rows),
-    el("p", { class: "sub" }, (mine ? "One contract, against the " + money(plan.entry_price) + " it was opened at, closing at the "
+    el("p", { class: "sub" }, (mine ? "One contract, against the " + exact(plan.entry_price) + " it was opened at, closing at the "
       : "If the stock stands still, closing at the ") + (seller ? "ask" : "bid") + ":"),
     el("table", { class: "history" },
       el("thead", {}, el("tr", {}, el("th", {}, "When"), el("th", {}, "Close at"), el("th", {}, "Result"))),
@@ -663,13 +670,13 @@ function renderPositions() {
   }
   const head = ["#", "Position", "Entry", "Close at", "Result now", "Days left", "To look at"];
   const rows = list.map((holding, i) => {
-    const p = holding.position, ctx = review.underlyings[p.underlying];
+    const p = holding.position, ctx = holding.dte < 0 ? null : review.underlyings[p.underlying];
     const row = el("tr", { tabindex: "0", onclick: () => selectHolding(holding), onkeydown: (e) => { if (e.key === "Enter") selectHolding(holding); } },
       el("td", {}, String(i + 1)),
       el("td", {}, el("strong", {}, p.underlying), " ",
         el("span", { class: "sub" }, dayMonth(p.expiry) + " · " + p.strike + " " + p.kind),
         el("div", { class: "sub" }, SIDE[p.side] + " × " + p.quantity)),
-      el("td", {}, money(p.entry_price), el("div", { class: "sub" }, "opened " + dayMonth(p.opened))),
+      el("td", {}, exact(p.entry_price), el("div", { class: "sub" }, "opened " + dayMonth(p.opened))),
       el("td", {}, money(holding.close_price),
         holding.close_price === null ? null : el("div", { class: "sub" }, p.side === "long" ? "the bid" : "the ask")),
       holding.pnl === null ? el("td", {}, "–")
@@ -687,22 +694,28 @@ function renderPositions() {
 function removeBlock(p) {
   const box = el("p", { class: "sub" });
   const offer = () => box.replaceChildren(el("button", { type: "button", onclick: sure }, "Remove this position…"));
+  const buttons = (off) => box.querySelectorAll("button").forEach((button) => { button.disabled = off; });
+  const remove = async () => {
+    // One request, however many clicks: both buttons are off until it has answered.
+    buttons(true);
+    box.querySelectorAll(".error").forEach((node) => node.remove());
+    try {
+      await api("/api/positions/" + encodeURIComponent(p.id), undefined, "DELETE");
+      held = null;
+      await loadPositions();
+    } catch (err) {
+      buttons(false);
+      box.append(el("span", { class: "error" }, " " + err.message));
+    }
+  };
   const sure = () => box.replaceChildren("Remove it from the list? This deletes the entry here and nothing else. ",
-    el("button", { type: "button", onclick: async () => {
-      try {
-        await api("/api/positions/" + encodeURIComponent(p.id), undefined, "DELETE");
-        held = null;
-        await loadPositions();
-      } catch (err) {
-        box.append(el("span", { class: "error" }, " " + err.message));
-      }
-    } }, "Remove"), " ", el("button", { type: "button", onclick: offer }, "Keep"));
+    el("button", { type: "button", onclick: remove }, "Remove"), " ", el("button", { type: "button", onclick: offer }, "Keep"));
   offer();
   return box;
 }
 
 function selectHolding(holding) {
-  const p = holding.position, c = holding.contract, ctx = review.underlyings[p.underlying];
+  const p = holding.position, c = holding.contract, ctx = holding.dte < 0 ? null : review.underlyings[p.underlying];
   held = p.id;
   document.querySelectorAll("#positions tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.id === held));
   const short = p.side === "short";
@@ -718,7 +731,7 @@ function selectHolding(holding) {
       el("strong", {}, status.positions.rules[check.rule] + ". "), check.detail)),
     el("h3", {}, "Position"),
     facts([
-      [short ? "Collected" : "Paid", money(p.entry_price) + " a share · " + dollars(p.entry_price * 100 * p.quantity) + " in all"],
+      [short ? "Collected" : "Paid", exact(p.entry_price) + " a share · " + dollars(p.entry_price * 100 * p.quantity) + " in all"],
       ["Bid × ask now", holding.bid === null && holding.ask === null ? "–" : money(holding.bid) + " × " + money(holding.ask)],
       holding.quote_time ? ["Quoted", newsTime(holding.quote_time) + ", New York"] : null,
       [short ? "Buying back now, at the ask" : "Selling now, at the bid", money(holding.close_price)],
@@ -748,19 +761,32 @@ function selectHolding(holding) {
 }
 
 async function loadPositions() {
+  // Two loads can be under way at once: the view opening, then an entry being added. The answers
+  // may come back in either order, so an answer that is not the newest load's is dropped.
+  const ticket = ++loads;
   $("p_busy").textContent = "Checking…";
   $("p_refresh").disabled = true;
   try {
-    review = await api("/api/positions");
+    const answer = await api("/api/positions");
+    if (ticket !== loads) return;
+    review = answer;
     showNotices(review.warnings, "positions");
     renderPositions();
     const open = review.holdings.find((holding) => holding.position.id === held) || review.holdings[0];
     if (open) selectHolding(open);
   } catch (err) {
+    if (ticket !== loads) return;
+    // Nothing left on screen may pass for the list as it is now: not the loading line, and not an earlier answer.
+    review = null;
     showNotices(["Positions could not be loaded: " + err.message], "positions");
+    $("positions-title").textContent = "Positions";
+    $("positions").replaceChildren(el("p", { class: "empty error" }, "The positions on file could not be loaded. Press Refresh to try again."));
+    $("position-detail").replaceChildren(el("p", { class: "empty" }, "Select a position to see what the exit rules say about it."));
   } finally {
-    $("p_busy").textContent = "";
-    $("p_refresh").disabled = false;
+    if (ticket === loads) {
+      $("p_busy").textContent = "";
+      $("p_refresh").disabled = false;
+    }
   }
 }
 
