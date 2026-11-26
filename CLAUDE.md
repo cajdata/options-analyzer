@@ -164,7 +164,8 @@ News, measured the same evening:
 
 - Branch off `main` for each change. Commit, push, open a pull request, merge, and delete the branch only when asked for that step. Merge with a merge commit.
 - GitHub deletes a pull request's branch on its side when it merges (a repository setting, on since 2026-11-25). The cleanup step is then the local half: switch to `main`, pull, delete the local branch, prune.
-- Auto-merge is allowed on the repository, and with the rule on `main` it has the two required checks to wait for. It has not been used on a pull request yet. Turn it on only when asked, and with the merge-commit method: the default is squash.
+- Auto-merge is allowed on the repository, and with the rule on `main` it has the two required checks to wait for. Turn it on only when asked, and with the merge-commit method: the default is squash.
+- Auto-merge has to be turned on while a required check is still running. The two checks finish in about a minute, and once they have passed GitHub refuses it ("Pull request is in clean status"). That happened on three pull requests (#15, #17, #18), each time because it was asked for after the pull request was already open. It first took on #19 (2026-11-26), asked for straight after the pull request opened, and GitHub merged it with a merge commit when the second check passed. So if auto-merge is wanted, ask for it with the pull request, and turn it on in the same step that opens it. If it is refused because the checks have already passed, merging directly with a merge commit gives the same result.
 - Do not place trades, and do not say what to trade. Explanations of the numbers are welcome.
 - There is no screenshot or OCR path, by decision. Do not add one.
 - Keep dependencies minimal, and the dashboard as one vanilla-JS file.
