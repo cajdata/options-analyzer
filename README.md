@@ -1,14 +1,18 @@
 # Strike Check
 
-A read-only options scanner. It pulls option chains from Alpaca, ranks contracts by
+An options scanner. It pulls option chains from Alpaca, ranks contracts by
 visible rules, and puts each stock's earnings history next to what the options are
 pricing for the next report. It also lists each stock's recent headlines and SEC
 filings by type of event, with how the stock moved after earlier events of the same
-type. A positions page sets what you already hold against the same exit rules. An
-optional AI brief has Claude write up the setups worth a closer look.
+type. A positions page sets what you already hold against the same exit rules. A
+paper view lets you try a contract with pretend money, and a journal records what
+the scan showed for each paper trade and how it ended. An optional AI brief has
+Claude write up the setups worth a closer look.
 
-It only reads market data. It cannot place orders. The ranking is a screen, not a
-forecast and not financial advice.
+It reads market data. The one kind of order it can send goes to Alpaca's paper
+account, which holds pretend money, and only after you have confirmed that one
+order. It cannot place a real order. The ranking is a screen, not a forecast and not
+financial advice.
 
 Website: [strikecheck.app](https://strikecheck.app)
 
@@ -26,6 +30,7 @@ earnings dates are made up.
 ## Use real data
 
 1. Create a free [Alpaca](https://alpaca.markets) account and generate **paper trading** API keys.
+   They read market data, and they are the only keys a paper order is ever sent with.
 2. Copy `.env.example` to `.env` and fill in `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`.
 3. Set at least one earnings source in `.env`:
    - `SEC_USER_AGENT` (your name and email, which the SEC asks automated clients to send):
@@ -54,10 +59,16 @@ earnings dates are made up.
 .venv\Scripts\python.exe -m app positions                 # check what you hold against the exit rules
 .venv\Scripts\python.exe -m app positions add AAPL 2026-12-18 340 put --sold --price 4.10 --qty 2
 .venv\Scripts\python.exe -m app positions remove 3f9c2a1b # by the id the list shows
+.venv\Scripts\python.exe -m app paper                     # the paper account, the journal and which signals worked
+.venv\Scripts\python.exe -m app paper open AAPL 2026-12-18 340 put --sell   # write an order out; nothing is sent
+.venv\Scripts\python.exe -m app paper open AAPL 2026-12-18 340 put --sell --send
+.venv\Scripts\python.exe -m app paper close 3f9c2a1b --send   # by the id the journal shows
+.venv\Scripts\python.exe -m app paper cancel <order id>   # an order that has not filled
 ```
 
-Add `--demo` to a scan, the pool or the positions list to use synthetic data, or `--json`
-to a scan or the positions list for the full result.
+Add `--demo` to a scan, the pool, the positions list or `paper` to use synthetic data
+(for `paper`, straight after the word: `paper --demo open ...`), or `--json` to a scan,
+the positions list or `paper` for the full result.
 
 ## What a scan does
 
@@ -214,7 +225,74 @@ how many you hold never leave your computer: only tickers and contract symbols a
 to ask for quotes, earnings dates and news, and the AI brief is not given your positions.
 Demo mode shows made-up positions held in memory and never touches the file.
 
+## Paper trading
+
+A scan ranks contracts by rules. Paper trading is how you find out what those rules
+were worth, without money: an Alpaca paper account holds pretend dollars, and an order
+sent to it never reaches an exchange.
+
+**Opening a trade.** Open a contract in a scan and use "Paper trade" in its detail, or
+`python -m app paper open`. Either way the order is first written out in words: what
+it buys or sells, how many contracts, the limit price, what it costs or brings in.
+Nothing has happened at that point. Only "Send to the paper account", or `--send`,
+sends it, and it sends that one order once.
+
+- **You send every order.** No scan, refresh or rule ever sends or cancels one.
+- **Limit orders, good for the day.** One option, whole contracts, a price in whole
+  cents. The limit starts at the ask to buy and the bid to sell, and you can change it.
+  An order that has not filled by the close ends there.
+- **Paper only.** Orders go to Alpaca's paper host and nowhere else. With the keys of a
+  live account (`ALPACA_PAPER=false`) the app sends no orders at all.
+- **Selling a call needs the shares.** Alpaca takes a call sold to open only when the
+  paper account holds 100 shares for each contract. The app does not buy shares, so
+  without them the order is turned down and the app says why. A put sold to open needs
+  the cash, which a new paper account has.
+
+**The Paper view**, and `python -m app paper`, show what the paper account holds,
+checked against the same exit rules as the positions page, with a way to close each
+trade. They also list any order still working, with a way to cancel it. Paper and real
+are never mixed: `data/positions.json` is not touched.
+
+**The journal** keeps each paper trade from its order to its end:
+
+- **What the scan showed** when the order was written out: rank, score, rating, chance
+  of profit, delta, days to expiry, implied volatility against history, whether it was
+  open over an earnings report, and any flagged news. It is a copy, so a later change
+  to a weight or a rule does not rewrite it.
+- **The fills.** A trade is open at the account's average fill price, for as many
+  contracts as filled.
+- **How it ended.** Closed by your order, with the exit rules that were reached when
+  you sent it. Or held to expiry, settled at what exercising it paid at that day's
+  close. Or closed by an order placed at Alpaca itself, at that order's price.
+- **The result**, in dollars and as a share of the premium paid or collected.
+
+**Which signals worked** sorts the closed trades by each of those readings and counts
+how many made money, beside the same figures for every closed trade. Bought and sold
+options are kept apart. A row with fewer than ten trades says "too few" instead of
+showing an average. It describes your trades and nothing more, and nothing in it feeds
+the score or the rating.
+
+The journal is kept in `data/journal.json` on your own computer, or wherever
+`JOURNAL_FILE` points, and git ignores it. Demo mode has a made-up account and journal
+in memory, so you can try the whole flow with no keys.
+
 ## Limits worth knowing
+
+- **Paper fills are kinder than real ones.** A paper order fills when the market reaches
+  its price, whatever its size, and it moves nothing. Alpaca fills against live quotes
+  while the free feed's quotes here are delayed, so an order at the quoted price may
+  not fill at once. So a result in the journal is likely better than the same order
+  would have done with real money.
+- **A handful of trades says little.** With a dozen paper trades, no row of "which
+  signals worked" has enough in it to compare. The table counts what you chose to
+  trade, so it also carries whatever led you to choose it.
+- **An option held to expiry is settled on paper, not followed.** The journal records
+  what exercising it paid at that day's close. If it expired in the money, Alpaca
+  exercises or assigns it, which leaves shares in the paper account. The app does not
+  show or close those.
+- **Paper trading is one contract at a time.** No spreads, no shares, no market orders
+  and no orders that last past the day. A trade opened at Alpaca's own site shows in
+  the Paper view and has no journal entry.
 
 - **Free Alpaca option quotes are "indicative"**: quotes are modified and trades are
   15 minutes delayed. Screen with them, then check the live quote at your broker.
@@ -279,7 +357,7 @@ Demo mode shows made-up positions held in memory and never touches the file.
   before the page can tell.
 - **A position is one contract type.** A spread is entered as two positions, and their
   rules are not combined. An entry cannot be edited, only removed and entered again, and
-  nothing records a position after it is closed.
+  nothing records a real position after it is closed. The journal is for paper trades.
 - **The step across earnings for a held contract is sized from past reports**, not from
   what the options price in. Reading that takes the whole chain, and the page asks only
   for the contracts you hold.
@@ -305,5 +383,7 @@ Demo mode shows made-up positions held in memory and never touches the file.
    the recent ones. Rules decide whose news a headline is, and each type is
    also counted across the stocks covered about as much.
 3. **Done:** a positions page that checks what you hold against the exit rules.
-4. Paper trading on Alpaca, with a journal that records which signals worked.
+4. **Started:** paper trading on Alpaca, with a journal that records which signals
+   worked. Orders you write out and send yourself, the journal and the summary are in.
+   It has run on the demo account only: no order has been sent to Alpaca yet.
 5. Live trading with a human approval on every order.

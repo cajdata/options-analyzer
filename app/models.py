@@ -390,3 +390,160 @@ class PositionsReview:
     holdings: list[Holding]
     underlyings: dict[str, UnderlyingContext] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+
+
+# -- Paper trading (phase 4) ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Order:
+    """One option order as the paper account reports it. Read by app/broker.py."""
+
+    id: str  # the broker's id for it
+    client_id: str  # the id this app gave it, which is how a journal entry finds its orders
+    symbol: str  # the OCC contract symbol
+    side: str  # "buy" or "sell"
+    intent: str  # "open" or "close"; "" when the account does not say
+    quantity: int  # contracts
+    limit: float | None  # per share
+    status: str  # the broker's own word: new, partially_filled, filled, canceled, expired, rejected
+    working: bool  # True while it may still fill. False once it will not change again.
+    filled: int = 0  # contracts filled so far
+    fill_price: float | None = None  # the average, per share
+    submitted: datetime | None = None
+    filled_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PaperHolding:
+    """An option position as the paper account reports it."""
+
+    symbol: str
+    side: str  # "long" or "short"
+    quantity: int
+    entry_price: float  # the account's average, per share
+
+
+@dataclass(frozen=True)
+class PaperAccount:
+    options_level: int | None  # 1: covered calls and cash-secured puts. 2: also buying. 3: also spreads.
+    buying_power: float | None  # what the account can put into options, in dollars
+
+
+@dataclass(frozen=True)
+class Ticket:
+    """An order written out before it is sent, for the person to confirm. Made by app/paper.py.
+
+    Nothing has happened when a ticket exists. Sending takes the ticket's id
+    and nothing else, so what goes to the broker is what was shown, once.
+    """
+
+    id: str
+    action: str  # "open" or "close"
+    symbol: str
+    underlying: str
+    kind: str
+    strike: float
+    expiry: date
+    order_side: str  # "buy" or "sell"
+    side: str  # the position it opens or closes: "long" or "short"
+    quantity: int
+    limit: float  # per share
+    text: str  # the order in a sentence
+    notes: list[str]
+    made: datetime
+    trade: str = ""  # closing: the journal entry it closes
+    signals: dict = field(default_factory=dict)  # opening: what the scan showed, to go in the journal
+
+
+@dataclass(frozen=True)
+class ClosingOrder:
+    """A closing order that has been sent and has not ended yet."""
+
+    client_id: str
+    quantity: int
+    limit: float
+    sent: datetime
+    # The exit rules that were reached when it was sent. None when they could not be checked.
+    rules: tuple[str, ...] | None = None
+    order: str = ""  # the broker's id, once it has confirmed the order
+
+
+@dataclass(frozen=True)
+class Exit:
+    """Contracts leaving a paper trade: bought or sold back, or held to expiry."""
+
+    quantity: int
+    price: float | None  # per share. None when nothing on record says what they closed at.
+    when: datetime
+    how: str  # "order", "outside", "expiry" or "unknown": see journal.HOW
+    rules: tuple[str, ...] | None = None  # as on the closing order; None when not known
+    order: str = ""  # the broker's id for the order, when there was one
+
+
+@dataclass
+class Trade:
+    """One paper trade, from the order that opened it to how it ended. Kept by app/journal.py."""
+
+    id: str
+    underlying: str
+    kind: str  # "call" or "put"
+    strike: float
+    expiry: date
+    symbol: str  # the OCC contract symbol
+    side: str  # "long" (bought to open) or "short" (sold to open)
+    quantity: int  # contracts ordered and, once the opening order has ended, contracts filled
+    limit: float  # the opening order's limit, per share
+    ordered: datetime
+    # What the scan showed for the contract when the order was written (analysis/signals.py).
+    signals: dict = field(default_factory=dict)
+    # "ordered": the opening order may still fill. "unfilled": it ended with nothing filled.
+    # "open": held. "closed": every contract has left, by an order or at expiry.
+    state: str = "ordered"
+    open_order: str = ""  # the broker's id, once it has confirmed the order
+    opened: datetime | None = None
+    entry_price: float | None = None  # the average fill, per share
+    closing: ClosingOrder | None = None
+    exits: list[Exit] = field(default_factory=list)
+    note: str | None = None
+    # Worked out from the exits (journal.settle). They are written to the file so it can be read there.
+    closed: datetime | None = None
+    exit_price: float | None = None
+    pnl: float | None = None  # dollars across every contract
+    pnl_pct: float | None = None  # as a share of the premium paid or collected
+    stands: str = ""  # where it is, or how it ended, in a few words
+
+    @property
+    def remaining(self) -> int:
+        """Contracts still held, by the journal's count."""
+        return max(self.quantity - sum(e.quantity for e in self.exits), 0) if self.state == "open" else 0
+
+
+@dataclass(frozen=True)
+class SignalRow:
+    """Closed paper trades that shared one reading of one signal. Built by analysis/signals.py."""
+
+    group: str  # the signal: "rating", "score", ...; "all" for every closed trade
+    bucket: str  # the reading: "favorable", "70 or more", ...
+    trades: int
+    won: int  # made money
+    lost: int
+    mean_pct: float  # average result, as a share of the premium
+    total: float  # dollars in all
+
+
+@dataclass
+class PaperReview:
+    """The paper account and the journal, as of now. Built by app/paper.py."""
+
+    generated_at: datetime
+    mode: str  # "demo", "live" or "unconfigured"
+    can_order: bool
+    account: PaperAccount | None
+    # What the account holds, checked against the exit rules as held positions are.
+    positions: PositionsReview | None
+    opened_by: dict[str, list[str]]  # a held position's id to the journal entries open on it
+    orders: list[Order]  # still working
+    trades: list[Trade]  # newest first
+    summary: dict[str, list[SignalRow]]  # by lens
+    warnings: list[str] = field(default_factory=list)

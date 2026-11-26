@@ -14,10 +14,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app import ai, positions
-from app.analysis import events, exits, holdings, scoring
+from app import ai, journal, paper, positions
+from app.analysis import events, exits, holdings, scoring, signals
 from app.config import ROOT, ConfigError, Settings, load_settings
-from app.models import Position, PositionsReview, ScanResult
+from app.models import PaperReview, Position, PositionsReview, ScanResult, Ticket, Trade
 from app.scanner import ET, PRESETS, Scanner, ScanRequest, build_scanner
 
 log = logging.getLogger(__name__)
@@ -63,6 +63,23 @@ class PositionBody(BaseModel):
     opened: date | None = None  # today, when left out
 
 
+class TicketBody(BaseModel):
+    """An order to write out. Nothing is sent: the answer is the order in words, for the person to confirm."""
+
+    action: Literal["open", "close"]
+    limit: float = Field(gt=0, le=paper.MAX_LIMIT)
+    # Opening: a contract from a scan that is still in memory. The scan is where its signals come from.
+    scan_id: str | None = Field(None, max_length=40)
+    contract: str | None = Field(None, max_length=32)
+    quantity: int | None = Field(None, ge=1, le=paper.MAX_CONTRACTS)
+    # Closing: the journal entry to close. What is left of it is closed.
+    trade: str | None = Field(None, max_length=40)
+
+
+class SendBody(BaseModel):
+    ticket: str = Field(max_length=40)
+
+
 def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
     settings = settings or load_settings()
     app = FastAPI(title="Strike Check", docs_url=None, redoc_url=None)
@@ -76,6 +93,8 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
         setup_error = str(err)
     # Positions can be entered and read without market data, so the store does not wait on the keys.
     store = positions.open_store(settings, scanner.market if scanner else None)
+    # The paper desk is there with or without a paper account, so the journal can always be read.
+    desk = paper.build_desk(settings, scanner, demo, setup_error)
 
     def today() -> date:
         return scanner.today if scanner else datetime.now(ET).date()
@@ -102,6 +121,19 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
                 "earnings_soon_days": holdings.EARNINGS_SOON,
                 # Where they are kept. None: in memory, as the demo's are.
                 "file": str(store.path) if store.path else None,
+            },
+            "paper": {
+                # Whether an order can be sent, and why not when it cannot.
+                "available": desk.available,
+                "why": desk.why,
+                # Where the journal is kept. None: in memory, as the demo's is.
+                "file": str(desk.journal.path) if desk.journal.path else None,
+                "lenses": signals.LENS,
+                "signals": signals.LABELS,
+                "min_trades": signals.MIN_TRADES,
+                "ended": journal.HOW,
+                "max_contracts": paper.MAX_CONTRACTS,
+                "ticket_minutes": paper.TICKET_MINUTES,
             },
             "news_sources": scanner.news.sources if scanner and scanner.news else [],
             "events": {
@@ -218,5 +250,56 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
         if not removed:
             raise HTTPException(404, "There is no position with that id.")
         return {"removed": position_id}
+
+    # -- Paper trading. The two routes that write or send take JSON only, as the positions routes do. --
+
+    @app.get("/api/paper")
+    def paper_account() -> PaperReview:
+        """The paper account beside the journal. Reading it brings the journal up to date, and sends nothing."""
+        try:
+            return desk.review()
+        except journal.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+        except Exception as err:  # as for a scan: report it rather than a bare 500
+            log.exception("paper review failed")
+            raise HTTPException(502, f"The paper account could not be checked: {err}") from err
+
+    @app.post("/api/paper/tickets")
+    def write_order(body: TicketBody) -> Ticket:
+        """Write an order out. This sends nothing: it answers with the order in words and an id to confirm it by."""
+        try:
+            if body.action == "close":
+                if not body.trade:
+                    raise HTTPException(422, "Closing needs the id of the trade to close.")
+                return desk.write_close(body.trade, body.limit)
+            if not (body.scan_id and body.contract and body.quantity):
+                raise HTTPException(422, "Opening needs a scan, a contract from it and a number of contracts.")
+            with scans_lock:
+                result = scans.get(body.scan_id)
+            if result is None:
+                raise HTTPException(404, "That scan is no longer in memory. Run it again.")
+            return desk.write_open(result, body.contract, body.quantity, body.limit)
+        except paper.PaperError as err:
+            raise HTTPException(err.status, str(err)) from err
+        except journal.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+
+    @app.post("/api/paper/orders", status_code=201)
+    def send_order(body: SendBody) -> Trade:
+        """Send the one order a ticket describes. This is the only route that sends an order."""
+        try:
+            return desk.send(body.ticket)
+        except paper.PaperError as err:
+            raise HTTPException(err.status, str(err)) from err
+        except journal.StoreError as err:
+            raise HTTPException(500, str(err)) from err
+
+    @app.delete("/api/paper/orders/{order_id}")
+    def cancel_order(order_id: str) -> dict:
+        try:
+            desk.cancel(order_id)
+        except paper.PaperError as err:
+            raise HTTPException(err.status, str(err)) from err
+        return {"cancelled": order_id}
 
     return app

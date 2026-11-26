@@ -1,29 +1,33 @@
-"""Command line: `python -m app scan ...`, `python -m app positions` or `python -m app serve`."""
+"""Command line: `python -m app scan ...`, `python -m app positions`, `python -m app paper` or `python -m app serve`."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import textwrap
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 
-from app import ai, positions
-from app.config import ConfigError, load_settings
-from app.analysis import events, exits, holdings
+from app import ai, journal, occ, paper, positions
+from app.config import ConfigError, load_settings, tidy
+from app.analysis import events, exits, holdings, signals
 from app.models import (
     ContractAnalysis,
     EventStudy,
     ExitPlan,
     Holding,
+    PaperReview,
     PooledStudy,
     Position,
     PositionsReview,
     ScanResult,
+    Ticket,
+    Trade,
     UnderlyingContext,
 )
-from app.scanner import ET, PRESETS, ScanRequest, build_scanner
+from app.scanner import ET, MAX_STRIKE_WINDOW, PRESETS, ScanRequest, build_scanner
 
 _RATING = 22  # width of the rating column, e.g. "unfavorable, long shot"
 
@@ -251,13 +255,72 @@ def _figure(price: float) -> str:
     return holdings.dollars(price)[1:]
 
 
-def _result(h: Holding) -> str:
+def _dollars(amount: float) -> str:
+    """Whole dollars with a sign, settled after rounding, so nothing prints as "+$0"."""
+    whole = round(amount)
+    return f"{'-' if whole < 0 else '+' if whole > 0 else ''}${abs(whole):,}"
+
+
+def _outcome(pnl: float | None, pnl_pct: float | None) -> str:
     """A result in whole dollars and percent. Signs are settled after rounding, so nothing prints as "+$0" or "-0%"."""
-    if h.pnl is None:
+    if pnl is None or pnl_pct is None:
         return "-"
-    whole, share = round(h.pnl), round(h.pnl_pct * 100)
-    money = f"{'-' if whole < 0 else '+' if whole > 0 else ''}${abs(whole):,}"
-    return f"{money} ({'+' if share > 0 else ''}{share}%)"
+    share = round(pnl_pct * 100)
+    return f"{_dollars(pnl)} ({'+' if share > 0 else ''}{share}%)"
+
+
+def _share(value: float) -> str:
+    """A share as a whole percent with a sign, settled after rounding, so nothing prints as "-0%"."""
+    whole = round(value * 100)
+    return f"{'+' if whole > 0 else ''}{whole}%"
+
+
+def _result(h: Holding) -> str:
+    return _outcome(h.pnl, h.pnl_pct)
+
+
+def _print_holdings(review: PositionsReview, ids: dict[str, str] | None = None) -> None:
+    """Each position in a line, then what the rules say about the ones they say something about.
+
+    `ids` gives what to show as each row's id in place of the position's own.
+    """
+    header = f"{'ID':<9} {'Position':<32} {'Qty':>3}  {'Entry':>7}  {'Close at':>8}  {'Result':>15}  {'DTE':>4}  To look at"
+    print(header)
+    print("-" * len(header))
+    for h in review.holdings:
+        p = h.position
+        # An expired position is not set beside its stock's news, whether or not something else on the stock is held.
+        ctx = review.underlyings.get(p.underlying) if h.dte >= 0 else None
+        look = [c.label for c in h.checks if c.state != "clear"]
+        look += [f"news: {kind}" for kind in (ctx.recent_events if ctx else {}) if kind in events.FLAGGED]
+        close = "-" if h.close_price is None else _figure(h.close_price)
+        shown = p.id if ids is None else ids.get(p.id, "-")
+        print(
+            f"{shown:<9} {_held(p):<32} {p.quantity:>3}  {_figure(p.entry_price):>7}  {close:>8}  {_result(h):>15}  "
+            f"{h.dte:>4}  {', '.join(look) or '-'}"
+        )
+
+    said = False
+    for h in review.holdings:
+        lines = [f"{holdings.RULES[c.rule]}: {c.detail}" for c in h.checks if c.state != "clear"]
+        lines += [h.note] if h.note else []
+        if not lines:
+            continue
+        if not said:
+            print("\nWhat the rules say")
+            said = True
+        print(f"  {_held(h.position)}")
+        for line in lines:
+            print(textwrap.fill(line, 110, initial_indent=" " * 6, subsequent_indent=" " * 6))
+
+
+def _flagged_news(review: PositionsReview) -> list[str]:
+    """News lines for the stocks held that have a recent event of a flagged type.
+
+    That is what a holder has to see, and every held stock's news would bury it.
+    """
+    telling = [s for s, ctx in sorted(review.underlyings.items()) if any(kind in events.FLAGGED for kind in ctx.recent_events)]
+    return [line for symbol in telling for line in _news_lines(symbol, review.underlyings[symbol])]
 
 
 def print_positions(review: PositionsReview) -> None:
@@ -268,38 +331,9 @@ def print_positions(review: PositionsReview) -> None:
         print("No positions on file. Add one with:")
         print("  python -m app positions add SYMBOL YYYY-MM-DD STRIKE call|put --sold --price 1.25")
     else:
-        header = f"{'ID':<9} {'Position':<32} {'Qty':>3}  {'Entry':>7}  {'Close at':>8}  {'Result':>15}  {'DTE':>4}  To look at"
-        print(header)
-        print("-" * len(header))
-        for h in review.holdings:
-            p = h.position
-            # An expired position is not set beside its stock's news, whether or not something else on the stock is held.
-            ctx = review.underlyings.get(p.underlying) if h.dte >= 0 else None
-            look = [c.label for c in h.checks if c.state != "clear"]
-            look += [f"news: {kind}" for kind in (ctx.recent_events if ctx else {}) if kind in events.FLAGGED]
-            close = "-" if h.close_price is None else _figure(h.close_price)
-            print(
-                f"{p.id:<9} {_held(p):<32} {p.quantity:>3}  {_figure(p.entry_price):>7}  {close:>8}  {_result(h):>15}  "
-                f"{h.dte:>4}  {', '.join(look) or '-'}"
-            )
+        _print_holdings(review)
 
-        said = False
-        for h in review.holdings:
-            lines = [f"{holdings.RULES[c.rule]}: {c.detail}" for c in h.checks if c.state != "clear"]
-            lines += [h.note] if h.note else []
-            if not lines:
-                continue
-            if not said:
-                print("\nWhat the rules say")
-                said = True
-            print(f"  {_held(h.position)}")
-            for line in lines:
-                print(textwrap.fill(line, 110, initial_indent=" " * 6, subsequent_indent=" " * 6))
-
-    # Only the stocks with a recent event of a type that tends to move a stock in one jump. That
-    # is what a holder has to see, and every held stock's news would bury it.
-    telling = [s for s, ctx in sorted(review.underlyings.items()) if any(kind in events.FLAGGED for kind in ctx.recent_events)]
-    news = [line for symbol in telling for line in _news_lines(symbol, review.underlyings[symbol])]
+    news = _flagged_news(review)
     if news:
         print(f"\nNews on what is held, last {events.RECENT_DAYS} days, where an event of a flagged type is among it")
         print("\n".join(news))
@@ -311,6 +345,187 @@ def print_positions(review: PositionsReview) -> None:
     print("at the ask. A rule that is reached is a fact about the position, not advice, and the")
     delayed = " Quotes on this feed are delayed." if review.options_feed == "indicative" else ""
     print(f"{exits.PROFIT_TARGET:.0%} target and {exits.TIME_STOP_DTE}-day time stop are rules of thumb.{delayed}")
+
+
+JOURNAL_LINES = 12  # trades printed from the journal, newest first
+
+
+def _signal_lines(summary: dict) -> list[str]:
+    """Closed trades by what the scan showed when each was opened. Below `signals.MIN_TRADES` a row says "too few"."""
+    lines = []
+    for lens, rows in summary.items():
+        lines.append(f"  {signals.LENS[lens]}")
+        group = None
+        for row in rows:
+            if row.group != group and row.group != signals.ALL:
+                lines.append(f"    {signals.LABELS[row.group]}")
+            group = row.group
+            indent = 4 if row.group == signals.ALL else 6
+            text = f"{' ' * indent}{row.bucket:<{40 - indent}} {row.trades:>3} closed"
+            if row.trades < signals.MIN_TRADES:
+                lines.append(f"{text}   too few to compare")
+                continue
+            lines.append(
+                f"{text}   {row.won:>3} made money ({row.won / row.trades:.0%})   {_share(row.mean_pct)} of the premium on average   "
+                f"{_dollars(row.total)} in all"
+            )
+    return lines
+
+
+def print_paper(review: PaperReview, kept: object = None, every: bool = False) -> None:
+    """The paper account: what it holds, the orders still working, the journal, and which signals worked."""
+    feed = {"demo": "SYNTHETIC DEMO DATA", "live": "Alpaca's paper account"}.get(review.mode, "no market data")
+    print(f"\nPaper trading   Data: {feed}")
+    if review.account:
+        level, power = review.account.options_level, review.account.buying_power
+        said = [f"options level {level}" if level is not None else "", f"${power:,.0f} to put into options" if power is not None else ""]
+        print("Account: " + ", ".join(text for text in said if text) + ".")
+    held = review.positions
+    print()
+    if held is None:
+        print("What the paper account holds could not be read.")
+    elif not held.holdings:
+        print("The paper account holds no options.")
+    else:
+        # A row goes by the journal's id for it, which is what `paper close` takes.
+        _print_holdings(held, {key: ", ".join(ids) for key, ids in review.opened_by.items() if ids})
+
+    if review.orders:
+        print("\nOrders still working")
+        for o in review.orders:
+            when = f", sent {o.submitted.astimezone(ET):%b %d %H:%M} New York time" if o.submitted else ""
+            limit = f" at {_figure(o.limit)}" if o.limit else ""
+            print(f"  {o.id}  {o.side} to {o.intent or '?'} {o.quantity} {o.symbol}{limit}{when}, {o.filled} filled")
+
+    counts = {state: sum(1 for t in review.trades if t.state == state) for state in journal.STATES}
+    said = ", ".join(f"{counts[state]} {state}" for state in ("closed", "open", "ordered", "unfilled") if counts[state])
+    print(f"\nJournal: {said or 'no trades yet'}" + (f"   ({kept})" if kept else ""))
+    listed = review.trades if every else review.trades[:JOURNAL_LINES]
+    if listed:
+        header = f"{'ID':<9} {'Trade':<32} {'Qty':>3}  {'Entry':>7}  {'Exit':>7}  {'Result':>15}  {'Days':>4}  How it stands"
+        print(header)
+        print("-" * len(header))
+        for t in listed:
+            entry = "-" if t.entry_price is None else _figure(t.entry_price)
+            left = "-" if t.exit_price is None else _figure(t.exit_price)
+            days = (t.closed - t.opened).days if t.closed and t.opened else "-"
+            print(
+                f"{t.id:<9} {_held(t):<32} {t.quantity:>3}  {entry:>7}  {left:>7}  {_outcome(t.pnl, t.pnl_pct):>15}  "
+                f"{days:>4}  {t.stands}"
+            )
+        if len(review.trades) > len(listed):
+            print(f"  ... and {len(review.trades) - len(listed)} older. Add --all for every one.")
+
+    if review.summary:
+        print("\nWhich signals worked: closed trades, by what the scan showed when each was opened")
+        print("\n".join(_signal_lines(review.summary)))
+        print(f"  A row with fewer than {signals.MIN_TRADES} trades is not compared. This describes these trades, on a paper account's")
+        print("  fills. It is not a forecast, and nothing here feeds the score or the rating.")
+    news = _flagged_news(held) if held else []
+    if news:
+        print(f"\nNews on what is held, last {events.RECENT_DAYS} days, where an event of a flagged type is among it")
+        print("\n".join(news))
+    if review.warnings:
+        print("\nNotes")
+        for warning in review.warnings:
+            print(f"  - {warning}")
+    print("\nPaper orders use pretend money and never reach an exchange. A rule that is reached is a fact about")
+    print("the position, not advice. Each order is one you send: nothing here sends or cancels one for you.")
+
+
+def _cents(price: float, up: bool) -> float:
+    """A quote as a limit in whole cents: rounded up to buy, down to sell. The free feed's quotes are not always whole cents."""
+    scaled = round(price * 100, 6)
+    return max((math.ceil(scaled) if up else math.floor(scaled)) / 100, 0.01)
+
+
+def _open_ticket(args, desk: paper.PaperDesk, scanner) -> Ticket:
+    """Scan the one stock, so the journal has what the scan showed for the contract, and write the order out."""
+    if scanner is None:
+        raise paper.PaperError(desk.why or "No market data is set up.")
+    (symbol,) = tidy([args.underlying]) or [""]
+    try:
+        expiry = date.fromisoformat(args.expiry)
+    except ValueError:
+        raise paper.PaperError("expiry must be a date such as 2026-12-18") from None
+    days = (expiry - scanner.today).days
+    if days < 0:
+        raise paper.PaperError("That contract has expired.")
+    request = ScanRequest(
+        symbols=[symbol], lens=args.lens, kind=args.kind, dte_min=days, dte_max=days,
+        strike_window=MAX_STRIKE_WINDOW, per_side=10_000, top_n=10_000,
+    )  # fmt: skip
+    result = scanner.scan(request)
+    contract = occ.build(symbol.replace(".", ""), expiry, args.kind, args.strike)
+    idea = next((c for c in result.ideas if c.symbol == contract), None)
+    if idea is None:
+        raise paper.PaperError(
+            f"The scan does not rank {contract}: it has no two-sided quote, or its price, spread or delta is outside what the "
+            f"{args.lens} lens ranks. A paper trade is opened from a ranked contract, so that the journal has what the scan showed for it."
+        )
+    limit = args.limit if args.limit is not None else _cents(idea.ask if args.lens == "buy" else idea.bid, up=args.lens == "buy")
+    return desk.write_open(result, contract, args.qty, limit)
+
+
+def _close_ticket(args, desk: paper.PaperDesk) -> Ticket:
+    limit = args.limit
+    if limit is None:
+        # Where closing now would be priced: the bid for a holder, the ask to buy back.
+        review = desk.review()
+        held = review.positions.holdings if review.positions else []
+        holding = next((h for h in held if args.id in review.opened_by.get(h.position.id, [])), None)
+        if holding is None or holding.close_price is None:
+            raise paper.PaperError("There is no quote to price the close at. Give a price with --limit.")
+        limit = _cents(holding.close_price, up=holding.position.side == "short")
+    return desk.write_close(args.id, limit)
+
+
+def _sent(t: Trade, action: str) -> str:
+    """What became of an order just sent."""
+    if action == "open":
+        if t.state == "open":
+            return f"Sent, and filled: {t.quantity} at {_figure(t.entry_price)}. Trade {t.id} is open."
+        if t.state == "unfilled":
+            return f"Sent, and it ended at once with nothing filled. {t.note or ''}".strip()
+        return f"Sent. Trade {t.id} is waiting to fill, and `python -m app paper` shows where it stands."
+    if t.state == "closed":
+        return f"Sent, and filled at {_figure(t.exit_price)}. Trade {t.id} is closed: {_outcome(t.pnl, t.pnl_pct)}."
+    if t.closing:
+        return f"Sent. The closing order for trade {t.id} is working, and `python -m app paper` shows where it stands."
+    return f"Sent, and it ended at once without closing trade {t.id} in full."
+
+
+def _paper(args, settings) -> int:
+    """The paper account and the journal, or one order written out and, with --send, sent."""
+    try:
+        scanner, setup_error = build_scanner(settings, demo=args.demo), None
+    except ConfigError as err:
+        scanner, setup_error = None, str(err)  # the journal can still be read
+    desk = paper.build_desk(settings, scanner, args.demo, setup_error)
+    try:
+        if args.action == "cancel":
+            desk.cancel(args.order)
+            print(f"Cancelled {args.order}.")
+            return 0
+        if args.action in ("open", "close"):
+            ticket = _open_ticket(args, desk, scanner) if args.action == "open" else _close_ticket(args, desk)
+            print(ticket.text)
+            for note in ticket.notes:
+                print(textwrap.fill(note, 110, initial_indent="  ", subsequent_indent="  "))
+            if not args.send:
+                print("\nNothing was sent. Run it again with --send to send this order to the paper account.")
+                return 0
+            print("\n" + _sent(desk.send(ticket.id), args.action))
+            return 0
+        review = desk.review()
+    except (paper.PaperError, journal.StoreError, ValueError) as err:
+        print(err, file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(asdict(review), default=str, indent=2))
+    else:
+        print_paper(review, desk.journal.path, every=args.all)
+    return 0
 
 
 def _change_positions(args, settings) -> int:
@@ -345,7 +560,9 @@ def _print_brief(brief: ai.BriefResult) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m app", description="Read-only options scanner.")
+    parser = argparse.ArgumentParser(
+        prog="python -m app", description="Options scanner. It reads market data, and sends an order only to a paper account, when asked for that order."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="scan symbols, or discover candidates when none are given")
@@ -396,6 +613,28 @@ def main(argv: list[str] | None = None) -> int:
     remove = actions.add_parser("remove", help="take a position off the file")
     remove.add_argument("id", help="its id, as the list shows it")
 
+    trades = sub.add_parser("paper", help="paper trades on Alpaca's paper account, and the journal of how they ended")
+    trades.add_argument("--json", action="store_true", help="print the full result as one JSON document")
+    trades.add_argument("--all", action="store_true", help="list every trade in the journal, not only the newest")
+    trades.add_argument("--demo", action="store_true", help="use synthetic data and a made-up account kept in memory; no keys needed")
+    orders = trades.add_subparsers(dest="action")
+    opening = orders.add_parser("open", help="write out an order to open a contract a scan ranks; --send sends it")
+    opening.add_argument("underlying", help="the stock's ticker")
+    opening.add_argument("expiry", help="the contract's expiry, as YYYY-MM-DD")
+    opening.add_argument("strike", type=float)
+    opening.add_argument("kind", choices=["call", "put"])
+    way = opening.add_mutually_exclusive_group(required=True)
+    way.add_argument("--buy", dest="lens", action="store_const", const="buy", help="buy it to open (the buy lens)")
+    way.add_argument("--sell", dest="lens", action="store_const", const="sell", help="sell it to open (the sell lens)")
+    opening.add_argument("--qty", type=int, default=1, help="contracts (default 1)")
+    closing = orders.add_parser("close", help="write out an order to close an open trade; --send sends it")
+    closing.add_argument("id", help="the trade's id, as the journal shows it")
+    for order in (opening, closing):
+        order.add_argument("--limit", type=float, help="limit price per share (default: the ask to buy, the bid to sell)")
+        order.add_argument("--send", action="store_true", help="send the order; without this it is only written out")
+    cancelling = orders.add_parser("cancel", help="cancel an order that is still working")
+    cancelling.add_argument("order", help="the order's id, as the list of working orders shows it")
+
     args = parser.parse_args(argv)
     if args.command == "scan":
         # A preset fills in whatever was not given on the command line.
@@ -433,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "positions" and args.action:
         return _change_positions(args, settings)
+    if args.command == "paper":
+        return _paper(args, settings)
 
     try:
         scanner = build_scanner(settings, demo=args.demo)

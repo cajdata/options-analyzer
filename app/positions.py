@@ -16,12 +16,8 @@ position beside today's quotes.
 
 from __future__ import annotations
 
-import contextlib
-import json
 import math
-import os
 import re
-import tempfile
 import threading
 import uuid
 from datetime import date, datetime
@@ -31,6 +27,9 @@ from typing import Any, Iterable
 from app import occ
 from app.config import tidy
 from app.models import Position
+from app.store import ListFile, StoreError
+
+__all__ = ["PositionStore", "StoreError", "make", "open_store", "unread_note"]
 
 KINDS = ("call", "put")
 SIDES = ("long", "short")
@@ -41,10 +40,6 @@ MIN_PRICE, MAX_PRICE = 0.0001, 1_000_000
 # One to six letters or digits, optionally a class suffix: AAPL, F, BRK.B.
 _SYMBOL = re.compile(r"[A-Z0-9]{1,6}(\.[A-Z0-9]{1,3})?")
 _FIELDS = ("underlying", "kind", "strike", "expiry", "side", "quantity", "entry_price", "opened")
-
-
-class StoreError(RuntimeError):
-    """The positions file cannot be read or written. The message is written for the user."""
 
 
 def _number(value: Any, what: str) -> float:
@@ -145,56 +140,16 @@ class PositionStore:
     """
 
     def __init__(self, path: Path | str | None, seed: Iterable[Position] = ()) -> None:
-        self.path = Path(path) if path is not None else None
-        self._memory = [_plain(p) for p in seed]
+        # Reading and writing the file, and what happens when either fails, is `store.ListFile`'s.
+        self._file = ListFile(path, "positions", "positions file", (_plain(p) for p in seed))
+        self.path = self._file.path
         self._lock = threading.Lock()
 
-    # -- Reading and writing -------------------------------------------------
-
     def _rows(self) -> list[Any]:
-        """Every entry as it is written, whether or not it reads as a position."""
-        if self.path is None:
-            return list(self._memory)
-        try:
-            # "utf-8-sig" reads a file with or without a byte order mark. An older Notepad and
-            # PowerShell's Set-Content both put one in front, and this file is meant to be edited by hand.
-            text = self.path.read_text(encoding="utf-8-sig")
-        except FileNotFoundError:
-            return []
-        except (OSError, UnicodeError) as err:
-            raise StoreError(f"The positions file {self.path} could not be read ({type(err).__name__}).") from err
-        if not text.strip():
-            return []
-        try:
-            rows = json.loads(text)["positions"]
-            if not isinstance(rows, list):
-                raise TypeError
-        except (ValueError, KeyError, TypeError):
-            raise StoreError(
-                f"The positions file {self.path} does not read as a list of positions. It has been left as it is, "
-                "and nothing will be written to it until it is repaired or moved away."
-            ) from None
-        return rows
+        return self._file.rows()
 
     def _write(self, rows: list[Any]) -> None:
-        if self.path is None:
-            self._memory = rows
-            return
-        payload = json.dumps({"version": 1, "positions": rows}, indent=2) + "\n"
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Written beside the file and swapped into place, so a crash never leaves half a file.
-            handle, temporary = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
-            try:
-                with os.fdopen(handle, "w", encoding="utf-8") as file:
-                    file.write(payload)
-                os.replace(temporary, self.path)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(temporary)
-                raise
-        except OSError as err:
-            raise StoreError(f"The positions file {self.path} could not be written ({type(err).__name__}).") from err
+        self._file.write(rows)
 
     # -- What callers use ----------------------------------------------------
 

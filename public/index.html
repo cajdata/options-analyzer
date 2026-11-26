@@ -53,8 +53,8 @@
   th, td { padding: 7px 6px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   th:nth-child(2), td:nth-child(2), th:last-child, td:last-child { text-align: left; }
-  #results td:last-child, #positions td:last-child { white-space: normal; min-width: 120px; }
-  #results .chip, #positions .chip { white-space: nowrap; margin-bottom: 2px; }
+  #results td:last-child, #positions td:last-child, #paper-held td:last-child { white-space: normal; min-width: 120px; }
+  #results .chip, #positions .chip, #paper-held .chip { white-space: nowrap; margin-bottom: 2px; }
   tbody tr { cursor: pointer; }
   tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
   tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -89,6 +89,13 @@
   details { border-top: 1px solid var(--line); padding: 6px 0; }
   summary { cursor: pointer; }
   #brief { margin-top: 16px; }
+  .stack { display: grid; gap: 16px; min-width: 0; }
+  .fields { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin: 6px 0; }
+  .plain tbody tr { cursor: default; }
+  .plain tbody tr:hover { background: none; }
+  .plain td:last-child { white-space: normal; }
+  .history.pool th.group { padding-top: 12px; color: var(--text); }
+  #paper-orders h3 { margin-top: 22px; }
   .pick { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
   .pick p { margin: 4px 0; }
   .empty { color: var(--muted); padding: 24px 4px; }
@@ -103,6 +110,7 @@
   <nav aria-label="Views">
     <button type="button" class="tab selected" id="tab-scan" aria-pressed="true">Scan</button>
     <button type="button" class="tab" id="tab-positions" aria-pressed="false">Positions</button>
+    <button type="button" class="tab" id="tab-paper" aria-pressed="false">Paper</button>
   </nav>
   <span id="sources" class="sub"></span>
 </header>
@@ -169,7 +177,26 @@
 <p class="hint" id="position-about" data-view="positions" hidden></p>
 <p class="hint" id="position-hint" role="status" data-view="positions" hidden></p>
 
+<div class="controls" data-view="paper" hidden>
+  <button id="paper-refresh" type="button">Refresh</button>
+  <span id="paper-account" class="sub"></span>
+  <span id="paper-busy" class="sub" role="status"></span>
+</div>
+<p class="hint" id="paper-about" data-view="paper" hidden></p>
+
 <div class="notice" id="notice"></div>
+
+<main data-view="paper" hidden>
+  <div class="stack">
+    <section class="panel">
+      <h2 id="paper-title">Paper account</h2>
+      <div class="scroll" id="paper-held"><p class="empty">Reading the paper account.</p></div>
+      <div class="scroll" id="paper-orders"></div>
+    </section>
+    <section id="journal"></section>
+  </div>
+  <aside class="panel" id="paper-detail"><p class="empty">Select a position to see what the exit rules say about it.</p></aside>
+</main>
 
 <main data-view="positions" hidden>
   <section class="panel">
@@ -193,17 +220,21 @@
   Contracts are ranked by fixed, visible rules: liquidity, distance to breakeven, how volatility is priced,
   time decay or yield, and delta. The risk and reward rating compares each price with the stock's own history.
   Neither is a forecast, and neither is financial advice.
-  This app only reads market data. It cannot place orders.
+  This app reads market data. It sends an order only to a paper account, with pretend money, and only the one
+  you have written out and confirmed. It cannot place a real one.
 </footer>
 
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 let status = null, scan = null, selected = null;
-// The positions view: what the last check returned, and the id of the position that is open.
-let view = "scan", review = null, held = null;
+// The positions view: what the last check returned.
+let view = "scan", review = null;
 let loads = 0;  // each load of the positions takes a number, and only the newest one's answer is shown
-const notices = { scan: [], positions: [] };
+// The paper view: what the last look at the paper account returned, and its own count of loads.
+let paper = null, paperLoads = 0;
+const VIEWS = ["scan", "positions", "paper"];
+const notices = { scan: [], positions: [], paper: [] };
 
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
@@ -597,6 +628,7 @@ function select(idea) {
     ].filter(Boolean)),
     riskBlock(idea, ctx),
     exitBlock(idea, ctx),
+    paperBlock(idea),
     el("h3", {}, "Score " + num(idea.score, 1) + " of 100"),
     Object.entries(idea.components).map(([name, value]) => el("div", { class: "component" },
       el("span", {}, COMPONENTS[name] || name),
@@ -660,20 +692,44 @@ function checkChips(holding) {
     .map((check) => el("span", { class: "chip hot", title: check.detail }, check.label));
 }
 
-function renderPositions() {
+// Two lists of held positions are drawn the same way: what the person entered, and what the paper
+// account holds. Each has its own table, its own detail pane and its own open row. `next` goes under
+// the rules (a way to close a paper trade) and `last` at the foot (a way to remove an entry, or what
+// the scan showed when a paper trade was opened).
+const PICK = "Select a position to see what the exit rules say about it.";
+const BOOKS = {
+  positions: {
+    list: "positions", title: "positions-title", detail: "position-detail", open: null, plain: "Positions",
+    heading: (n) => n + (n === 1 ? " position" : " positions") + ", in the order entered",
+    none: "No positions on file. Enter one above, or open a contract in a scan and record it from there.",
+    next: () => null,
+    last: (holding) => removeBlock(holding.position),
+  },
+  paper: {
+    list: "paper-held", title: "paper-title", detail: "paper-detail", open: null, plain: "Paper account",
+    heading: (n) => n + (n === 1 ? " position" : " positions") + " in the paper account",
+    none: "The paper account holds no options. Open a contract in a scan and write an order out from there.",
+    next: (holding) => closeBlock(holding),
+    last: (holding) => heldTrades(holding).map(shownThen),
+  },
+};
+
+function renderPositions() { renderHoldings(review, BOOKS.positions); }
+function selectHolding(holding) { showHolding(review, BOOKS.positions, holding); }
+
+function renderHoldings(review, book) {
   const list = review.holdings;
-  $("positions-title").textContent = list.length
-    ? list.length + (list.length === 1 ? " position" : " positions") + ", in the order entered" : "Positions";
+  $(book.title).textContent = list.length ? book.heading(list.length) : book.plain;
   if (!list.length) {
-    $("positions").replaceChildren(el("p", { class: "empty" },
-      "No positions on file. Enter one above, or open a contract in a scan and record it from there."));
-    $("position-detail").replaceChildren(el("p", { class: "empty" }, "Select a position to see what the exit rules say about it."));
+    $(book.list).replaceChildren(el("p", { class: "empty" }, book.none));
+    $(book.detail).replaceChildren(el("p", { class: "empty" }, PICK));
     return;
   }
   const head = ["#", "Position", "Entry", "Close at", "Result now", "Days left", "To look at"];
   const rows = list.map((holding, i) => {
     const p = holding.position, ctx = holding.dte < 0 ? null : review.underlyings[p.underlying];
-    const row = el("tr", { tabindex: "0", onclick: () => selectHolding(holding), onkeydown: (e) => { if (e.key === "Enter") selectHolding(holding); } },
+    const open = () => showHolding(review, book, holding);
+    const row = el("tr", { tabindex: "0", onclick: open, onkeydown: (e) => { if (e.key === "Enter") open(); } },
       el("td", {}, String(i + 1)),
       el("td", {}, el("strong", {}, p.underlying), " ",
         el("span", { class: "sub" }, dayMonth(p.expiry) + " · " + p.strike + " " + p.kind),
@@ -689,7 +745,7 @@ function renderPositions() {
     row.dataset.id = p.id;
     return row;
   });
-  $("positions").replaceChildren(el("table", {}, el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, h)))), el("tbody", {}, rows)));
+  $(book.list).replaceChildren(el("table", {}, el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, h)))), el("tbody", {}, rows)));
 }
 
 // Removing asks once more in the page itself, since an entry cannot be brought back.
@@ -703,7 +759,7 @@ function removeBlock(p) {
     box.querySelectorAll(".error").forEach((node) => node.remove());
     try {
       await api("/api/positions/" + encodeURIComponent(p.id), undefined, "DELETE");
-      held = null;
+      BOOKS.positions.open = null;
       await loadPositions();
     } catch (err) {
       buttons(false);
@@ -716,10 +772,10 @@ function removeBlock(p) {
   return box;
 }
 
-function selectHolding(holding) {
+function showHolding(review, book, holding) {
   const p = holding.position, c = holding.contract, ctx = holding.dte < 0 ? null : review.underlyings[p.underlying];
-  held = p.id;
-  document.querySelectorAll("#positions tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.id === held));
+  book.open = p.id;
+  document.querySelectorAll("#" + book.list + " tbody tr").forEach((row) => row.classList.toggle("selected", row.dataset.id === book.open));
   const short = p.side === "short";
   const breakeven = p.kind === "call" ? p.strike + p.entry_price : p.strike - p.entry_price;
   const reached = holding.checks.some((check) => check.rule === "profit_target" && check.state === "reached");
@@ -731,6 +787,7 @@ function selectHolding(holding) {
     el("h3", {}, "What the exit rules say"),
     holding.checks.map((check) => el("p", { class: check.state === "clear" ? "rule" : "rule caution" },
       el("strong", {}, status.positions.rules[check.rule] + ". "), check.detail)),
+    book.next(holding),
     el("h3", {}, "Position"),
     facts([
       [short ? "Collected" : "Paid", exact(p.entry_price) + " a share · " + dollars(p.entry_price * 100 * p.quantity) + " in all"],
@@ -758,8 +815,8 @@ function selectHolding(holding) {
     );
   }
   parts.push(el("p", { class: "sub" }, "A rule that is reached is a fact about the position, not an instruction. The result counts the spread: "
-    + "a holder sells at the bid and a seller buys back at the ask."), removeBlock(p));
-  $("position-detail").replaceChildren(...parts.flat(Infinity).filter(Boolean));
+    + "a holder sells at the bid and a seller buys back at the ask."), book.last(holding));
+  $(book.detail).replaceChildren(...parts.flat(Infinity).filter(Boolean));
 }
 
 async function loadPositions() {
@@ -774,7 +831,7 @@ async function loadPositions() {
     review = answer;
     showNotices(review.warnings, "positions");
     renderPositions();
-    const open = review.holdings.find((holding) => holding.position.id === held) || review.holdings[0];
+    const open = review.holdings.find((holding) => holding.position.id === BOOKS.positions.open) || review.holdings[0];
     if (open) selectHolding(open);
   } catch (err) {
     if (ticket !== loads) return;
@@ -783,7 +840,7 @@ async function loadPositions() {
     showNotices(["Positions could not be loaded: " + err.message], "positions");
     $("positions-title").textContent = "Positions";
     $("positions").replaceChildren(el("p", { class: "empty error" }, "The positions on file could not be loaded. Press Refresh to try again."));
-    $("position-detail").replaceChildren(el("p", { class: "empty" }, "Select a position to see what the exit rules say about it."));
+    $("position-detail").replaceChildren(el("p", { class: "empty" }, PICK));
   } finally {
     if (ticket === loads) {
       $("p_busy").textContent = "";
@@ -803,10 +860,289 @@ function record(idea) {
     + ". Change the price to what you actually " + (scan.lens === "buy" ? "paid" : "collected") + ", set the contracts, then press Add position.");
 }
 
+// -- Paper trading -------------------------------------------------------------------------------
+
+// A quote as a limit in whole cents: up to buy, down to sell. The free feed's quotes are not always whole cents.
+function cents(v, up) {
+  const scaled = Math.round(v * 1e8) / 1e6;
+  return Math.max((up ? Math.ceil(scaled) : Math.floor(scaled)) / 100, 0.01).toFixed(2);
+}
+const stamp = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "–";
+
+// An order is written out first, which sends nothing. Only the Send button under the written-out order
+// sends it, and it sends that one order once: both buttons are off from the first click.
+function orderBox(fields, body, sent) {
+  const box = el("div", {});
+  const note = el("p", { class: "sub error" });
+  const write = el("button", { type: "button" }, "Write the order out…");
+  const offer = () => { write.disabled = false; box.replaceChildren(fields, el("p", {}, write), note); };
+  write.addEventListener("click", async () => {
+    write.disabled = true;
+    note.textContent = "";
+    let ticket;
+    try {
+      ticket = await api("/api/paper/tickets", body());
+    } catch (err) {
+      write.disabled = false;
+      note.textContent = "Not written out: " + err.message;
+      return;
+    }
+    const send = el("button", { type: "button", class: "primary" }, "Send to the paper account");
+    const back = el("button", { type: "button", onclick: offer }, "Not now");
+    const problem = el("p", { class: "error" });
+    send.addEventListener("click", async () => {
+      send.disabled = back.disabled = true;
+      try {
+        sent(await api("/api/paper/orders", { ticket: ticket.id }), box);
+      } catch (err) {
+        // A written-out order is used once, so Send stays off. Going back writes a new one.
+        problem.textContent = err.message;
+        back.disabled = false;
+        back.textContent = "Back";
+      }
+    });
+    box.replaceChildren(el("p", { class: "caution" }, el("strong", {}, ticket.text)),
+      ...ticket.notes.map((text) => el("p", { class: "sub" }, text)),
+      el("p", { class: "sub" }, "Nothing has been sent. It waits " + status.paper.ticket_minutes + " minutes to be confirmed."),
+      el("p", {}, send, " ", back), problem);
+  });
+  offer();
+  return box;
+}
+
+// What became of an order just sent.
+function sentText(trade, opening) {
+  if (opening) {
+    if (trade.state === "open") return "Sent, and filled: " + trade.quantity + " at " + exact(trade.entry_price) + ". It is in the journal as open.";
+    if (trade.state === "unfilled") return "Sent, and it ended at once with nothing filled. " + (trade.note || "");
+    return "Sent. It is waiting to fill, and the journal has it as ordered.";
+  }
+  if (trade.state === "closed") {
+    return "Sent, and filled at " + exact(trade.exit_price) + ". The trade is closed: "
+      + dollars(trade.pnl, true) + " (" + signedPct(trade.pnl_pct, 0) + ").";
+  }
+  return trade.closing ? "Sent. The closing order is working." : "Sent, and it ended at once without closing the trade.";
+}
+
+const limitTitle = (buying) => buying ? "The most to pay for one share. It starts at the ask." : "The least to take for one share. It starts at the bid.";
+
+// Open a paper trade from a contract in the scan. The journal keeps what the scan shows for it now.
+function paperBlock(idea) {
+  const rules = status.paper;
+  const parts = [el("h3", {}, "Paper trade")];
+  if (!rules.available) return parts.concat(el("p", { class: "sub" }, rules.why || "No paper account is set up, so no order can be sent."));
+  const buying = scan.lens === "buy";
+  const quantity = el("input", { type: "number", min: "1", max: String(rules.max_contracts), step: "1", value: "1" });
+  const limit = el("input", { type: "number", min: "0.01", step: "0.01", value: cents(buying ? idea.ask : idea.bid, buying) });
+  const fields = el("div", { class: "fields" }, el("label", {}, "Contracts", quantity),
+    el("label", { title: limitTitle(buying) }, "Limit per share ($)", limit));
+  parts.push(el("p", { class: "sub" }, (buying ? "Buy" : "Sell") + " this contract to open on "
+    + (status.mode === "demo" ? "the demo's made-up account" : "Alpaca's paper account") + ": pretend money, and never an exchange. "
+    + "The journal keeps what this scan shows for it, and later how the trade ended."));
+  parts.push(orderBox(fields,
+    () => ({ action: "open", scan_id: scan.id, contract: idea.symbol, quantity: Number(quantity.value), limit: Number(limit.value) }),
+    (trade, box) => {
+      paper = null;  // the paper view is read afresh the next time it opens
+      box.replaceChildren(el("p", { class: "sub" }, sentText(trade, true)),
+        el("p", {}, el("a", { href: "#paper", onclick: (e) => { e.preventDefault(); show("paper"); } }, "See the paper account")));
+    }));
+  return parts;
+}
+
+// What the scan showed for a trade when its order was written, as the journal kept it.
+function shownThen(trade) {
+  const s = trade.signals || {};
+  if (s.score === undefined || s.score === null) return [];
+  const report = s.spans_earnings ? "open over a report" + (s.earnings_estimated ? " (estimated date)" : "")
+    : s.earnings_unknown ? "report date unknown" : "clear of a report";
+  return [el("h3", {}, "What the scan showed when it was opened"),
+    facts([
+      ["Ranked", s.rank ? s.rank + " of " + s.of + ", to " + s.lens : "–"],
+      ["Score", num(s.score, 1) + " of 100"],
+      ["Rating if history repeats", s.rating ? s.rating + (s.shape ? ", " + s.shape : "") : "not rated"],
+      ["Chance of profit, as priced", pct(s.pop, 0)],
+      ["Delta · days to expiry", num(s.delta) + " · " + s.dte],
+      ["Implied volatility, against history", pct(s.iv) + " against " + pct(s.history_vol)],
+      ["Earnings", report],
+      ["Flagged news", s.news && s.news.length ? s.news.join(", ") : "none"],
+    ]),
+    el("p", { class: "sub" }, "Scanned " + newsTime(s.scanned) + ", New York. The journal keeps this copy, so a later change to a weight or a rule does not rewrite it.")];
+}
+
+// The journal entries that are open on a position the paper account holds. Usually there is one.
+function heldTrades(holding) {
+  return (paper.opened_by[holding.position.id] || []).map((id) => paper.trades.find((t) => t.id === id)).filter(Boolean);
+}
+
+// Under a paper position's rules: a way to close each journal entry that is open on it.
+function closeBlock(holding) {
+  const side = holding.position.side;
+  const mine = heldTrades(holding);
+  if (!mine.length) {
+    return [el("h3", {}, "Close it"),
+      el("p", { class: "sub" }, "This position was not opened from here, so the journal has no entry for it and it cannot be closed from here.")];
+  }
+  return mine.map((trade) => {
+    const parts = [el("h3", {}, "Close it")];
+    if (trade.state !== "open") {
+      parts.push(el("p", { class: "sub" }, "The order that opened it is still working, so it cannot be closed yet."));
+    } else if (trade.closing) {
+      parts.push(el("p", { class: "sub" }, "A closing order at " + exact(trade.closing.limit) + " is working. It is in the list of orders, where it can be cancelled."));
+    } else if (!paper.can_order) {
+      parts.push(el("p", { class: "sub" }, status.paper.why || "No order can be sent."));
+    } else {
+      const buying = side === "short";
+      const left = trade.quantity - trade.exits.reduce((sum, e) => sum + e.quantity, 0);
+      const limit = el("input", { type: "number", min: "0.01", step: "0.01", value: holding.close_price === null ? "" : cents(holding.close_price, buying) });
+      const fields = el("div", { class: "fields" }, el("label", { title: limitTitle(buying) }, "Limit per share ($)", limit),
+        el("span", { class: "sub" }, (buying ? "buys back " : "sells ") + left + (left === 1 ? " contract" : " contracts")));
+      parts.push(orderBox(fields, () => ({ action: "close", trade: trade.id, limit: Number(limit.value) }),
+        (sent, box) => { box.replaceChildren(el("p", { class: "sub" }, sentText(sent, false))); loadPaper(); }));
+    }
+    return parts;
+  });
+}
+
+function tradeName(t) {
+  return [el("strong", {}, t.underlying), " ", el("span", { class: "sub" }, dayMonth(t.expiry) + " · " + t.strike + " " + t.kind),
+    el("div", { class: "sub" }, SIDE[t.side] + " × " + t.quantity)];
+}
+
+// Orders that may still fill. Cancelling is the one thing here that needs no written-out order: it sends nothing new.
+function renderOrders() {
+  if (!paper.orders.length) { $("paper-orders").replaceChildren(); return; }
+  const rows = paper.orders.map((o, i) => {
+    const t = paper.trades.find((trade) => trade.symbol === o.symbol);
+    const cancel = el("button", { type: "button" }, "Cancel");
+    const problem = el("span", { class: "error" });
+    cancel.addEventListener("click", async () => {
+      cancel.disabled = true;
+      problem.textContent = "";
+      try {
+        await api("/api/paper/orders/" + encodeURIComponent(o.id), undefined, "DELETE");
+        await loadPaper();
+      } catch (err) {
+        cancel.disabled = false;
+        problem.textContent = " " + err.message;
+      }
+    });
+    return el("tr", {}, el("td", {}, String(i + 1)),
+      el("td", {}, t ? tradeName(t).slice(0, 3) : o.symbol, el("div", { class: "sub" }, o.side + " to " + (o.intent || "?") + " × " + o.quantity)),
+      el("td", {}, exact(o.limit)), el("td", {}, o.filled + " of " + o.quantity),
+      el("td", {}, o.submitted ? newsTime(o.submitted) : "–"), el("td", {}, cancel, problem));
+  });
+  $("paper-orders").replaceChildren(el("h3", {}, "Orders still working"),
+    el("table", { class: "plain" }, el("thead", {}, el("tr", {}, ["#", "Order", "Limit", "Filled", "Sent (New York)", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, rows)));
+}
+
+// Closed trades by what the scan showed when each was opened. Below the least number of trades a row says "too few".
+function signalTables() {
+  const rules = status.paper, parts = [];
+  for (const [lens, rows] of Object.entries(paper.summary)) {
+    const body = [];
+    let group = null;
+    rows.forEach((row) => {
+      if (row.group !== group && row.group !== "all") body.push(el("tr", {}, el("th", { class: "group", colspan: "5" }, rules.signals[row.group])));
+      group = row.group;
+      body.push(row.trades < rules.min_trades
+        ? el("tr", {}, el("td", {}, row.bucket), el("td", {}, String(row.trades)), el("td", { class: "sub", colspan: "3" }, "too few to compare"))
+        : el("tr", {}, el("td", {}, row.bucket), el("td", {}, String(row.trades)),
+          el("td", {}, row.won + " (" + pct(row.won / row.trades, 0) + ")"),
+          el("td", { class: tone(Math.round(row.mean_pct * 100)) }, signedPct(row.mean_pct, 0)),
+          el("td", { class: tone(Math.round(row.total)) }, dollars(row.total, true))));
+    });
+    parts.push(el("h3", {}, rules.lenses[lens]), el("table", { class: "history pool plain" },
+      el("thead", {}, el("tr", {}, ["What the scan showed", "Closed", "Made money", "Average result", "In all"].map((h) => el("th", {}, h)))),
+      el("tbody", {}, body)));
+  }
+  if (!parts.length) return [];
+  return [el("h2", { style: "margin-top:22px" }, "Which signals worked"),
+    el("p", { class: "sub" }, "Closed trades, sorted by what the scan showed when each was opened and by the rule that was reached when it was closed. "
+      + "The average result is a share of the premium paid or collected, and a seller's can be worse than −100%. Each reading means something only by how "
+      + "it differs from the first row, every closed trade of the same kind. A row with fewer than " + rules.min_trades + " trades is not compared."),
+    ...parts,
+    el("p", { class: "sub" }, "This describes these trades, on a paper account's fills: no order here moved a market or waited in a queue. "
+      + "It is not a forecast, and nothing in it feeds the score or the rating.")];
+}
+
+function renderJournal() {
+  const trades = paper.trades;
+  const parts = [el("h2", {}, trades.length ? "Journal · " + trades.length + (trades.length === 1 ? " trade" : " trades") + ", newest first" : "Journal")];
+  if (!trades.length) {
+    parts.push(el("p", { class: "empty" }, "No paper trades yet. Open a contract in a scan and write an order out from there."));
+  } else {
+    const head = ["#", "Trade", "Opened", "Entry", "Closed", "Exit", "Result", "How it stands"];
+    const rows = trades.map((t, i) => el("tr", {}, el("td", {}, String(i + 1)), el("td", {}, tradeName(t)),
+      el("td", {}, stamp(t.opened || t.ordered), t.opened ? null : el("div", { class: "sub" }, "ordered")),
+      el("td", {}, t.entry_price === null ? [exact(t.limit), el("div", { class: "sub" }, "the limit")] : exact(t.entry_price)),
+      el("td", {}, stamp(t.closed)), el("td", {}, exact(t.exit_price)),
+      t.pnl === null ? el("td", {}, "–")
+        : el("td", { class: tone(Math.round(t.pnl)) }, dollars(t.pnl, true), el("div", { class: "sub" }, signedPct(t.pnl_pct, 0))),
+      el("td", {}, t.stands, t.note ? el("div", { class: "sub" }, t.note) : null)));
+    parts.push(el("div", { class: "scroll" }, el("table", { class: "plain" },
+      el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, h)))), el("tbody", {}, rows))));
+  }
+  $("journal").replaceChildren(el("div", { class: "panel" }, parts, signalTables()));
+}
+
+function renderPaper() {
+  const account = paper.account, book = BOOKS.paper;
+  $("paper-account").textContent = account ? [
+    account.options_level === null ? "" : "Options level " + account.options_level,
+    account.buying_power === null ? "" : dollars(account.buying_power) + " to put into options",
+  ].filter(Boolean).join(" · ") : "";
+  if (paper.positions) {
+    renderHoldings(paper.positions, book);
+    const open = paper.positions.holdings.find((holding) => holding.position.id === book.open) || paper.positions.holdings[0];
+    if (open) showHolding(paper.positions, book, open);
+  } else {
+    $(book.title).textContent = book.plain;
+    $(book.list).replaceChildren(el("p", { class: "empty" }, paper.can_order
+      ? "What the paper account holds could not be read. Press Refresh to try again."
+      : (status.paper.why || "No paper account is set up.")));
+    $(book.detail).replaceChildren(el("p", { class: "empty" }, PICK));
+  }
+  renderOrders();
+  renderJournal();
+}
+
+async function loadPaper() {
+  // As for the positions: an answer that is not the newest load's is dropped.
+  const ticket = ++paperLoads;
+  $("paper-busy").textContent = "Checking…";
+  $("paper-refresh").disabled = true;
+  try {
+    const answer = await api("/api/paper");
+    if (ticket !== paperLoads) return;
+    paper = answer;
+    showNotices(paper.warnings, "paper");
+    renderPaper();
+  } catch (err) {
+    if (ticket !== paperLoads) return;
+    // Nothing left on screen may pass for the account as it is now.
+    paper = null;
+    showNotices(["The paper account could not be loaded: " + err.message], "paper");
+    $("paper-title").textContent = BOOKS.paper.plain;
+    $("paper-account").textContent = "";
+    $("paper-held").replaceChildren(el("p", { class: "empty error" }, "The paper account and the journal could not be loaded. Press Refresh to try again."));
+    $("paper-detail").replaceChildren(el("p", { class: "empty" }, PICK));
+    $("paper-orders").replaceChildren();
+    $("journal").replaceChildren();
+  } finally {
+    if (ticket === paperLoads) {
+      $("paper-busy").textContent = "";
+      $("paper-refresh").disabled = false;
+    }
+  }
+}
+
+const fromHash = () => VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "scan";
+
 function show(name) {
   view = name;
   document.querySelectorAll("[data-view]").forEach((node) => { node.hidden = node.dataset.view !== name; });
-  for (const tab of ["scan", "positions"]) {
+  for (const tab of VIEWS) {
     $("tab-" + tab).classList.toggle("selected", tab === name);
     $("tab-" + tab).setAttribute("aria-pressed", String(tab === name));
   }
@@ -814,6 +1150,7 @@ function show(name) {
   if (location.hash !== hash) history.replaceState(null, "", location.pathname + hash);
   showNotices();
   if (name === "positions" && !review) loadPositions();
+  if (name === "paper" && !paper) loadPaper();
 }
 
 function renderBriefButton() {
@@ -896,7 +1233,7 @@ $("position-form").addEventListener("submit", async (event) => {
       entry_price: Number($("p_entry_price").value),
       opened: $("p_opened").value || null,
     });
-    held = made.id;
+    BOOKS.positions.open = made.id;
     for (const id of ["p_underlying", "p_strike", "p_expiry", "p_entry_price", "p_opened"]) $(id).value = "";
     $("p_quantity").value = 1;
     await loadPositions();
@@ -909,7 +1246,9 @@ $("position-form").addEventListener("submit", async (event) => {
 $("p_refresh").addEventListener("click", loadPositions);
 $("tab-scan").addEventListener("click", () => show("scan"));
 $("tab-positions").addEventListener("click", () => show("positions"));
-window.addEventListener("hashchange", () => show(location.hash === "#positions" ? "positions" : "scan"));
+$("tab-paper").addEventListener("click", () => show("paper"));
+$("paper-refresh").addEventListener("click", loadPaper);
+window.addEventListener("hashchange", () => show(fromHash()));
 
 (async function start() {
   try {
@@ -943,7 +1282,11 @@ window.addEventListener("hashchange", () => show(location.hash === "#positions" 
     + "on the quotes of that moment. Nothing watches the market in between. "
     + (status.positions.file ? "Positions are kept on this computer, in " + status.positions.file + "."
       : "The demo's positions are made up and kept in memory: they are gone when the server stops.");
-  show(location.hash === "#positions" ? "positions" : "scan");
+  $("paper-about").textContent = "Paper orders use pretend money and never reach an exchange. Each one is an order you write out and then send: "
+    + "nothing here sends or cancels one for you, and nothing watches the market between refreshes. "
+    + (status.paper.file ? "The journal is kept on this computer, in " + status.paper.file + "."
+      : status.mode === "demo" ? "The demo's account and journal are made up and kept in memory: they are gone when the server stops." : "");
+  show(fromHash());
 })();
 </script>
 </body>
