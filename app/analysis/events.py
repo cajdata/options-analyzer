@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import statistics
+import unicodedata
 from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime, time as clock, timedelta
@@ -115,6 +116,12 @@ _RATINGS = r"buy|sell|hold|neutral|outperform|underperform|overweight|underweigh
 # Words that make "positive data" a medicine's and not a benchmark's.
 _CLINICAL = r"trials?|stud(?:y|ies)|patients?|therap\w+|treatment|vaccine|cancer|disease|dos(?:e|ing)|candidate|investigational"
 
+# After a results word these make the headline about what is expected, not what was
+# reported: "Fourth Quarter 2026 Revenue Guidance" is guidance, not results.
+_AHEAD = r"(?! (?:growth )?(?:guidance|outlook|forecasts?|targets?|estimates?|projections?|expectations)\b)"
+# A sale of the company. "Explores Sale of Delivery Hero Assets" is a sale of something it owns.
+_EXPLORES_SALE = r"explor\w+ (?:a |potential )?sale\b(?! of (?!the company\b|itself\b|the business\b))"
+
 # Headline rules, checked in this order: the first that matches decides the type.
 # The order matters. "Raises price target" is an analyst note and not guidance, and
 # "announces webcast for third quarter earnings" is a date, not the results.
@@ -139,6 +146,7 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         "analyst",
         _rule(
             r"price targets?",
+            r"target prices?",
             rf"(?:up|down)grade[sd]?\b.*\b(?:{_RATINGS}|rating|positive|negative)\b",
             r"initiates? coverage",
             r"coverage (?:of|on)\b",
@@ -149,16 +157,27 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     (
+        # What a company says ahead of its report, and an outlook that falls short, are
+        # guidance though they name a quarter. They come first because the results rule
+        # below would take them, and results are neither pointed out nor studied.
+        "guidance",
+        _rule(
+            r"preliminary (?:\S+ ){0,4}?(?:results|revenue|sales|earnings)\b",
+            r"pre-?announces?",
+            r"(?:guidance|outlook|forecast) (?:\S+ ){0,3}?(?:fails?|miss(?:es)?|disappoints?|falls? short|underwhelms?)\b",
+        ),
+    ),
+    (
         "earnings",
         _rule(
             r"(?:reports?|posts?|announces?|releases?|delivers?|records?)\b.*"
             r"\b(?:first|second|third|fourth|q[1-4]|quarter(?:ly)?|full[- ]year|fiscal|annual)\b.*"
-            r"\b(?:results|earnings|revenue|profit|loss|sales|income)\b",
-            r"(?:reports?|posts?) (?:\S+ ){0,3}(?:loss|profit|results|earnings|revenue|income)\b",
+            r"\b(?:results|earnings|revenues?|profit|loss|sales|income)\b" + _AHEAD,
+            r"(?:reports?|posts?) (?:\S+ ){0,3}(?:loss|profit|results|earnings|revenues?|income)\b" + _AHEAD,
             r"(?:earnings|eps|revenue|profit|sales) (?:beats?|miss(?:es)?|tops?|falls? short|exceeds?)\b",
             r"(?:beats?|miss(?:es)?|tops?|exceeds?) .*\b(?:estimates|expectations|consensus)\b",
-            r"(?:first|second|third|fourth)[- ]quarter (?:\d{4} )?(?:results|earnings|profit|loss|revenue)",
-            r"q[1-4] (?:\d{4} )?(?:results|earnings|profit|loss|revenue)",
+            r"(?:first|second|third|fourth)[- ]quarter (?:\d{4} )?(?:results|earnings|profit|loss|revenues?)\b" + _AHEAD,
+            r"q[1-4] (?:\d{4} )?(?:results|earnings|profit|loss|revenues?)\b" + _AHEAD,
         ),
     ),
     (
@@ -178,6 +197,12 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     (
+        # A mini-tender is an offer for a sliver of the shares, usually below the market
+        # price. The company tells holders to reject it, and nobody is buying the company.
+        "disclosure",
+        _rule(r"mini-?tender"),
+    ),
+    (
         "takeover",
         _rule(
             r"to be (?:acquired|bought|taken private|sold)\b",
@@ -191,7 +216,7 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"unsolicited",
             r"hostile bid",
             r"strategic (?:alternatives|review)",
-            r"explor\w+ (?:a |potential )?sale",
+            _EXPLORES_SALE,
             r"sale of the company",
             r"merger agreement",
             r"agrees? to merge",
@@ -214,6 +239,8 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"working with\b.*\bon\b.*\b(?:ipo|offering|listing)\b",
             r"(?:participat\w+ in|pledges?|commits?|(?:expresses?|indicates?) interest in|pitch(?:es|ing)?)\b.*"
             r"\b(?:ipo|offering|funding round|financing)\b",
+            r"(?:acts?|acting|serves?|serving|engaged|appointed|mandated) as (?:\S+ ){0,3}?"
+            r"(?:(?:co-)?manager|bookrunner|underwriter|arranger|agent|advis[eo]r|dealer)\b",
         ),
     ),
     (
@@ -221,6 +248,9 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
         _rule(
             r"(?:public|secondary|registered direct|follow-on|notes?|debt|equity|bond|stock|share|unit) offering",
             r"offering of\b",
+            r"securities purchase agreement",
+            r"(?:underwritten|securities|registered) (?:\S+ ){0,2}?offering\b",
+            r"(?:million|billion) (?:\S+ ){0,2}?offering\b",
             # A company prices a product too ("Prices Its New Headset at $3,499"), so the
             # thing priced has to be named as a security.
             r"prices? (?:upsized )?offering",
@@ -270,7 +300,7 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
             r"defaults? on (?:\S+ ){0,4}?(?:debt|loans?|bonds?|notes|payments?|obligations?|credit|agreement|lease|mortgage)\b",
             r"defaulted\b",
             r"in default\b",
-            r"(?:debt|loan|bond|credit|payment|covenant|mortgage) defaults?\b",
+            r"(?:debt|loan|bond|credit|payment|covenant|mortgage) defaults?\b(?! swaps?\b)",
             r"(?:event|notice) of default\b",
             r"deficiency (?:notice|letter)",
             r"material weakness",
@@ -480,14 +510,17 @@ HEADLINE_RULES: list[tuple[str, re.Pattern[str]]] = [
 
 # 8-K item codes, most telling first: the first item in this table that a filing
 # carries decides its type. Item 9.01 (exhibits) is paperwork and is left out.
+# Distress and a change of control come ahead of results. A company often files a
+# delisting notice or a restatement together with its results, and typed as results
+# the filing would lose its chip. Results still come ahead of everything routine.
 FILING_ITEMS: dict[str, tuple[str, str]] = {
-    "2.02": ("earnings", "Results of operations"),
     "1.03": ("distress", "Bankruptcy or receivership"),
     "4.02": ("distress", "Earlier financial statements can no longer be relied on"),
     "3.01": ("distress", "Delisting notice, or a listing rule not met"),
     "2.04": ("distress", "An event that speeds up a debt coming due"),
     "4.01": ("distress", "Change of auditor"),
     "5.01": ("takeover", "Change in control of the company"),
+    "2.02": ("earnings", "Results of operations"),
     "1.05": ("incident", "Material cybersecurity incident"),
     "2.01": ("acquisition", "Completed acquisition or sale of assets"),
     "2.05": ("restructuring", "Costs of an exit or disposal"),
@@ -515,7 +548,15 @@ _PAYING = r"to buy|buys|to purchase|purchase of|deal for"
 # How a headline goes on once it has named the company being bought: it ends, or it
 # turns to the price and the terms. Anything else after the name is something of the
 # company's, not the company ("Nvidia servers", "Pfizer brands", "Insmed's lung unit").
-_THEN = r"(?=\s*$|\s*[,.;:!?()]|\s+[-–—]|\s+(?:for|in|at|to|by|from|as|after|amid|with|and|following|valued|worth)\b)"
+# A full stop counts only when no letter follows it: "Acquires SHOP.COM Domain Name" is a domain.
+# And a list of names before the thing bought is not a list of companies bought: "Acquires
+# Apple, Microsoft and NVIDIA Shares", "Bid for Nvidia and AMD Chips".
+_LISTED = r"shares|stock|stakes?|holdings|positions?|bonds|notes|chips|servers|systems|jets|aircraft|assets|brands|units"
+_NOT_A_LIST = rf"(?!(?:\s*,\s*\S+){{0,4}}?,?\s+and\s+\S+(?:\s+\S+)?\s+(?:{_LISTED})\b)"
+_THEN = (
+    _NOT_A_LIST + r"(?=\s*$|\s*[,;:!?()]|\s*\.(?!\w)|\s+[-–—]"
+    r"|\s+(?:for|in|at|to|by|from|as|after|amid|with|and|following|valued|worth)\b)"
+)
 _PRICED = r"(?=\s+(?:for|in|at)\s+(?:\S+\s+){0,3}?(?:[$€£]\d|\d[\d.,]*\s+(?:million|billion|trillion)|deal\b))"
 # A legal ending a headline may leave on the name. "Company" is not one: "target company" is anybody.
 _ENDING = r"(?:,?\s+(?:inc|incorporated|corp|corporation|co|ltd|limited|plc|llc|holdings|group)\b\.?)?"
@@ -530,29 +571,42 @@ _LEGAL_ENDING = re.compile(r"[\s,]+(?:inc|corp|corporation|co|company|ltd|limite
 MAX_NAME_WORDS = 5
 
 
-def aliases(symbol: str, name: str | None = None) -> tuple[str, ...]:
-    """What a headline may call a company: its ticker, and its name without the legal ending.
+def _fold(text: str) -> str:
+    """`text` with its accents taken off, so "Solésence" in a headline meets SOLESENCE in the SEC's list."""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
+
+
+def aliases(symbol: str, name: str | None = None, also: Iterable[str] = ()) -> tuple[str, ...]:
+    """What a headline may call a company: its ticker, its name without the legal ending, and any other names given.
 
     An entry in capitals is a ticker and has to match exactly, so COST is not
-    "cost". A one- or two-letter ticker is left out. The name is in lower case
+    "cost". A one- or two-letter ticker is left out. A name is in lower case
     and matches in any case. How much of it a headline has to give is settled
     where it is matched (`_spelled`).
+
+    `also` are names the company goes by that its registered name does not
+    give: a name it had before ("La Rosa Holdings" for Stratum Holdings, from
+    the SEC), or a brand ("Nubank" for Nu Holdings, from data/aliases.txt).
     """
     out = [symbol.upper()] if len(symbol) >= 3 and symbol.isalpha() else []
-    words = re.findall(r"[a-z0-9][a-z0-9'&-]*", _LEGAL_ENDING.sub("", (name or "").split("/")[0].strip()).lower())
-    if words[:1] == ["the"]:
-        words = words[1:]
-    if words:
-        out.append(" ".join(words[:MAX_NAME_WORDS]))
+    for given in (name or "", *also):
+        plain = _LEGAL_ENDING.sub("", given.split("/")[0].strip())
+        words = re.findall(r"[a-z0-9][a-z0-9'&-]*", _fold(plain).lower())
+        if words[:1] == ["the"]:
+            words = words[1:]
+        if words and " ".join(words[:MAX_NAME_WORDS]) not in out:
+            out.append(" ".join(words[:MAX_NAME_WORDS]))
     return tuple(out)
 
 
 def _needed(words: list[str]) -> int | None:
     """How many words of a company's name a headline has to give. None if no part of it is safe to go by."""
     need = 2 if words[0] in _COMMON else 1
-    while need <= len(words) and words[need - 1] in _JOINING:
+    # Never stop on a joining word, nor on fewer than three letters in all: "GE" is not
+    # enough for GE Vernova, and "W W" is not enough for W.W. Grainger.
+    while need <= len(words) and (words[need - 1] in _JOINING or sum(map(len, words[:need])) < 3):
         need += 1
-    return None if need > len(words) or len(" ".join(words[:need])) < 3 else need
+    return None if need > len(words) else need
 
 
 def _spelled(name: str) -> str | None:
@@ -568,7 +622,7 @@ def _spelled(name: str) -> str | None:
     need = _needed(words)
     if need is None:
         return None
-    gap = r"(?:\s+&)?\s+"  # "Procter & Gamble" is on file as two words
+    gap = r"(?:[\s.]*&)?[\s.]+"  # "Procter & Gamble" is on file as two words, "W.W. Grainger" as three
     rest = ""
     for word in reversed(words[need:]):
         rest = rf"(?:{gap}{re.escape(word)}{rest})?"
@@ -595,13 +649,30 @@ def _bought(names: tuple[str, ...]) -> re.Pattern[str] | None:
 # Words in a company's name that name nobody by themselves ("Palantir Technologies",
 # "Costco Wholesale"), so a headline that has only that word does not name the company.
 _PLAIN_WORDS = frozenset(
-    "airlines america brands capital communications company corporation devices electric electronics enterprises "
-    "express financial foods global group health healthcare holdings industries instruments international labs lines "
-    "materials medical micro motor motors networks partners pharmaceuticals platforms resources sciences services "
-    "software solutions stores systems technologies technology therapeutics wholesale".split()
+    "aerospace airlines airways america automotive bancorp biosciences biotech brands capital communications company "
+    "connectivity corporation devices electric electronics enterprises entertainment exploration express financial foods "
+    "global group health healthcare holdings industries instruments interactive international laboratories labs lines "
+    "logistics materials medical micro minerals mining motor motors networks partners petroleum pharma pharmaceuticals "
+    "platforms power properties realty resources restaurants sciences semiconductor semiconductors services software "
+    "solutions steel stores systems technologies technology therapeutics trust wholesale wireless worldwide".split()
 )
 # After the name these make someone else the subject: "Apple Supplier Foxconn Cuts Outlook".
 _OF_ANOTHER = r"supplier|rival|competitor|partner|backer|investor|customer|peer|spin-?off"
+
+
+def _stem(word: str) -> str:
+    """A pattern for a word built on `word`: the whole of it with more letters after, or its first four letters or more.
+
+    So "SpaceX" is found for "space" and "Citi" for "citigroup". "Costain" is
+    neither for "costco", and "Pharos" is neither for "pharming": both are
+    other companies with a ticker like this one's.
+    """
+    if len(word) < 6:
+        return re.escape(word) + r"\w*"
+    rest = r"\w*"
+    for letter in reversed(word[4:]):
+        rest = f"(?:{re.escape(letter)}{rest})?"
+    return re.escape(word[:4]) + rest
 
 
 @lru_cache(maxsize=512)
@@ -614,9 +685,12 @@ def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | 
 
     Both are looser than the spelling a takeover needs (`_spelled`). They take
     the name with its dots and spaces moved ("J.P. Morgan" and "JPMorganChase"
-    for "jpmorgan chase") and a later word of the name alone ("Lilly",
-    "Chase"), unless that word is a plain one. Looser is the safe side here:
-    a headline wrongly taken to name the company is typed as it always was.
+    for "jpmorgan chase"), a later word of the name alone ("Lilly", "Chase")
+    unless that word is a plain one, and a word built on the first word
+    ("SpaceX", "Citi"). Looser is the safe side here: a headline wrongly taken
+    to name the company is typed as it always was. A headline wrongly taken
+    not to name it is set aside, which for a company the feed calls by a brand
+    was most of its news.
     """
     ways = []
     for name in names:
@@ -624,18 +698,27 @@ def _named(names: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]] | 
         need = None if name.isupper() else _needed(words)
         if need is None:
             continue
-        gap = r"[\s&.,]*"
+        gap = r"[\s&.,']*"  # the apostrophe for "O'Reilly", on file as "O REILLY"
         loosely = [r"[.\s]*".join(map(re.escape, word)) if len(word) >= 6 else re.escape(word) for word in words]
         rest = ""
         for word in reversed(loosely[need:]):
             rest = rf"(?:{gap}{word}{rest})?"
         ways.append(gap.join(loosely[:need]) + rest)
-        ways += [re.escape(w) for w in words[need:] if len(w) >= 5 and w not in _COMMON and w not in _PLAIN_WORDS]
+        if need == 1 and len(words[0]) >= 4:
+            ways.append(_stem(words[0]))
+        telling = lambda w, least: len(w) >= least and w not in _COMMON and w not in _PLAIN_WORDS and w not in _JOINING  # noqa: E731
+        # A later word of the name alone ("Lilly"), and a needed word after the first when it
+        # could hardly be anyone else ("Bradesco" for Bank Bradesco, "Grainger" for W.W. Grainger).
+        ways += [re.escape(w) for w in words[need:] if telling(w, 5)]
+        ways += [re.escape(w) for w in words[1:need] if telling(w, 6)]
     if not ways:
         return None
     tickers = [re.escape(n) for n in names if n.isupper()]
     who = "|".join([f"(?i:{way})" for way in ways] + tickers)
-    opens = re.compile(rf"(?:(?i:the)\s+)?(?:{who})(?![A-Za-z0-9-])(?!\s+(?i:{_OF_ANOTHER})\b)")
+    # Not the company's own news when someone else follows the name: "Apple Supplier Foxconn",
+    # "Apple's Top Supplier Foxconn".
+    another = rf"(?!\s+(?i:{_OF_ANOTHER})\b)(?!'s\s+(?:\S+\s+){{0,2}}?(?i:{_OF_ANOTHER})\b)"
+    opens = re.compile(rf"(?:(?i:the)\s+)?(?:{who})(?![A-Za-z0-9-]){another}")
     anywhere = re.compile(rf"(?<![A-Za-z0-9])(?:{who})(?![A-Za-z0-9])")
     return opens, anywhere
 
@@ -648,7 +731,7 @@ _RECEIVING = re.compile(
     r"|reject\w+ (?:(?!approv)\S+ ){0,6}?(?:offer|bid|proposal|approach)\b"
     r"|(?:offer|bid|proposal|approach|interest) from\b"
     r"|go(?:es|ing)? private|to go private|take[- ]private|buyout by\b"
-    r"|strategic (?:alternatives|review)|explor\w+ (?:a |potential )?sale|sale of the company"
+    r"|strategic (?:alternatives|review)|" + _EXPLORES_SALE + r"|sale of the company"
     r"|to (?:merge|combine) with|merger (?:agreement|with)\b|agrees? to merge)",
     re.IGNORECASE,
 )
@@ -660,6 +743,11 @@ _WRITES = re.compile(
     _UNIT + r"\s+(?:maintains?|reiterates?|reaffirms?|raises?|lowers?|cuts?|adjusts?|initiates?|resumes?|starts?"
     r"|upgrades?|downgrades?|updates?|assigns?|sets?|boosts?|trims?|keeps?)\b",
     re.IGNORECASE,
+)
+# After the company's own name these make it the buyer: "Disney to Acquire Assets from
+# Character.ai Following Bankruptcy Filing" is not Disney in distress.
+_ACQUIRING = re.compile(
+    _UNIT + r"\s+(?:to acquire|acquires?|acquiring|to buy|buys|to purchase|purchases?|bids? for|to bid)\b", re.IGNORECASE
 )
 # A holding in a company. When the company that opens the headline holds it in someone
 # else, the trade is in that other company's shares.
@@ -694,6 +782,7 @@ def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> 
 
     Where one of the last two does not hold, the rest of the table decides.
     """
+    text, summary = _fold(text), _fold(summary)
     bought = _bought(names)
     if bought is not None and bought.search(text):
         return "takeover"
@@ -719,6 +808,8 @@ def headline_type(text: str, names: tuple[str, ...] = (), summary: str = "") -> 
                 continue
             if kind == "analyst" and lead and _WRITES.match(text, lead.end()):
                 return ELSEWHERE
+            if kind == "distress" and lead and _ACQUIRING.match(text, lead.end()):
+                continue
         return kind
     return "other"
 
@@ -850,6 +941,28 @@ def coverage(items: Iterable[NewsItem], today: date) -> str:
     return "heavy" if own >= HEAVY_HEADLINES else "light"
 
 
+def unpoolable(items: Iterable[NewsItem], bars: list[Bar], earnings_days: set[date]) -> str | None:
+    """Why a stock adds nothing to a pool, or None if it may be added.
+
+    A scan and `Scanner.widen_pool` both ask here, so a stock is treated alike
+    whichever way it arrives:
+
+    - With no headlines there is nothing to say how much the feed covers it. A
+      second share class has filings and no headlines, and would be pooled
+      with the smallest companies.
+    - With too little price history there is no usual day to measure against.
+    - With no report days in that history, a move that belongs to a report
+      could not be told from an event's.
+    """
+    if not any(i.kind == "headline" for i in items):
+        return "no headlines"
+    if len(bars) < BASELINE_SESSIONS:
+        return "too little price history"
+    if not earnings_days:
+        return "no report days"
+    return None
+
+
 def tally(items: list[NewsItem], bars: list[Bar], earnings_days: set[date]) -> dict[str, list[int]]:
     """What one stock adds to a pool, by event type: `TALLY` counts for each type it has events of.
 
@@ -938,6 +1051,7 @@ class NewsContext(NamedTuple):
     elsewhere: list[NewsItem]  # recent items that are another company's news
     coverage: str  # "light" or "heavy": which stocks it is pooled with
     tally: dict[str, list[int]]  # what it adds to that pool, by type
+    unnamed: tuple[int, int]  # headlines on record that name the company nowhere, and headlines on record
 
 
 def context(
@@ -979,4 +1093,20 @@ def context(
         elsewhere=elsewhere,
         coverage=coverage(classified, today),
         tally=tally(classified, bars, earnings_days),
+        unnamed=_unnamed(items, names),
     )
+
+
+def _unnamed(items: Iterable[NewsItem], names: tuple[str, ...]) -> tuple[int, int]:
+    """How many of a stock's headlines name the company nowhere, headline or summary, out of how many.
+
+    A large share means one of two things, and no rule can say which: the feed
+    is tagging another company's news with this ticker (Reckitt, RKT in London,
+    under Rocket Companies), or the company goes by a name that is not on file
+    (Nubank for Nu Holdings). The scan says so when it is most of them.
+    """
+    known = _named(names)
+    heads = [i for i in items if i.kind == "headline" and i.summary]
+    if known is None:
+        return 0, len(heads)
+    return sum(1 for i in heads if not known[1].search(_fold(i.title)) and not known[1].search(_fold(i.summary))), len(heads)

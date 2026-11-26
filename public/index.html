@@ -444,16 +444,17 @@ function pooledBlock(ctx) {
   const rows = Object.values(ctx.pooled_studies || {});
   if (!rows.length) return [];
   const share = (part, whole) => (whole ? pct(part / whole, 0) : "–");
+  const stocks = (count) => count + (count === 1 ? " stock" : " stocks");
   const big = "Over " + rules.big_move + "× usual";
   return [
     el("p", { class: "sub" }, "The same types across the " + rows[0].group_stocks + " " + rules.groups[rows[0].group]
-      + " stocks on record. A day counts as big when it moved more than " + rules.big_move
+      + (rows[0].group_stocks === 1 ? " stock" : " stocks") + " on record. A day counts as big when it moved more than " + rules.big_move
       + " times that stock's own usual day, and the last column is how often any day did."),
     el("table", { class: "history pool" },
       el("thead", {}, el("tr", {}, el("th", {}, "Type"), el("th", {}, "Days"), el("th", {}, big), el("th", {}, "Up / down"), el("th", {}, "Any day"))),
       el("tbody", {}, rows.map((row) => row.events < rules.min_events
         ? el("tr", {}, el("td", {}, row.label), el("td", {}, String(row.events)), el("td", { class: "sub" }, "too few"), el("td", {}, ""), el("td", {}, ""))
-        : el("tr", {}, el("td", {}, row.label), el("td", {}, row.events + " in " + row.stocks + " stocks"),
+        : el("tr", {}, el("td", {}, row.label), el("td", {}, row.events + " in " + stocks(row.stocks)),
           el("td", {}, share(row.big, row.events)), el("td", {}, row.up + " / " + row.down), el("td", {}, share(row.big_sessions, row.sessions)))))),
     el("p", { class: "sub" }, "A stock is " + rules.groups.heavy + " when the feed carried " + rules.heavy_headlines + " or more headlines of its own in the last "
       + rules.coverage_days + " days, and " + rules.groups.light + " otherwise. The two are kept apart because they behave differently. "

@@ -99,7 +99,8 @@ def estimate_next(history: list[EarningsEvent], today: date) -> EarningsEvent | 
         # More than a full cycle with no report on record: the history is stale.
         return None
     timings = [e.timing for e in sorted(history, key=lambda e: e.day, reverse=True)[:4]]
-    timing = max(set(timings), key=timings.count)
+    # On a tie the newest report decides, every time: a set's order is not a rule.
+    timing = max(dict.fromkeys(timings), key=timings.count)
     return EarningsEvent(day=guess, timing=timing, confirmed=False, source="estimated from past reports")
 
 

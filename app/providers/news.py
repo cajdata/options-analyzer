@@ -61,11 +61,13 @@ class NewsService:
         headline_source: HeadlineSource | None = None,
         filing_source: FilingSource | None = None,
         names: Callable[[str], str | None] | None = None,
+        former_names: Callable[[str], list[str]] | None = None,
     ) -> None:
         self._cache = cache
         self._headline_source = headline_source
         self._filing_source = filing_source
         self._names = names  # looks up a company's name by ticker, where one is available
+        self._former_names = former_names  # and the names it had before
 
     def name(self, symbol: str) -> str | None:
         """The company's name, or None when there is nowhere to look it up or the lookup fails."""
@@ -75,6 +77,15 @@ class NewsService:
             return self._names(symbol)
         except _FAILURES:
             return None
+
+    def former_names(self, symbol: str) -> tuple[str, ...]:
+        """Names the company had before. Empty when there is nowhere to look, or the lookup fails."""
+        if self._former_names is None:
+            return ()
+        try:
+            return tuple(self._former_names(symbol))
+        except _FAILURES:
+            return ()
 
     @property
     def sources(self) -> list[str]:

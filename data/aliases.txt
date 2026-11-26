@@ -1,0 +1,18 @@
+# Other names a company goes by in headlines, when its registered name does not give them.
+#
+# The news feed tags a stock with any headline that mentions it, and the app sets a
+# headline aside as another company's news when it never names the company. That is
+# right for a look-alike ticker (Reckitt, RKT in London, under Rocket Companies) and
+# wrong for a company the press calls by a brand. No rule can tell the two apart, so a
+# brand has to be listed here.
+#
+# The app already works out the usual cases without help: a later word of the name
+# ("Lilly", "Disney"), the name with its dots and spaces moved ("J.P. Morgan"), a word
+# built on the first word ("SpaceX", "Citi"), and names the company had before, which
+# the SEC supplies. A scan says when most of a stock's headlines never name it.
+#
+# One company to a line: SYMBOL: name, name. '#' starts a comment.
+C: Citibank
+NU: Nubank
+GOOGL: Google
+META: Facebook, Instagram, WhatsApp

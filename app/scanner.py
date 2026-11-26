@@ -14,7 +14,7 @@ from app.analysis import contracts as metrics
 from app.analysis import earnings as earnings_math
 from app.analysis import events, exits, risk, scoring
 from app.cache import DiskCache, MemoryCache, NullCache
-from app.config import ConfigError, Settings
+from app.config import ConfigError, Settings, tidy
 from app.models import Bar, ContractAnalysis, EarningsEvent, ScanResult, StockQuote, TermPoint, UnderlyingContext
 from app.providers import MarketData
 from app.providers.earnings import AlphaVantageEarnings, EarningsService, EdgarEarnings
@@ -27,6 +27,10 @@ ET = ZoneInfo("America/New_York")
 HISTORY_DAYS = 1200  # a little over three years: twelve earnings reports
 WIDEN_SCREEN = 50  # how many of the day's most active stocks and movers a wider pool takes in
 WIDEN_BARS = 25  # stocks whose price history is asked for at once when widening the pool
+# When more than this share of a stock's headlines never name it, the scan says so: either the
+# feed is tagging another company's news with the ticker, or the company goes by another name.
+UNNAMED_SHARE = 0.5
+UNNAMED_LEAST = 10  # headlines on record before that is said
 MAX_REPORTS = 12
 MIN_PRICE = 5.0  # discovery skips stocks below this
 # Rule of thumb for discovery under a budget: a one-month at-the-money option costs
@@ -118,6 +122,7 @@ class Scanner:
         self.earnings = earnings
         self.news = news  # None leaves the news section out of every scan
         self.pool = pool  # None leaves pooled studies out of the news section
+        self._also = settings.aliases()  # brands and other names the registered name does not give
         self.settings = settings
         self.universe = universe or []  # symbols a discovery scan always considers
         self._today = today
@@ -135,8 +140,7 @@ class Scanner:
     def _scan(self, req: ScanRequest) -> ScanResult:
         # Tidy the symbols here so every way in (command line, API) is treated alike.
         # Share classes are written both ways (BRK-B, BRK.B); the data provider wants the dot.
-        tidy = (s.strip().upper().replace("-", ".") for s in req.symbols)
-        req = replace(req, symbols=list(dict.fromkeys(s for s in tidy if s)))
+        req = replace(req, symbols=tidy(req.symbols))
         today = self._today or datetime.now(ET).date()
         warnings: list[str] = []
         self.market.notes.clear()
@@ -263,13 +267,17 @@ class Scanner:
             ctx = underlyings[symbol]
             try:
                 items, ctx.news_note, failed = self.news.items(symbol, today)
-                names = events.aliases(symbol, self.news.name(symbol))
-                found = events.context(items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, names)
+                found = events.context(items, bars.get(symbol, []), earnings_days.get(symbol, set()), today, self._called(symbol))
                 ctx.news, ctx.recent_events, ctx.event_studies, ctx.news_elsewhere = found[:4]
                 ctx.coverage = found.coverage
-                # Without report days a move that belongs to a report would be counted as an
-                # event's, so such a stock adds nothing to the pool.
-                if earnings_days.get(symbol):
+                missing, of = found.unnamed
+                if of >= UNNAMED_LEAST and missing > of * UNNAMED_SHARE:
+                    said = f"{missing} of the {of} headlines the feed tags with {symbol} never name {self.news.name(symbol) or 'the company'}, and are set aside."
+                    said += " If it goes by another name, add that to data/aliases.txt."
+                    ctx.news_note = " ".join(n for n in (ctx.news_note, said) if n)
+                # A lookup that failed has left part of the news out. A tally built from the rest
+                # would take the place of a full one, and could move the stock to the other group.
+                if not failed and events.unpoolable(items, bars.get(symbol, []), earnings_days.get(symbol, set())) is None:
                     tallies[symbol] = found.tally
             except Exception as err:  # news is an extra: it must not sink the scan
                 ctx.news_note, failed = f"News lookup failed: {type(err).__name__}.", True
@@ -283,6 +291,11 @@ class Scanner:
             return []
         # One note for all of them. A failure is usually the same one for every stock.
         return [f"News could not be loaded for {_names(failed)}. {underlyings[failed[0]].news_note}"]
+
+    def _called(self, symbol: str) -> tuple[str, ...]:
+        """Everything a headline may call the company: its ticker, its name, names it had before, and listed aliases."""
+        also = (*self.news.former_names(symbol), *self._also.get(symbol, ()))
+        return events.aliases(symbol, self.news.name(symbol), also)
 
     def _pool_studies(self, shown: list[UnderlyingContext], tallies: dict[str, dict[str, list[int]]]) -> None:
         """Add what this scan's stocks bring to the pool, then give each its pooled studies.
@@ -309,8 +322,8 @@ class Scanner:
         With no `symbols`, these are the universe and the day's most active stocks and
         movers. For each one its news is read (and kept, as for a scan), its report days
         are taken from what is on file or from the first earnings source, and its price
-        history is fetched. A stock with no news of its own, no report days or too
-        little price history is passed over.
+        history is fetched. A stock is passed over when a news lookup failed or when
+        `events.unpoolable` gives a reason, the same test a scan applies.
 
         Returns how many stocks were asked for, how many were added to each group, and
         why the rest were not.
@@ -319,36 +332,44 @@ class Scanner:
             raise ConfigError("Pooling needs a news source. None is configured.")
         with self._lock:
             today = self._today or datetime.now(ET).date()
-            if symbols:
-                tidy = (s.strip().upper().replace("-", ".") for s in symbols)
-                wanted = list(dict.fromkeys(s for s in tidy if s))
-            else:
-                wanted = list(self.universe)
+            wanted = list(symbols or self.universe)
+            if not symbols:
                 for fetch in (self.market.most_actives, self.market.movers):
                     try:
                         wanted += fetch(WIDEN_SCREEN)
                     except Exception:  # screeners are optional extras
                         continue
-                wanted = list(dict.fromkeys(wanted))
+            wanted = tidy(wanted)
 
             added = {group: 0 for group in events.GROUPS}
             passed_over: dict[str, int] = {}
+
+            def skip(why: str) -> None:
+                passed_over[why] = passed_over.get(why, 0) + 1
+
             ready: dict[str, tuple[list, list[EarningsEvent], tuple[str, ...]]] = {}
             for n, symbol in enumerate(wanted, 1):
                 if progress:
                     progress(n, len(wanted), symbol)
                 try:
-                    items, _, _ = self.news.items(symbol, today)
+                    items, _, failed = self.news.items(symbol, today)
                 except Exception:
-                    items = []
+                    items, failed = [], True
+                if failed:
+                    # Part of its news is missing, so whatever is already on record for it stays.
+                    skip("a news lookup that failed")
+                    continue
                 if not any(i.kind == "headline" for i in items):
-                    passed_over["no headlines"] = passed_over.get("no headlines", 0) + 1
+                    skip("no headlines")  # said here, before a request for report days is spent on it
                     continue
-                reports = self.earnings.reports(symbol)
+                try:
+                    reports = self.earnings.reports(symbol)
+                except Exception:
+                    reports = []
                 if not reports:
-                    passed_over["no report days"] = passed_over.get("no report days", 0) + 1
+                    skip("no report days")
                     continue
-                ready[symbol] = (items, reports, events.aliases(symbol, self.news.name(symbol)))
+                ready[symbol] = (items, reports, self._called(symbol))
 
             batch = list(ready)
             for i in range(0, len(batch), WIDEN_BARS):
@@ -360,10 +381,12 @@ class Scanner:
                 for symbol in group_of:
                     items, reports, names = ready[symbol]
                     history = bars.get(symbol) or []
-                    if len(history) < events.BASELINE_SESSIONS:
-                        passed_over["too little price history"] = passed_over.get("too little price history", 0) + 1
+                    report_days = earnings_math.reaction_days(reports, history)
+                    why = events.unpoolable(items, history, report_days)
+                    if why:
+                        skip(why)
                         continue
-                    found = events.context(items, history, earnings_math.reaction_days(reports, history), today, names)
+                    found = events.context(items, history, report_days, today, names)
                     self.pool.add(symbol, found.coverage, found.tally)
                     added[found.coverage] += 1
             self.market.notes.clear()  # nobody is shown a scan here, so its notes have no reader
@@ -611,5 +634,11 @@ def build_scanner(settings: Settings, demo: bool = False) -> Scanner:
     earnings = EarningsService(cache, history_sources=history_sources, calendar_source=calendar_source)
     # Headlines come with the Alpaca keys. Filings, and the company names that tell a
     # buyer from the company being bought, need the same SEC contact line as earnings history.
-    news = NewsService(cache, headline_source=market, filing_source=edgar, names=edgar.company_name if edgar else None)
+    news = NewsService(
+        cache,
+        headline_source=market,
+        filing_source=edgar,
+        names=edgar.company_name if edgar else None,
+        former_names=edgar.former_names if edgar else None,
+    )
     return Scanner(market, earnings, settings, universe=settings.universe(), news=news, pool=EventPool(cache))
