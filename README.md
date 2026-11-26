@@ -247,6 +247,9 @@ sends it, and it sends that one order once.
   paper account holds 100 shares for each contract. The app does not buy shares, so
   without them the order is turned down and the app says why. A put sold to open needs
   the cash, which a new paper account has.
+- **One side of a contract at a time.** An account holds a contract bought or sold,
+  never both. While a paper trade on a contract has not ended, the app does not write
+  out an order to open the other side of it. Close that trade instead.
 
 **The Paper view**, and `python -m app paper`, show what the paper account holds,
 checked against the same exit rules as the positions page, with a way to close each
@@ -262,7 +265,9 @@ are never mixed: `data/positions.json` is not touched.
 - **The fills.** A trade is open at the account's average fill price, for as many
   contracts as filled.
 - **How it ended.** Closed by your order, with the exit rules that were reached when
-  you sent it. Or held to expiry, settled at what exercising it paid at that day's
+  you sent it. When the rules could not be read at that moment (no quote to set beside
+  the profit target, say), the journal says they are not on record. It never says that
+  none was reached. Or held to expiry, settled at what exercising it paid at that day's
   close. Or closed by an order placed at Alpaca itself, at that order's price.
 - **The result**, in dollars and as a share of the premium paid or collected.
 
@@ -293,6 +298,10 @@ in memory, so you can try the whole flow with no keys.
 - **Paper trading is one contract at a time.** No spreads, no shares, no market orders
   and no orders that last past the day. A trade opened at Alpaca's own site shows in
   the Paper view and has no journal entry.
+- **A very busy paper account is read in part.** The app reads up to 2,000 of the
+  account's orders, from the day your oldest open paper trade was ordered. With more
+  than that it says so, still finds the orders it sent itself, and leaves any trade
+  whose contracts have left the account as it is until the list can be read whole.
 
 - **Free Alpaca option quotes are "indicative"**: quotes are modified and trades are
   15 minutes delayed. Screen with them, then check the live quote at your broker.

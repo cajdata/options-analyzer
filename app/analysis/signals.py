@@ -27,6 +27,7 @@ with real money.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Iterable
 
 from app import journal
@@ -81,14 +82,17 @@ def snapshot(result: ScanResult, c: ContractAnalysis) -> dict:
 
 
 def _band(value, bands: tuple[float, float], text: Callable[[float], str]) -> str | None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    # A journal entry can be edited by hand, so a reading is whatever was typed. One that is not a number has
+    # no band: NaN compares false with everything, and fell into the lowest.
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
         return None
     high, low = bands
     return f"{text(high)} or more" if value >= high else f"{text(low)} to {text(high)}" if value >= low else f"under {text(low)}"
 
 
 def _rating(t: Trade) -> str | None:
-    return t.signals.get("rating") or "not rated"
+    rating = t.signals.get("rating")
+    return rating if isinstance(rating, str) and rating else "not rated"  # a list here would be a key no table can hold
 
 
 def _score(t: Trade) -> str | None:
@@ -123,7 +127,8 @@ LABELS = {ALL: "Every closed trade", **{name: label for name, (label, _) in GROU
 
 def counted(t: Trade) -> bool:
     """Whether a trade has a result and the scan's readings to set it beside."""
-    return t.state == "closed" and t.pnl is not None and t.pnl_pct is not None and t.signals.get("lens") in LENS
+    lens = t.signals.get("lens")
+    return t.state == "closed" and t.pnl is not None and t.pnl_pct is not None and isinstance(lens, str) and lens in LENS
 
 
 def _row(group: str, bucket: str, trades: list[Trade]) -> SignalRow:

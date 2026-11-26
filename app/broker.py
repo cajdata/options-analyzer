@@ -38,7 +38,7 @@ PAPER_URL = "https://paper-api.alpaca.markets"
 # Statuses after which an order does not change again. Anything else may still fill.
 DONE = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
 ORDER_PAGE = 500  # the most orders the list returns at once
-MAX_ORDER_PAGES = 4
+MAX_ORDER_PAGES = 4  # past this many, `orders` says its list is not whole
 _RETRIES = 2
 _ORDER_ID = re.compile(r"[0-9A-Za-z-]{6,64}")
 _INTENTS = {"buy_to_open": "open", "sell_to_open": "open", "buy_to_close": "close", "sell_to_close": "close"}
@@ -64,12 +64,16 @@ class Broker(Protocol):
         """The option positions the account holds."""
         ...
 
-    def orders(self, since: datetime) -> list[Order]:
-        """Every option order sent since then, whatever became of it, oldest first."""
+    def orders(self, since: datetime) -> tuple[list[Order], bool]:
+        """Every option order sent since then, whatever became of it, and whether that is all of them.
+
+        False when the account has more than can be read at once. What is missing is then the newest, less
+        the orders still working, which are asked for on their own.
+        """
         ...
 
     def order(self, client_id: str) -> Order | None:
-        """The order this app gave that id. None when the account has no such order."""
+        """The order this app gave that id. None only when the account says it has no such order."""
         ...
 
     def submit(self, symbol: str, side: str, intent: str, quantity: int, limit: float, client_id: str) -> Order:
@@ -214,9 +218,17 @@ class AlpacaPaper:
             held.append(PaperHolding(str(row["symbol"]), side, abs(int(quantity)), price))
         return held
 
-    def orders(self, since: datetime) -> list[Order]:
+    def orders(self, since: datetime) -> tuple[list[Order], bool]:
         found: dict[str, Order] = {}
-        after = since
+
+        def keep(rows: Any) -> list:
+            rows = rows if isinstance(rows, list) else []
+            for row in rows:
+                if order := _order(row):
+                    found[order.id] = order
+            return rows
+
+        after, whole = since, False
         for _ in range(MAX_ORDER_PAGES):
             params = {
                 "status": "all",
@@ -224,20 +236,30 @@ class AlpacaPaper:
                 "direction": "asc",
                 "after": after.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
-            rows = self._read("/v2/orders", params)
-            rows = rows if isinstance(rows, list) else []
-            times = [when for row in rows if isinstance(row, dict) and (when := _when(row, "submitted_at"))]
-            for row in rows:
-                if order := _order(row):
-                    found[order.id] = order
-            if len(rows) < ORDER_PAGE or not times or max(times) <= after:
+            rows = keep(self._read("/v2/orders", params))
+            if len(rows) < ORDER_PAGE:
+                whole = True
                 break
+            # The list holds every order on the account, stocks too, and the next page starts after the newest one here.
+            times = [when for row in rows if isinstance(row, dict) and (when := _when(row, "submitted_at") or _when(row, "created_at"))]
+            if not times or max(times) <= after:
+                break  # a full page with no later time to go on from: there is more, and no way to ask for it
             after = max(times)
-        return list(found.values())
+        if not whole:
+            # Read oldest first, so what was not reached is the newest. The orders still working are among
+            # those, and they are the ones a person may want to cancel: they are asked for on their own.
+            keep(self._read("/v2/orders", {"status": "open", "limit": ORDER_PAGE}))
+        return list(found.values()), whole
 
     def order(self, client_id: str) -> Order | None:
         row = self._read("/v2/orders:by_client_order_id", {"client_order_id": client_id}, missing=None)
-        return _order(row) if row else None
+        if row is None:
+            return None  # a 404: the account has no order by that name
+        order = _order(row)
+        if order is None:
+            # The account does have it. Read as "no such order", it would be taken to have never arrived.
+            raise BrokerError("Alpaca's paper account answered for that order, but its answer does not read as one.")
+        return order
 
     # -- Changing -----------------------------------------------------------
 
@@ -277,7 +299,7 @@ class AlpacaPaper:
 
     def cancel(self, order_id: str) -> None:
         if not _ORDER_ID.fullmatch(order_id):
-            raise BrokerError("That is not an order's id.", refused=True)
+            raise BrokerError("That is not an order's id.", status=422, refused=True)
         try:
             response = self._client.delete(f"{PAPER_URL}/v2/orders/{order_id}", headers=self._headers)
         except httpx.TransportError as err:
@@ -330,8 +352,8 @@ class DemoBroker:
     def positions(self) -> list[PaperHolding]:
         return [PaperHolding(symbol, side, count, round(price, 4)) for (symbol, side), (count, price) in self._held.items()]
 
-    def orders(self, since: datetime) -> list[Order]:
-        return [o for o in self._orders.values() if o.submitted and o.submitted >= since]
+    def orders(self, since: datetime) -> tuple[list[Order], bool]:
+        return [o for o in self._orders.values() if o.submitted and o.submitted >= since], True
 
     def order(self, client_id: str) -> Order | None:
         return next((o for o in self._orders.values() if o.client_id == client_id), None)

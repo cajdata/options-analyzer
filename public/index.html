@@ -35,6 +35,7 @@
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); padding-bottom: 8px; }
   .check input { width: auto; margin: 0; }
   .hint { max-width: 1440px; margin: 8px auto 0; padding: 0 16px; color: var(--muted); font-size: 13px; }
+  .hint:empty { display: none; }
   #symbols { width: 260px; }
   #p_underlying { width: 96px; }
   nav { display: flex; gap: 4px; }
@@ -183,6 +184,7 @@
   <span id="paper-busy" class="sub" role="status"></span>
 </div>
 <p class="hint" id="paper-about" data-view="paper" hidden></p>
+<p class="hint" id="paper-said" role="status" data-view="paper" hidden></p>
 
 <div class="notice" id="notice"></div>
 
@@ -302,7 +304,9 @@ async function api(path, body, method) {
     const detail = typeof data.detail === "string" ? data.detail
       : Array.isArray(data.detail) ? data.detail.map((d) => (d.loc ? d.loc[d.loc.length - 1] + ": " : "") + d.msg).join("; ")
       : JSON.stringify(data.detail || data);
-    throw new Error(detail || ("Request failed: " + response.status));
+    const failure = new Error(detail || ("Request failed: " + response.status));
+    failure.status = response.status;  // a caller may need to tell "turned down" from "nobody can say what happened"
+    throw failure;
   }
   return data;
 }
@@ -710,7 +714,7 @@ const BOOKS = {
     heading: (n) => n + (n === 1 ? " position" : " positions") + " in the paper account",
     none: "The paper account holds no options. Open a contract in a scan and write an order out from there.",
     next: (holding) => closeBlock(holding),
-    last: (holding) => heldTrades(holding).map(shownThen),
+    last: (holding) => heldTrades(holding).map((trade, _, mine) => shownThen(trade, mine)),
   },
 };
 
@@ -867,11 +871,21 @@ function cents(v, up) {
   const scaled = Math.round(v * 1e8) / 1e6;
   return Math.max((up ? Math.ceil(scaled) : Math.floor(scaled)) / 100, 0.01).toFixed(2);
 }
-const stamp = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "–";
+// The day something happened to a paper trade, in New York, where the contract trades. In the browser's own
+// zone an expiry at the 4 p.m. close, or an order sent in the evening, could land on another day.
+const stamp = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "America/New_York" }) : "–";
+
+// What became of the last order sent from the paper view. It has a line of its own above the lists, because
+// reading the account afresh redraws everything under it, the place the order was sent from included.
+function say(text, failed) {
+  $("paper-said").textContent = text;
+  $("paper-said").classList.toggle("error", Boolean(failed));
+}
 
 // An order is written out first, which sends nothing. Only the Send button under the written-out order
-// sends it, and it sends that one order once: both buttons are off from the first click.
-function orderBox(fields, body, sent) {
+// sends it, and it sends that one order once: both buttons are off from the first click. `failed` is told
+// when sending did not go through, with the error, whose `status` says whether the order was turned down.
+function orderBox(fields, body, sent, failed) {
   const box = el("div", {});
   const note = el("p", { class: "sub error" });
   const write = el("button", { type: "button" }, "Write the order out…");
@@ -892,13 +906,18 @@ function orderBox(fields, body, sent) {
     const problem = el("p", { class: "error" });
     send.addEventListener("click", async () => {
       send.disabled = back.disabled = true;
+      // The rules are read before the order leaves, which can take a moment, and the order goes either way.
+      problem.className = "sub";
+      problem.textContent = "Sending…";
       try {
         sent(await api("/api/paper/orders", { ticket: ticket.id }), box);
       } catch (err) {
         // A written-out order is used once, so Send stays off. Going back writes a new one.
+        problem.className = "error";
         problem.textContent = err.message;
         back.disabled = false;
         back.textContent = "Back";
+        if (failed) failed(err);
       }
     });
     box.replaceChildren(el("p", { class: "caution" }, el("strong", {}, ticket.text)),
@@ -945,17 +964,27 @@ function paperBlock(idea) {
       paper = null;  // the paper view is read afresh the next time it opens
       box.replaceChildren(el("p", { class: "sub" }, sentText(trade, true)),
         el("p", {}, el("a", { href: "#paper", onclick: (e) => { e.preventDefault(); show("paper"); } }, "See the paper account")));
-    }));
+    },
+    // The journal has the entry before the order leaves, so a send that failed may have changed it too:
+    // an order whose answer was lost is in the journal as ordered. The paper view is read afresh either way.
+    () => { paper = null; }));
   return parts;
 }
 
+// Which trade a heading is about, said only when more than one is open on the contract.
+function whichTrade(trade, mine) {
+  if (mine.length < 2) return "";
+  return " · trade " + trade.id + (trade.entry_price === null ? ", ordered " + stamp(trade.ordered)
+    : ", opened " + stamp(trade.opened || trade.ordered) + " at " + exact(trade.entry_price));
+}
+
 // What the scan showed for a trade when its order was written, as the journal kept it.
-function shownThen(trade) {
+function shownThen(trade, mine) {
   const s = trade.signals || {};
   if (s.score === undefined || s.score === null) return [];
   const report = s.spans_earnings ? "open over a report" + (s.earnings_estimated ? " (estimated date)" : "")
     : s.earnings_unknown ? "report date unknown" : "clear of a report";
-  return [el("h3", {}, "What the scan showed when it was opened"),
+  return [el("h3", {}, "What the scan showed when it was opened" + whichTrade(trade, mine)),
     facts([
       ["Ranked", s.rank ? s.rank + " of " + s.of + ", to " + s.lens : "–"],
       ["Score", num(s.score, 1) + " of 100"],
@@ -983,11 +1012,14 @@ function closeBlock(holding) {
       el("p", { class: "sub" }, "This position was not opened from here, so the journal has no entry for it and it cannot be closed from here.")];
   }
   return mine.map((trade) => {
-    const parts = [el("h3", {}, "Close it")];
+    const parts = [el("h3", {}, "Close it" + whichTrade(trade, mine))];
     if (trade.state !== "open") {
       parts.push(el("p", { class: "sub" }, "The order that opened it is still working, so it cannot be closed yet."));
     } else if (trade.closing) {
       parts.push(el("p", { class: "sub" }, "A closing order at " + exact(trade.closing.limit) + " is working. It is in the list of orders, where it can be cancelled."));
+    } else if (holding.dte < 0) {
+      // The account still lists an expired contract until it has settled. No order can close it by then.
+      parts.push(el("p", { class: "sub" }, "This contract has expired, so no order can close it. Alpaca takes it off the account once it has settled, and the journal then records how it ended."));
     } else if (!paper.can_order) {
       parts.push(el("p", { class: "sub" }, status.paper.why || "No order can be sent."));
     } else {
@@ -996,8 +1028,13 @@ function closeBlock(holding) {
       const limit = el("input", { type: "number", min: "0.01", step: "0.01", value: holding.close_price === null ? "" : cents(holding.close_price, buying) });
       const fields = el("div", { class: "fields" }, el("label", { title: limitTitle(buying) }, "Limit per share ($)", limit),
         el("span", { class: "sub" }, (buying ? "buys back " : "sells ") + left + (left === 1 ? " contract" : " contracts")));
-      parts.push(orderBox(fields, () => ({ action: "close", trade: trade.id, limit: Number(limit.value) }),
-        (sent, box) => { box.replaceChildren(el("p", { class: "sub" }, sentText(sent, false))); loadPaper(); }));
+      parts.push(orderBox(fields,
+        () => { say(""); return { action: "close", trade: trade.id, limit: Number(limit.value) }; },
+        // What became of the order is said above the lists, since reading the account afresh redraws this pane.
+        (sent) => { say(sentText(sent, false)); loadPaper(); },
+        // An order the account turned down changed nothing, and the reason stays beside the order. Anything
+        // else may have: the order may have arrived, or the trade is not as this page last read it.
+        (err) => { if (err.status !== 422) { say("The closing order: " + err.message, true); loadPaper(); } }));
     }
     return parts;
   });
@@ -1149,6 +1186,7 @@ function show(name) {
   const hash = name === "scan" ? "" : "#" + name;
   if (location.hash !== hash) history.replaceState(null, "", location.pathname + hash);
   showNotices();
+  if (name !== "paper") say("");  // what became of the last order is news only while the view it was sent from stays open
   if (name === "positions" && !review) loadPositions();
   if (name === "paper" && !paper) loadPaper();
 }
@@ -1247,7 +1285,7 @@ $("p_refresh").addEventListener("click", loadPositions);
 $("tab-scan").addEventListener("click", () => show("scan"));
 $("tab-positions").addEventListener("click", () => show("positions"));
 $("tab-paper").addEventListener("click", () => show("paper"));
-$("paper-refresh").addEventListener("click", loadPaper);
+$("paper-refresh").addEventListener("click", () => { say(""); loadPaper(); });
 window.addEventListener("hashchange", () => show(fromHash()));
 
 (async function start() {

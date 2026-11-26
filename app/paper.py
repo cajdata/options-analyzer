@@ -60,6 +60,16 @@ LIVE_KEYS = (
     "ALPACA_PAPER is off, so these are the keys of a live account. Orders are sent to a paper account only, "
     "so none can be sent. The journal can still be read."
 )
+CUT_SHORT = (
+    "The paper account has more orders since the oldest trade still open than this app reads at once, so the list of "
+    "orders still working may be short, and contracts that have left the account are left as they are in the journal. "
+    "Orders sent from here are still found by name."
+)
+NO_PRICE = "The account says"  # how the remark on an order that filled with no price begins
+EXPIRED = (
+    "That contract has expired, so no order can close it. Alpaca takes it off the account once it has settled, "
+    "and the journal then records how it ended."
+)
 SHARES = 100
 
 
@@ -78,6 +88,11 @@ def name(t) -> str:
 
 def open_id(trade: Trade) -> str:
     return f"{PREFIX}-{trade.id}-o"
+
+
+def held_id(symbol: str, side: str) -> str:
+    """What a position the account holds goes by in a review. The side is part of it, so no two rows ever share one."""
+    return f"{symbol}:{side}"
 
 
 # -- Bringing the journal up to date with the account ---------------------------------------
@@ -107,24 +122,46 @@ def reconcile(
        as gone with no price on record.
 
     An order still working changes nothing, however much of it has filled. An
-    order that the account confirmed and that is missing from the list is
-    waited for, never written off. Only one whose answer was lost is asked
-    after by name (`lookup`), and only when the account says it never had it
-    is it taken to have never arrived.
+    order that is missing from the list is asked after by name (`lookup`).
+    Only one whose answer was lost, and that the account then says it never
+    had, is taken to have never arrived. One the account confirmed is waited
+    for whatever a later answer says, never written off. And an order that
+    ended with contracts filled and no price for them is waited for too:
+    nothing is made up for it.
+
+    The account's positions are read before its orders (`PaperDesk.review`),
+    so `held` can be older than `orders`. A trade this call has just found
+    open is therefore left out of the third pass: the position its fill made
+    may not have been there to read yet.
     """
     by_client = {o.client_id: o for o in orders if o.client_id}
     touched: dict[str, Trade] = {}
+    just_opened: set[str] = set()
 
     def find(client_id: str, confirmed: bool) -> tuple[Order | None, bool]:
         """The order, and whether the answer is certain."""
         if client_id in by_client:
             return by_client[client_id], True
-        if confirmed or lookup is None:
+        if lookup is None:
             return None, False
         try:
-            return lookup(client_id), True
+            order = lookup(client_id)
         except BrokerError:
             return None, False
+        # The account took this order once. If it now says it has none by that name, that is no answer to go by.
+        return order, order is not None or not confirmed
+
+    def waits(t: Trade, order: Order) -> None:
+        """An order that ended with contracts filled and no price on it. The trade stays as it is, and says why."""
+        said = f"{NO_PRICE} {order.filled} of this order's contracts filled and gives no price for them. It is asked again at the next refresh."
+        if t.note != said:
+            t.note = said
+            touched[t.id] = t
+
+    def priced(t: Trade) -> None:
+        """The price has come, so the remark that it was missing goes."""
+        if t.note and t.note.startswith(NO_PRICE):
+            t.note = None
 
     for t in trades:
         if t.state != "ordered":
@@ -140,11 +177,17 @@ def reconcile(
             touched[t.id] = t
         if order.working:
             continue
-        if order.filled > 0 and order.fill_price:
+        price = _fill(order)
+        if order.filled > 0 and price is None:
+            waits(t, order)
+            continue
+        priced(t)
+        if order.filled > 0:
             if order.filled < t.quantity:
                 t.note = f"{order.filled} of the {t.quantity} contracts ordered were filled."
-            t.state, t.quantity, t.entry_price = "open", order.filled, round(order.fill_price, 4)
+            t.state, t.quantity, t.entry_price = "open", order.filled, price
             t.opened = order.filled_at or order.submitted or now
+            just_opened.add(t.id)
         else:
             t.state, t.note = "unfilled", f"The order ended {order.status} with nothing filled."
         touched[t.id] = t
@@ -163,16 +206,33 @@ def reconcile(
             touched[t.id] = t
         if order.working:
             continue
-        if order.filled > 0 and order.fill_price:
+        price = _fill(order)
+        if order.filled > 0 and price is None:
+            waits(t, order)  # and the closing order stays on the trade, so nothing is concluded about its contracts
+            continue
+        priced(t)
+        if order.filled > 0:
             count = min(order.filled, t.remaining)
-            t.exits.append(Exit(count, round(order.fill_price, 4), order.filled_at or now, "order", t.closing.rules, order.id))
+            t.exits.append(Exit(count, price, _when(order, now), "order", t.closing.rules, order.id))
         t.closing = None
-        touched[journals.settle(t).id] = t
+        touched[t.id] = t
 
     if held is not None:
-        for t in _unheld(trades, orders, held, today, now, close_on):
+        for t in _unheld(trades, orders, held, today, now, close_on, just_opened):
             touched[t.id] = t
-    return list(touched.values())
+    # Where each one stands is worded again here, so a caller never reads the words of the state it was in before.
+    return [journals.settle(t) for t in touched.values()]
+
+
+def _fill(order: Order) -> float | None:
+    """The price an order's contracts filled at. None when the account gives none that can be a price."""
+    price = order.fill_price
+    return round(price, 4) if price is not None and price >= positions.MIN_PRICE else None
+
+
+def _when(order: Order, now: datetime) -> datetime:
+    """When an order's contracts filled. One that filled in part and was then cancelled has no fill time, so it goes by when it was sent."""
+    return order.filled_at or order.submitted or now
 
 
 def _unheld(
@@ -182,19 +242,30 @@ def _unheld(
     today: date,
     now: datetime,
     close_on: Callable[[str, date], float | None] | None,
+    skip: set[str] = frozenset(),
 ) -> list[Trade]:
-    """Account for contracts the journal has as open and the account no longer holds. Returns the trades that changed."""
+    """Account for contracts the journal has as open and the account no longer holds. Returns the trades that changed.
+
+    `skip` names the trades that were found open in this same look, whose positions may not have been read yet.
+    """
     have = {(h.symbol, h.side): h.quantity for h in held}
-    accounted = {t.open_order for t in trades} | {e.order for t in trades for e in t.exits}
-    # Orders this app did not send, each with the contracts it filled that no trade has claimed yet.
+    # An order can close more than one trade, and part of it in one look and the rest in the next. So what
+    # counts is how many of its contracts the journal has already taken, not whether it was ever used.
+    taken: dict[str, int] = {}
+    for t in trades:
+        for e in t.exits:
+            if e.order:
+                taken[e.order] = taken.get(e.order, 0) + e.quantity
+    # Orders this app did not send, each with the contracts it filled that no trade has taken yet. One that
+    # says it opens a position is not one that closes: the account's word for it is used when it gives one.
     spare = {
-        o.id: o.filled
+        o.id: o.filled - taken.get(o.id, 0)
         for o in orders
-        if not o.working and o.filled > 0 and o.fill_price and o.id not in accounted and not o.client_id.startswith(PREFIX + "-")
+        if not o.working and o.filled > 0 and _fill(o) is not None and o.intent != "open" and not o.client_id.startswith(PREFIX + "-")
     }
     groups: dict[tuple[str, str], list[Trade]] = {}
     for t in trades:
-        if t.state == "open":
+        if t.state == "open" and t.id not in skip:
             groups.setdefault((t.symbol, t.side), []).append(t)
 
     changed: list[Trade] = []
@@ -208,11 +279,11 @@ def _unheld(
             if missing <= 0:
                 break
             before = len(t.exits)
-            for o in sorted(orders, key=lambda o: o.filled_at or now):
+            for o in sorted(orders, key=lambda o: _when(o, now)):
                 count = min(spare.get(o.id, 0), t.remaining, missing)
-                if count <= 0 or o.symbol != symbol or o.side != closes or (o.filled_at or now) < (t.opened or t.ordered):
+                if count <= 0 or o.symbol != symbol or o.side != closes or _when(o, now) < (t.opened or t.ordered):
                     continue
-                t.exits.append(Exit(count, round(o.fill_price, 4), o.filled_at or now, "outside", None, o.id))
+                t.exits.append(Exit(count, _fill(o), _when(o, now), "outside", None, o.id))
                 spare[o.id] -= count
                 missing -= count
             count = min(t.remaining, missing)
@@ -288,7 +359,8 @@ class PaperDesk:
     # -- Writing an order out -----------------------------------------------
 
     @staticmethod
-    def _sized(quantity, limit) -> tuple[int, float]:
+    def sized(quantity, limit) -> tuple[int, float]:
+        """A number of contracts and a limit as an order takes them. Raises PaperError when either is not one."""
         if type(quantity) is not int or not 1 <= quantity <= MAX_CONTRACTS:
             raise PaperError(f"An order is for a whole number of contracts from 1 to {MAX_CONTRACTS}.")
         if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 0.01 <= limit <= MAX_LIMIT:
@@ -320,8 +392,16 @@ class PaperDesk:
                 raise PaperError("That contract is not in the scan.", 404)
             if c.expiry < self._today():
                 raise PaperError("That contract has expired.")
-            quantity, limit = self._sized(quantity, limit)
+            quantity, limit = self.sized(quantity, limit)
             buying = result.lens == "buy"
+            # An account holds a contract one way or the other, never both. An order to open the other side
+            # would be set against the trade that is there, and the journal could not tell which had ended.
+            other = "short" if buying else "long"
+            if any(t.symbol == c.symbol and t.side == other and t.state in ("ordered", "open") for t in self.journal.load()[0]):
+                raise PaperError(
+                    f"The journal has a trade {'sold' if buying else 'bought'} to open on this contract that has not ended. "
+                    "An account holds a contract one way or the other, so this order would not open a second position. Close that trade instead."
+                )
             premium = limit * SHARES * quantity
             text = f"{'Buy' if buying else 'Sell'} to open {quantity} {name(c)} at {holdings.dollars(limit)} a share or {'less' if buying else 'more'}, good for today."
             if buying:
@@ -358,8 +438,8 @@ class PaperDesk:
                 )
             )
 
-    def write_close(self, trade_id: str, limit: float) -> Ticket:
-        """An order to close what is left of an open trade, written out and not sent."""
+    def closable(self, trade_id: str) -> Trade:
+        """The trade with that id, when an order to close it can be written out. Raises PaperError saying why not."""
         with self._lock:
             self._ready()
             t = next((t for t in self.journal.load()[0] if t.id == trade_id), None)
@@ -369,14 +449,21 @@ class PaperDesk:
                 raise PaperError(f"That trade is {t.state}, so there is nothing to close.")
             if t.closing:
                 raise PaperError("A closing order for it is already working. Cancel that one, or wait for it to end.")
-            quantity, limit = self._sized(t.remaining, limit)
+            if t.expiry < self._today():
+                raise PaperError(EXPIRED)
+            return t
+
+    def write_close(self, trade_id: str, limit: float) -> Ticket:
+        """An order to close what is left of an open trade, written out and not sent."""
+        with self._lock:
+            t = self.closable(trade_id)
+            quantity, limit = self.sized(t.remaining, limit)
             selling = t.side == "long"
-            gain = (limit - t.entry_price if selling else t.entry_price - limit) * SHARES * quantity
+            # The sign is settled after rounding to whole dollars, so nothing ends "down $0".
+            gain = round((limit - t.entry_price if selling else t.entry_price - limit) * SHARES * quantity)
+            ends = "even" if gain == 0 else f"{'up' if gain > 0 else 'down'} ${abs(gain):,}"
             text = f"{'Sell' if selling else 'Buy'} to close {quantity} {name(t)} at {holdings.dollars(limit)} a share or {'more' if selling else 'less'}, good for today."
-            notes = [
-                f"It was {'bought' if selling else 'sold'} at {holdings.dollars(t.entry_price)}. Filled at the limit, the trade ends "
-                f"{'up' if gain >= 0 else 'down'} ${abs(gain):,.0f}."
-            ]
+            notes = [f"It was {'bought' if selling else 'sold'} at {holdings.dollars(t.entry_price)}. Filled at the limit, the trade ends {ends}."]
             return self._keep(
                 Ticket(
                     id=uuid.uuid4().hex[:12],
@@ -407,13 +494,20 @@ class PaperDesk:
             now = self._clock()
             if ticket is None or now - ticket.made > timedelta(minutes=TICKET_MINUTES):
                 raise PaperError("That order is no longer waiting to be confirmed. Write it out again.", 409)
+            # A contract can expire while its order waits: one written out late on its last day and confirmed after midnight.
+            if ticket.expiry < max(self._today(), now.astimezone(ET).date()):
+                raise PaperError("That contract has expired since the order was written out, so it was not sent.", 409)
             return self._open(broker, ticket, now) if ticket.action == "open" else self._close(broker, ticket, now)
 
     def _open(self, broker: Broker, ticket: Ticket, now: datetime) -> Trade:
-        t = journals.new(
-            ticket.underlying, ticket.kind, ticket.strike, ticket.expiry, ticket.side, ticket.quantity, ticket.limit, now, ticket.signals
-        )
-        self.journal.add(t)  # before the order leaves: an order is never out there with no record of it
+        try:
+            t = journals.new(
+                ticket.underlying, ticket.kind, ticket.strike, ticket.expiry, ticket.side, ticket.quantity, ticket.limit, now, ticket.signals
+            )
+            self.journal.add(t)  # before the order leaves: an order is never out there with no record of it
+        except ValueError as err:
+            # No entry, no order. What the journal will not take is said, and never answered with a bare failure.
+            raise PaperError(f"The journal could not take this order, so it was not sent: {err}.") from err
         try:
             order = broker.submit(t.symbol, ticket.order_side, "open", t.quantity, t.limit, open_id(t))
         except BrokerError as err:
@@ -451,12 +545,23 @@ class PaperDesk:
         return t
 
     def _rules_now(self, t: Trade) -> tuple[str, ...] | None:
-        """The exit rules this trade has reached, on the quotes of this moment. None when they cannot be checked."""
+        """The exit rules this trade has reached, on the quotes of this moment. None when they cannot be told.
+
+        That is so when the review fails, and also when it answers "unknown" for a rule the journal sorts a
+        closed trade by (`journals.ENDED_BY`): no ask to set beside the profit target, or a quote that is no
+        price to close at. Left out of the list, such a rule would read as not reached, and a trade closed at
+        its target would be filed as closed before it. An unknown check never passes, here as on the page.
+
+        The news is left out of this review. A headline cannot change a rule, and the order is waiting to leave.
+        """
         if self.scanner is None:
             return None
         try:
-            (holding,) = self.scanner.review([self._position(t.symbol, t.side, t.remaining, t.entry_price, [t])]).holdings
+            held = self._position(t.symbol, t.side, t.remaining, t.entry_price, [t])
+            (holding,) = self.scanner.review([held], news=False).holdings
         except Exception:  # the order is the person's to send whether or not the rules can be read
+            return None
+        if any(check.state == "unknown" and check.rule in journals.ENDED_BY for check in holding.checks):
             return None
         return tuple(check.rule for check in holding.checks if check.state == "reached")
 
@@ -476,17 +581,16 @@ class PaperDesk:
         # An option's symbol has no dot in it (BRKB), so the stock's own spelling comes from the journal.
         underlying = mine[0].underlying if mine else root
         opened = min([(t.opened or t.ordered).astimezone(ET).date() for t in mine] + [today, expiry])
-        return positions.make(underlying, kind, strike, expiry, side, quantity, round(price, 4), opened, id=symbol)
+        return positions.make(underlying, kind, strike, expiry, side, quantity, round(price, 4), opened, id=held_id(symbol, side))
 
     def _close_on(self, underlying: str, day: date) -> float | None:
         """The stock's close on one day, for what an option held to expiry was worth. None until that day's bar is final."""
         if self.scanner is None:
             return None
         try:
-            bars = self.scanner.market.daily_bars([underlying], day - timedelta(days=7)).get(underlying, [])
+            return self.scanner.close_on(underlying, day)  # which waits its turn with scans: the provider is shared
         except Exception:
             return None
-        return next((bar.close for bar in bars if bar.day == day), None)
 
     def review(self) -> PaperReview:
         """Bring the journal up to date with the paper account, and set what the account holds against the exit rules."""
@@ -511,13 +615,24 @@ class PaperDesk:
                 warnings.extend([self.why] if self.why else [])
             else:
                 account = fetch("The paper account", self.broker.account)
+                # Positions first, then orders, and it matters. Whatever the positions show has then already reached
+                # the list of orders: contracts that have gone are never looked for among orders read before they went.
+                # The other way round is covered in `reconcile`: a trade it finds open just now is not yet looked for
+                # among positions that were read before its order filled.
                 held = fetch("The paper account's positions", self.broker.positions)
                 in_play = [t.ordered for t in trades if t.state in ("ordered", "open")]
                 # From a little before the oldest trade still in play: this computer's clock and Alpaca's are not one clock.
                 since = min(in_play + [now - timedelta(days=1)]) - timedelta(hours=1)
-                orders = fetch("The paper account's orders", lambda: self.broker.orders(since))
-                if orders is not None:
-                    changed = reconcile(trades, orders, held, today, now, lookup=self.broker.order, close_on=self._close_on)
+                listed = fetch("The paper account's orders", lambda: self.broker.orders(since))
+                if listed is not None:
+                    orders, whole = listed
+                    if not whole:
+                        warnings.append(CUT_SHORT)
+                    # With part of the list missing, an order that closed a trade may be in the part not read.
+                    # So nothing is concluded about contracts that have gone, as when the positions cannot be read.
+                    changed = reconcile(
+                        trades, orders, held if whole else None, today, now, lookup=self.broker.order, close_on=self._close_on
+                    )
                     self.journal.save(changed)
 
             checked, opened_by = self._held_review(held, trades, warnings)
@@ -610,7 +725,12 @@ def _demo_start(desk: PaperDesk) -> None:
 def build_desk(settings, scanner=None, demo: bool = False, setup_error: str | None = None) -> PaperDesk:
     """The paper desk for these settings. There is always one, so the journal can be read whatever else is missing."""
     if scanner is not None and demo:
-        return PaperDesk(journals.open_journal(settings, demo=True), scanner, DemoBroker(scanner.market), seed=_demo_start)
+        # The demo's day is its market's day, which a test holds still. Its clock is that day at the time it is
+        # now in New York, so an order is never dated after the demo's own contracts have expired.
+        def now() -> datetime:
+            return datetime.combine(scanner.today, datetime.now(ET).time(), ET)
+
+        return PaperDesk(journals.open_journal(settings, demo=True), scanner, DemoBroker(scanner.market, now), clock=now, seed=_demo_start)
     journal = journals.open_journal(settings)
     if scanner is None:
         return PaperDesk(journal, None, None, setup_error)

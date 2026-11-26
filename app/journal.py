@@ -16,6 +16,7 @@ paper account and writes down what changed.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import asdict
 from datetime import date, datetime
@@ -27,7 +28,7 @@ from app import positions
 from app.models import ClosingOrder, Exit, Trade
 from app.store import ListFile, StoreError
 
-__all__ = ["HOW", "Journal", "StoreError", "ended", "new", "open_journal", "settle", "unread_note"]
+__all__ = ["ENDED_BY", "HOW", "Journal", "StoreError", "ended", "new", "open_journal", "settle", "unread_note"]
 
 ET = ZoneInfo("America/New_York")
 SHARES = 100
@@ -39,6 +40,9 @@ HOW: dict[str, str] = {
     "expiry": "held to expiry",
     "unknown": "left the account with no order on record",
 }
+# The exit rules a closed trade is sorted by, first match first, and how each is said. A closing order
+# whose reading of one of these could not be made has no rules on record at all (`PaperDesk._rules_now`).
+ENDED_BY: dict[str, str] = {"profit_target": "at the profit target", "time_stop": "inside the time stop"}
 
 
 def new(
@@ -82,10 +86,11 @@ def ended(t: Trade) -> str | None:
         return "held to expiry"
     if last.rules is None:
         return "rules not on record"
-    for rule, said in (("profit_target", "at the profit target"), ("time_stop", "inside the time stop")):
+    for rule, said in ENDED_BY.items():
         if rule in last.rules:
             return said
-    return "before either rule was reached"
+    # Only a seller has a profit target (`holdings.assess`), so a bought option has the one rule to be ahead of.
+    return "before either rule was reached" if t.side == "short" else "before the time stop"
 
 
 def _stands(t: Trade) -> str:
@@ -144,6 +149,17 @@ def _plain(trade: Trade) -> dict:
     return text(asdict(trade))
 
 
+def _written(trade: Trade) -> dict:
+    """A trade as it goes to the file, with where it stands worked out afresh.
+
+    Nothing this app writes holds a figure that is not a number: `json.dumps` raises ValueError first. (An
+    entry that does not read goes back to the file as it came, whatever is in it: that is `store.ListFile`.)
+    """
+    plain = _plain(settle(trade))
+    json.dumps(plain, allow_nan=False)
+    return plain
+
+
 def _time(value: Any) -> datetime:
     when = datetime.fromisoformat(value)
     if when.tzinfo is None:
@@ -156,10 +172,15 @@ def _rules(value: Any) -> tuple[str, ...] | None:
     return None if value is None else tuple(str(rule) for rule in value)
 
 
-def _price(value: Any, needed: bool = True) -> float | None:
+def _price(value: Any, needed: bool = True, least: float = positions.MIN_PRICE) -> float | None:
+    """A price per share within a position's bounds. `least` is 0 only for an exit: an option can expire worth nothing.
+
+    A price to measure a result against has the same floor as a position's entry price. One of 1e-310 was
+    read as a price, and every result against it was infinite.
+    """
     if value is None and not needed:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= positions.MAX_PRICE:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not least <= value <= positions.MAX_PRICE:
         raise ValueError("not a price")
     return float(value)
 
@@ -175,6 +196,9 @@ def _trade(row: Any) -> Trade | None:
     try:
         if row["state"] not in STATES or not isinstance(row["signals"], dict):
             return None
+        # What the scan showed is handed out as it is, so a figure in it that is not a number (NaN, Infinity,
+        # which Python reads from a file) would leave with it. Such an entry does not read.
+        json.dumps(row["signals"], allow_nan=False)
         made = new(
             row["underlying"], row["kind"], row["strike"], row["expiry"], row["side"], row["quantity"],
             row["limit"], _time(row["ordered"]), row["signals"], id=row["id"],
@@ -193,7 +217,7 @@ def _trade(row: Any) -> Trade | None:
             if e["how"] not in HOW:
                 return None
             made.exits.append(
-                Exit(_count(e["quantity"]), _price(e.get("price"), needed=False), _time(e["when"]), e["how"], _rules(e.get("rules")), str(e.get("order") or ""))
+                Exit(_count(e["quantity"]), _price(e.get("price"), needed=False, least=0.0), _time(e["when"]), e["how"], _rules(e.get("rules")), str(e.get("order") or ""))
             )
         if made.state in ("open", "closed") and not made.entry_price:
             return None  # a trade that was filled has the price it was filled at
@@ -236,12 +260,12 @@ class Journal:
             rows = self._file.rows()
             if any((held := _trade(row)) and held.id == trade.id for row in rows):
                 raise ValueError(f"there is already a trade with the id {trade.id}")
-            self._file.write(rows + [_plain(settle(trade))])
+            self._file.write(rows + [_written(trade)])
         return trade
 
     def save(self, trades: Iterable[Trade]) -> None:
         """Write these trades over their entries. Anything else in an entry, such as a remark added by hand, is kept."""
-        changed = {t.id: _plain(settle(t)) for t in trades}
+        changed = {t.id: _written(t) for t in trades}
         if not changed:
             return
         with self._lock:

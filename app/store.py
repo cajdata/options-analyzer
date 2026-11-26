@@ -10,6 +10,12 @@ cache:
 What an entry means is the caller's business (`app/positions.py`,
 `app/journal.py`). Here an entry is whatever JSON was written, and it goes back
 as it came, so one that does not read stays in the file untouched.
+
+That is why a write does not refuse a figure that is not a number (`NaN`,
+`Infinity`). Python reads those from a file, and an entry typed with one in it
+does not read as a position or a trade. Refusing to write it back would stop
+every later entry over one the rules say to leave alone. The callers keep such
+a figure out of the entries they make themselves.
 """
 
 from __future__ import annotations

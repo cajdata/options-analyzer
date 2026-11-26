@@ -434,7 +434,7 @@ class Scanner:
 
     # -- Positions already held ---------------------------------------------
 
-    def review(self, positions: list[Position]) -> PositionsReview:
+    def review(self, positions: list[Position], news: bool = True) -> PositionsReview:
         """Set each position beside today's quotes and check it against the exit rules.
 
         The held contracts are asked for by name, in one request however many
@@ -445,12 +445,29 @@ class Scanner:
         Every position comes back, priced or not. A source that fails leaves its
         numbers out and adds a warning, and a check that needed them says it could
         not be made (`analysis/holdings.py`).
+
+        `news=False` leaves the news out. The paper desk reads the rules that way
+        just before a closing order leaves: no rule depends on a headline, and a
+        stock's headlines can take many requests.
         """
         # One at a time with scans, for the same reason: the provider and its notes are shared.
         with self._lock:
-            return self._review(positions)
+            return self._review(positions, news)
 
-    def _review(self, positions: list[Position]) -> PositionsReview:
+    def close_on(self, symbol: str, day: date) -> float | None:
+        """A stock's close on one day, from its price history. None when that day has no final bar.
+
+        The paper desk settles a trade held to expiry with it. It waits its turn with
+        scans and reviews like any other use of the provider, whose notes are shared.
+        """
+        with self._lock:
+            try:
+                bars = self.market.daily_bars([symbol], day - timedelta(days=7)).get(symbol, [])
+            finally:
+                self.market.notes.clear()  # nobody is shown a scan here, so its notes have no reader
+        return next((bar.close for bar in bars if bar.day == day), None)
+
+    def _review(self, positions: list[Position], news: bool = True) -> PositionsReview:
         today = self.today
         rate = self.settings.risk_free_rate
         warnings: list[str] = []
@@ -578,8 +595,9 @@ class Scanner:
 
         # News for every stock held, flagged events above all. As in a scan it runs
         # before the provider's notes are collected, because loading headlines can add one.
-        earnings_days = {symbol: reports.days for symbol, reports in reports_for.items()}
-        warnings.extend(self._add_news(list(underlyings), underlyings, bars, earnings_days, today))
+        if news:
+            earnings_days = {symbol: reports.days for symbol, reports in reports_for.items()}
+            warnings.extend(self._add_news(list(underlyings), underlyings, bars, earnings_days, today))
         warnings.extend(dict.fromkeys(self.market.notes))
         self.market.notes.clear()
         return PositionsReview(
