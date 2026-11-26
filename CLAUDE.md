@@ -60,7 +60,7 @@ Things that are not obvious from any one file:
 These came out of two rounds of outside code review. Each has a test; do not regress them.
 
 - **Risk/reward is in present value, priced at the fill.** `risk.assess` uses the ask to buy and the bid to sell, and discounts the payoff. A fairly priced option must show zero edge at any expiry, and a buyer's "most you can lose" must equal the cost shown. (A seller's outlay is collateral, a different number: the most a short put can lose is the strike less the bid, and a short call has no cap on its own.) Display metrics on `ContractAnalysis` (breakeven, `pop`, annualized yield) stay at the mid.
-- **A quote below exercise value is rejected**, using plain `max(S-K, 0)` or `max(K-S, 0)` whether or not the feed supplies a volatility. Do not swap in a discounted European floor: it drops legitimate deep in-the-money calls on dividend stocks.
+- **A quote below exercise value is rejected**, using plain `max(S-K, 0)` or `max(K-S, 0)` whether or not the feed supplies a volatility. Do not swap in a discounted European floor: it drops legitimate deep in-the-money calls on dividend stocks. "Below" is below by more than `contracts.PRICE_TOLERANCE`: prices are amounts in cents and a float is not one (`100.0 - 80.10` is `19.900000000000006`), so without the room a price exactly at exercise value was rejected about one time in four.
 - **Earnings math.** `TRADING_DAY = 1/252`; a report replaces one trading day. `risk.event_variance` uses log returns and takes `(sessions - 1)` ordinary days out of a two-session reaction. `earnings.spans` treats unknown timing as possibly before the open, and `earnings.implied_move` leaves a report-day expiry of unknown timing out of both sides (`_ambiguous`).
 - **"No reports" and "cannot tell" are different.** A company that files 6-K, 20-F or 40-F raises `Unsupported` in `EdgarEarnings`, which sets `earnings_unknown`. Never let it look like an ETF, which has no reports at all.
 - **The strike window scales with volatility** (`Scanner._strike_window`). A fixed 15% cuts off the deltas the sell lens targets on volatile stocks.
@@ -161,6 +161,13 @@ These came out of the outside review of phase 3 (2026-11-26). All sixteen of its
 - **A zero is said to be whose it is.** With no reading from the options, and past reports sizing the step at nothing, the plan's note used to say the options price no move. A review reads no chain, so nobody had looked.
 - **A calendar note is repeated only by a review that looked dates up.** The note stays on `EarningsService` between scans.
 - **On the page, an answer that is not the newest load's is dropped** (`loads`), a load that fails leaves neither the loading line nor an earlier list on screen, a note the status and a review both carry is shown once, and Remove sends one request however many times it is clicked.
+
+A second review the same day read those fixes and found four more points and a nit. All were reproduced on `main` first, and each has a test at the end of `tests/test_positions.py`.
+
+- **An ask at exercise value to the cent is not below it.** The check for a quote that is out of date against the stock compared `ask < strike - stock` in floating point. A $100 put with the stock at $80.10 and an ask of $19.90 was turned away, with the note "Even its ask ($19.90) is below the $19.90". Over whole-cent prices that was about one case in four. `holdings.unusable` and `contracts.analyze_contract` now share `contracts.PRICE_TOLERANCE`. Any new comparison of two prices needs the same room.
+- **Every price of a position is shown as it is** (`exact` on the page, `holdings.dollars` on the command line), not only the entry and the target. The first fix left the row saying $0.52 beside a check that said $0.515. In the check itself the ask is cut off when it has reached the target and rounded up when it has not (`holdings._beside_target`), so the two figures stand the same way round as the prices behind them at any number of decimals.
+- **The calendar note is repeated only when a stock's dates were looked up to the end.** A lookup that fails on the earnings history never reaches the calendar, and since the first fix its stock is kept, so "a stock was looked up" was no longer the right test.
+- **Only a quote with a time can be outdated.** A snapshot with no quote in it at all is left out of the answer when every dated quote is too old, and comes back as it is, unmarked, on an ordinary day.
 
 ## What live data looks like
 

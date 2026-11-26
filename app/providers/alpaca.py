@@ -270,7 +270,9 @@ class AlpacaData:
         else:
             current = {quote.symbol: quote for quote in _from_session(parsed, session)}
         for quote, _ in parsed:
-            if quote.symbol not in current:
+            # Only a quote with a time can be from an earlier day. A snapshot with no quote in it
+            # at all is left out, and the position says no quote was found.
+            if quote.symbol not in current and quote.quote_time is not None:
                 current[quote.symbol] = OptionQuote(
                     quote.symbol, quote.underlying, quote.kind, quote.strike, quote.expiry, quote_time=quote.quote_time, outdated=True
                 )

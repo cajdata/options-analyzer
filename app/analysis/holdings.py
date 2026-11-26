@@ -30,6 +30,7 @@ import math
 from datetime import date, timedelta
 
 from app.analysis import exits
+from app.analysis.contracts import PRICE_TOLERANCE
 from app.analysis.earnings import reaction_day, spans
 from app.models import ContractAnalysis, ExitPlan, Holding, OptionQuote, Position, PositionCheck, UnderlyingContext
 
@@ -89,6 +90,10 @@ def unusable(p: Position, quote: OptionQuote | None, spot: float | None) -> str 
     in-the-money quote, and no bid at all is an ordinary nearly worthless one.
     Neither is turned away. With no stock price nothing can be told, and the
     quote stands.
+
+    "Below" is below by more than `PRICE_TOLERANCE`. An ask of $19.90 is at
+    exercise value for a $100 put with the stock at $80.10, and 100.0 - 80.10
+    in floating point is a hair above 19.90.
     """
     if quote is None:
         return None
@@ -97,7 +102,7 @@ def unusable(p: Position, quote: OptionQuote | None, spot: float | None) -> str 
         return "This quote is crossed: its ask is below its bid. That is not a price anything can be closed at, so no result is shown."
     if ask > 0 and spot and spot > 0:
         exercise = max(spot - p.strike, 0.0) if p.kind == "call" else max(p.strike - spot, 0.0)
-        if ask < exercise:
+        if ask < exercise - PRICE_TOLERANCE:
             return (
                 f"This quote is out of date against the stock. Even its ask ({dollars(ask)}) is below the "
                 f"{dollars(exercise)} that exercising the {p.kind} would pay with the stock at ${spot:,.2f}. No result is shown."
@@ -116,6 +121,18 @@ def result(p: Position, quote: OptionQuote | None) -> tuple[float, float, float]
         return None
     gain = price - p.entry_price if p.side == "long" else p.entry_price - price
     return price, gain * SHARES * p.quantity, gain / p.entry_price
+
+
+def _beside_target(ask: float, reached: bool) -> str:
+    """An ask as it is set beside the target: cut off when it has reached the target, rounded up when it has not.
+
+    The target is shown cut off (`at_most`). Cutting the ask off too when it is
+    at or under the target, and rounding it up when it is over, keeps the two
+    figures the same way round as the prices behind them at any number of
+    decimals. A whole-cent ask reads the same either way.
+    """
+    scaled = ask * 10_000
+    return dollars((math.floor(scaled + 1e-6) if reached else math.ceil(scaled - 1e-6)) / 10_000)
 
 
 def _kept(kept: float, reached: bool) -> str:
@@ -137,12 +154,12 @@ def profit_target(p: Position, ask: float | None, usable: bool = True) -> Positi
         return PositionCheck("profit_target", "unknown", "profit target unknown", f"There is no ask to buy back at. {aim}")
     kept, collected = (p.entry_price - ask) / p.entry_price, dollars(p.entry_price)
     if ask <= target:
-        text = f"Buying back at {dollars(ask)} keeps {_kept(kept, True)} of the {collected} collected. {aim}"
+        text = f"Buying back at {_beside_target(ask, True)} keeps {_kept(kept, True)} of the {collected} collected. {aim}"
         return PositionCheck("profit_target", "reached", "profit target reached", text)
     if kept >= 0:
-        text = f"Buying back at {dollars(ask)} would keep {_kept(kept, False)} of the {collected} collected. {aim}"
+        text = f"Buying back at {_beside_target(ask, False)} would keep {_kept(kept, False)} of the {collected} collected. {aim}"
     else:
-        text = f"Buying back at {dollars(ask)} costs {dollars(ask - p.entry_price)} a share more than the {collected} collected. {aim}"
+        text = f"Buying back at {_beside_target(ask, False)} costs {dollars(ask - p.entry_price)} a share more than the {collected} collected. {aim}"
     return PositionCheck("profit_target", "clear", "profit target not reached", text)
 
 

@@ -228,7 +228,9 @@ function signedPct(v, digits = 1) {
 }
 const money = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(2);
 const num = (v, digits = 2) => v === null || v === undefined ? "–" : v.toFixed(digits);
-// A price as it was entered: to the cent, or finer when it is not a whole cent (an average of two fills).
+// A price as it is: to the cent, or finer when it is not a whole cent. An entry can be an average
+// of two fills, and the free feed's quotes are not always whole cents. Every price of a position is
+// shown this way, so the table never says $0.52 beside a check that says $0.515.
 const exact = (v) => v === null || v === undefined ? "–" : "$" + v.toFixed(4).replace(/0{1,2}$/, "");
 // A price to be at or below: cut off, never rounded up, and finer than a cent when it is.
 // Half of $1.03 is $0.515. Shown as "$0.52 or less" it reads as reached at an ask of $0.52.
@@ -677,7 +679,7 @@ function renderPositions() {
         el("span", { class: "sub" }, dayMonth(p.expiry) + " · " + p.strike + " " + p.kind),
         el("div", { class: "sub" }, SIDE[p.side] + " × " + p.quantity)),
       el("td", {}, exact(p.entry_price), el("div", { class: "sub" }, "opened " + dayMonth(p.opened))),
-      el("td", {}, money(holding.close_price),
+      el("td", {}, exact(holding.close_price),
         holding.close_price === null ? null : el("div", { class: "sub" }, p.side === "long" ? "the bid" : "the ask")),
       holding.pnl === null ? el("td", {}, "–")
         : el("td", { class: tone(Math.round(holding.pnl)) }, dollars(holding.pnl, true), el("div", { class: "sub" }, signedPct(holding.pnl_pct, 0))),
@@ -732,11 +734,11 @@ function selectHolding(holding) {
     el("h3", {}, "Position"),
     facts([
       [short ? "Collected" : "Paid", exact(p.entry_price) + " a share · " + dollars(p.entry_price * 100 * p.quantity) + " in all"],
-      ["Bid × ask now", holding.bid === null && holding.ask === null ? "–" : money(holding.bid) + " × " + money(holding.ask)],
+      ["Bid × ask now", holding.bid === null && holding.ask === null ? "–" : exact(holding.bid) + " × " + exact(holding.ask)],
       holding.quote_time ? ["Quoted", newsTime(holding.quote_time) + ", New York"] : null,
-      [short ? "Buying back now, at the ask" : "Selling now, at the bid", money(holding.close_price)],
+      [short ? "Buying back now, at the ask" : "Selling now, at the bid", exact(holding.close_price)],
       ["Result if closed now", holding.pnl === null ? "–" : dollars(holding.pnl, true) + " (" + signedPct(holding.pnl_pct, 0) + ")"],
-      ["Breakeven at expiry", money(breakeven)],
+      ["Breakeven at expiry", exact(breakeven)],
       ["Expires", shortDate(p.expiry) + (holding.dte < 0 ? "" : " · " + inDays(holding.dte))],
       c ? ["Implied volatility", pct(c.iv) + " (" + c.iv_source + ")"] : null,
       c ? ["Delta · gamma", num(c.delta) + " · " + num(c.gamma, 3) + " (" + c.greeks_source + ")"] : null,
