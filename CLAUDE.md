@@ -63,7 +63,7 @@ Things that are not obvious from any one file:
 - **The dashboard has three views in the one file**, Scan, Positions and Paper. Each element belongs to a view through `data-view`, `show()` switches them, and the address ends in `#positions` for the second and `#paper` for the third. The notes under the controls are kept for each view (`notices`).
 - **The page draws two lists of held positions with one function.** `BOOKS` names the table, the detail pane and the open row of each: what the person entered (Positions) and what the paper account holds (Paper). `renderHoldings` and `showHolding` take the review and the book, so a fix to one list is a fix to both.
 - **The file handling for the positions and the journal is one class** (`store.ListFile`). `PositionStore` and `Journal` say what an entry means, and share how a file is read, written and refused.
-- **`docs/` is the public site for strikecheck.app**, published by GitHub Pages from that folder on `main`. It is one plain HTML file with no scripts, plus `CNAME` and `.nojekyll`. Its sample table and earnings bars were copied from a `scan --demo` run and its claims come from the README, so change them together. The dashboard itself is never hosted there: it has no login and runs on the owner's keys.
+- **`docs/` is the public site for strikecheck.app**, published by GitHub Pages from that folder on `main`. It is one plain HTML file with no scripts, plus `CNAME` and `.nojekyll`. Its sample table and earnings bars were copied from a `scan --demo` run and its claims come from the README, so change them together. Since 2026-11-27 it describes the positions page and paper trading as well as the scan. It still leaves out the whose-news rules and pooling. The dashboard itself is never hosted there: it has no login and runs on the owner's keys.
 
 ## Invariants
 
@@ -387,7 +387,6 @@ In so far: a file of entries, a review that sets each one beside today's quotes,
 - **What the options price for a held stock's next report.** That takes the chain around the report, which a review does not pull. It could be fetched for one position when the person asks for it.
 - **A stock price from after hours.** After 4 p.m. the strike check compares the strike with an after-hours trade while the option's quote is from the close. Where the move puts an option's whole quote under exercise value, the position now shows no result and says the quote is out of date. A smaller move leaves a quote that is just as old and looks fine, and nothing catches that. This is the scan's open problem too (see "What live data looks like").
 - **Anything that watches.** A review runs when the view opens or Refresh is pressed. With free delayed quotes a signal is end-of-day quality, so no timer and no alert was built.
-- **The public page in `docs/`** does not mention positions.
 
 ## Phase 4: paper trading (started 2026-11-26)
 
@@ -410,7 +409,6 @@ In so far: the broker, the journal, the desk between them, the Paper view, `pyth
 - **The readings the summary sorts by.** `signals.GROUPS` has six, with fixed bands (`SCORE_BANDS`, `POP_BANDS`). Delta, days to expiry, the score's components and the size of the spread are in each entry's `signals` and are not summed up yet.
 - **The journal in the AI brief.** It is not given the journal or the paper account.
 - **Real positions in the journal.** See "Positions page: what is left".
-- **The public page in `docs/`** says the app cannot place a real order, and still calls it read-only in its title and its heading. It does not describe paper trading.
 - **Left from the phase 4 review.** With the list of orders cut short, a trade whose contracts have left the account (closed at Alpaca, or expired) stays open in the journal until the list can be read whole, and it is that trade's own age that keeps the list long. Reading the newest orders first, or asking for one contract's orders by `symbols`, would get past it, and both need parameters nobody has checked. The rules are still read with a price history request and an earnings lookup while a closing order waits to leave, under the desk's lock, and no time limit is put on that: the page says "Sending…" meanwhile. A limit is rounded to a cent and not to the contract's tick. And the page does not guard a journal entry's signals against every shape a hand edit could give them, as `signals.py` now does.
 ## Phase 5: live trading (not started, not approved)
 

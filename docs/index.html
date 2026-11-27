@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strike Check: a read-only options scanner</title>
-<meta name="description" content="Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and shows each stock's past earnings moves next to what the options are pricing in. It runs on your own computer and can't place a real order.">
+<title>Strike Check: an options scanner</title>
+<meta name="description" content="Strike Check ranks option contracts by rules you can see, shows each stock's past earnings moves next to what the options are pricing in, checks what you hold against the exit rules, and paper trades with pretend money. It runs on your own computer and can't place a real order.">
 <link rel="canonical" href="https://strikecheck.app/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Strike Check: a read-only options scanner">
-<meta property="og:description" content="Ranks option contracts by rules you can see, with each stock's past earnings moves next to what the options are pricing in. It can't place a real order.">
+<meta property="og:title" content="Strike Check: an options scanner">
+<meta property="og:description" content="Ranks option contracts by rules you can see, checks what you hold against the exit rules, and paper trades with pretend money. It can't place a real order.">
 <meta property="og:url" content="https://strikecheck.app/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5fbf'/%3E%3Cpath d='M9 16.5l5 5 9-11' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
@@ -64,6 +64,7 @@
   .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .grid p { margin: 0; color: var(--muted); font-size: 15px; }
   .grid .wide { grid-column: 1 / -1; }
+  .after { margin: 14px 0 0; color: var(--muted); font-size: 15px; }
   ul { margin: 0; padding-left: 20px; }
   li { margin: 6px 0; }
   pre { margin: 0 0 12px; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; font: 13.5px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace; }
@@ -86,8 +87,8 @@
 </header>
 
 <section class="hero">
-  <h1>A read-only options scanner</h1>
-  <p class="lede">Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and puts each stock's past earnings moves next to what the options are pricing in for the next report. It runs on your own computer and it can't place a real order.</p>
+  <h1>An options scanner</h1>
+  <p class="lede">Strike Check pulls option chains from Alpaca, ranks contracts by rules you can see, and puts each stock's past earnings moves next to what the options are pricing in for the next report. It also checks what you already hold against the same exit rules, and lets you try a contract with pretend money. It runs on your own computer and it can't place a real order.</p>
   <div class="actions">
     <a class="button primary" href="#try">Try the demo</a>
     <a class="button" href="https://github.com/cajdata/strike-check">Source on GitHub</a>
@@ -159,9 +160,33 @@
 </section>
 
 <section>
+  <h2>After the scan</h2>
+  <div class="grid">
+    <div class="panel">
+      <h3>A check on what you hold</h3>
+      <p>Enter a position once, and each refresh sets it beside that moment's quotes: the result if you closed now, whether an option you sold has kept half its premium, whether it's inside its last 21 days, whether an earnings report is within a week, and whether the stock is through the strike.</p>
+    </div>
+    <div class="panel">
+      <h3>Paper trades you send yourself</h3>
+      <p>Try a contract from a scan with pretend money in an Alpaca paper account. Each order is written out in words first, and only you send it: one limit order, good for the day. No scan, refresh or rule ever sends or cancels one.</p>
+    </div>
+    <div class="panel">
+      <h3>A journal of each paper trade</h3>
+      <p>What the scan showed when you wrote the order out, the fills, how the trade ended and the result. What the scan showed is kept as a copy, so a later change to a weight or a rule doesn't rewrite it.</p>
+    </div>
+    <div class="panel">
+      <h3>Which signals worked</h3>
+      <p>Your closed paper trades, sorted by what the scan showed for each, with how many made money. Bought and sold options are kept apart, and a row with fewer than ten trades says "too few". It describes your trades and nothing more.</p>
+    </div>
+  </div>
+  <p class="after">A rule that is reached is a fact about a position, not an instruction. What you really hold and what you paid never leave your computer. A paper order sends its contract, its size and its limit to Alpaca's paper account, and that is the only place a quantity or a price goes.</p>
+</section>
+
+<section>
   <h2>What it doesn't do</h2>
   <ul>
     <li><strong>It can't place a real order.</strong> It reads market data. The one kind of order it can send goes to Alpaca's paper account, which holds pretend money, and only after you have confirmed that one order.</li>
+    <li><strong>It never acts on its own.</strong> Nothing in it sends, cancels or closes anything unless you send that one order yourself, and nothing watches the market between refreshes.</li>
     <li><strong>It doesn't tell you what to trade.</strong> The ranking is a screen. It isn't a forecast and it isn't financial advice.</li>
     <li><strong>There's no hosted version.</strong> It runs on your own computer with your own free Alpaca keys.</li>
     <li><strong>Free quotes aren't live.</strong> Alpaca's free option feed is indicative: quotes are modified and trades are 15 minutes delayed. Screen with it, then check the live quote at your broker.</li>
@@ -177,6 +202,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev,ai]"
 .venv\Scripts\python.exe -m app serve --demo</code></pre>
   <p>Then open <code>http://127.0.0.1:8000</code>. On macOS or Linux, use <code>.venv/bin/python</code> in place of <code>.venv\Scripts\python.exe</code>.</p>
+  <p>The demo also has made-up positions and a made-up paper account, so you can try the Positions and Paper views, and send a paper order, with no keys.</p>
   <p>To use real data, the <a href="https://github.com/cajdata/strike-check#use-real-data">README</a> covers the Alpaca keys and the earnings sources. It also lists the limits worth knowing before you rely on any number here.</p>
 </section>
 
