@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import broker, journal, paper
+from app import broker, journal, paper, positions
 from app.analysis import signals
 from app.broker import AlpacaPaper, BrokerError, DemoBroker
 from app.config import ConfigError, Settings, load_settings
@@ -1447,3 +1447,161 @@ def test_whether_the_keys_are_a_paper_accounts_is_yes_or_no(monkeypatch, written
             load_settings()
     else:
         assert load_settings().alpaca_paper is read
+
+
+# -- From the second outside review of phase 4 (2026-11-27) ----------------------------------------------
+#
+# It read the fixes above and found five more points. Each was reproduced on `main` first, and each test here failed there.
+
+
+def test_the_other_side_is_asked_about_again_when_an_order_is_sent(desk, scanner):
+    wide = dict(symbols=["CRUX"], kind="put", dte_min=25, dte_max=45, per_side=10_000, top_n=10_000)
+    sells, buys = scanner.scan(ScanRequest(lens="sell", **wide)), scanner.scan(ScanRequest(lens="buy", **wide))
+    both = sorted({c.symbol for c in sells.ideas} & {c.symbol for c in buys.ideas})
+    idea = next(c for c in sells.ideas if c.symbol == both[0])
+    # Both orders are written out before either is sent: two tabs, or the command line while a ticket waits.
+    # Asked only when an order was written out, both were sent, and the journal had the contract open both ways.
+    sell, buy = desk.write_open(sells, idea.symbol, 1, idea.bid), desk.write_open(buys, idea.symbol, 1, idea.ask)
+    again = desk.write_open(sells, idea.symbol, 1, idea.bid)
+    made = desk.send(sell.id)
+    with pytest.raises(PaperError, match="one way or the other.*It was not sent") as caught:
+        desk.send(buy.id)
+    assert caught.value.status == 409 and len(desk.broker.sent) == 1 and desk.journal.load() == ([made], 0)
+    with pytest.raises(PaperError, match="no longer waiting"):
+        desk.send(buy.id)  # and the order is used up, like any other that was not sent
+    assert desk.send(again.id).side == "short"  # more of the same side is another trade on the contract, as before
+
+    # The demo's account does not hold a contract both ways either.
+    account = DemoBroker(scanner.market, now=lambda: NOW)
+    account.submit(idea.symbol, "sell", "open", 1, 0.01, "sc-a-o")
+    with pytest.raises(BrokerError, match="one way or the other") as turned_down:
+        account.submit(idea.symbol, "buy", "open", 1, 10_000.0, "sc-b-o")
+    assert turned_down.value.refused and "Alpaca" not in str(turned_down.value)  # what Alpaca says has not been seen
+    assert [(h.side, h.quantity) for h in account.positions()] == [("short", 1)]
+    account.submit(idea.symbol, "sell", "open", 1, 0.01, "sc-c-o")
+    assert [(h.side, h.quantity) for h in account.positions()] == [("short", 2)]
+
+
+def test_the_demos_clock_only_runs_forward(scanner, scan, tmp_path, monkeypatch):
+    class Wall(datetime):
+        at = datetime(2026, 12, 1, 23, 55, tzinfo=ET)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.astimezone(tz)
+
+    monkeypatch.setattr(paper, "datetime", Wall)
+    monkeypatch.setattr(broker, "datetime", Wall)
+    first, second = scan.ideas[0], scan.ideas[1]
+    desk = paper.build_desk(Settings(journal_file=tmp_path / "journal.json"), scanner, demo=True)
+    started = desk._clock()
+    assert (started.astimezone(ET).date(), started.astimezone(ET).time()) == (TODAY, Wall.at.time())  # the demo's day, at this time
+    waiting = desk.write_open(scan, first.symbol, 1, first.bid)
+    opened = desk.send(desk.write_open(scan, second.symbol, 1, second.bid).id)
+
+    # Ten minutes on it is past midnight. Read as the demo's day at the time on the wall, the clock went back a day.
+    Wall.at = datetime(2026, 12, 2, 0, 5, tzinfo=ET)
+    assert desk._clock() - started == timedelta(minutes=10)
+    shut = desk.send(desk.write_close(opened.id, second.ask + 5).id)
+    assert shut.state == "closed" and shut.closed - shut.opened == timedelta(minutes=10)  # it was closed the day before it opened
+
+    Wall.at = datetime(2026, 12, 2, 0, 15, tzinfo=ET)
+    with pytest.raises(PaperError, match="no longer waiting"):
+        desk.send(waiting.id)  # written out twenty minutes ago, and it was taken as written 23 hours 40 minutes from now
+
+    # The hour that comes twice when the clocks go back: 1:30 a.m., and forty minutes later 1:10 a.m.
+    Wall.at = datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc)
+    fall = paper.build_desk(Settings(journal_file=tmp_path / "fall.json"), scanner, demo=True)
+    before = fall._clock()
+    Wall.at = datetime(2026, 11, 1, 6, 10, tzinfo=timezone.utc)
+    assert fall._clock() - before == timedelta(minutes=40)
+
+
+def test_a_fill_above_what_a_position_can_cost_is_no_price_either(tmp_path):
+    # The floor was checked and the ceiling was not. The trade opened at $2,000,000 a share, the journal wrote
+    # that down, and then could not read its own entry back.
+    t = trade()
+    reconcile([t], [order(t, fill_price=2_000_000.0)], [], TODAY, NOW)
+    assert (t.state, t.entry_price) == ("ordered", None) and paper.unpriced(t)
+    most = trade()
+    reconcile([most], [order(most, fill_price=float(positions.MAX_PRICE))], None, TODAY, NOW)
+    assert (most.state, most.entry_price) == ("open", positions.MAX_PRICE)
+    # An order this app did not send, at such a price, is not an exit at it.
+    gone = held()
+    reconcile([gone], [order(gone, "close", fill_price=2_000_000.0, id="outside")], [], TODAY, NOW)
+    assert [(e.how, e.price) for e in gone.exits] == [("unknown", None)]
+    # Whatever the account says, the journal reads back what it was given.
+    kept = Journal(tmp_path / "journal.json")
+    for one in (t, most, gone):
+        kept.add(one)
+    assert kept.load() == ([t, most, gone], 0)
+
+
+class Unpriced(Account):
+    """A stand-in that can fill an order and give no price for the fill."""
+
+    priced = True
+
+    def submit(self, *sent) -> Order:
+        made = super().submit(*sent)
+        if not self.priced:
+            made = self.listed[made.id] = replace(made, fill_price=None)
+        return made
+
+
+def test_an_order_filled_with_no_price_is_not_said_to_be_waiting_or_working(desk, scan, client):
+    from app.__main__ import _sent
+
+    account = desk.broker = Unpriced()
+    stands = lambda t: next((found.state, found.stands, found.note) for found in desk.review().trades if found.id == t.id)  # noqa: E731
+
+    account.priced = False
+    made = desk.send(desk.write_open(scan, scan.ideas[0].symbol, 1, 4.10).id)
+    assert made.state == "ordered" and paper.unpriced(made)
+    said = _sent(made, "open")
+    assert made.note in said and "waiting to fill" not in said  # it filled, and that was all the account said
+    # Where it stands is worded beside that remark, and said "ordered, not filled yet".
+    assert made.stands == "ordered, waiting for the price it filled at" and stands(made)[1] == made.stands
+    account.listed["order-1"] = replace(account.listed["order-1"], fill_price=4.10)
+    assert stands(made) == ("open", "open", None)  # the price came, and the words and the remark went with the wait
+
+    account.priced = True
+    opened = desk.send(desk.write_open(scan, scan.ideas[1].symbol, 1, 4.10).id)
+    assert not paper.unpriced(opened) and "filled: 1 at 4.10" in _sent(opened, "open")
+    account.priced = False
+    shut = desk.send(desk.write_close(opened.id, 1.00).id)
+    assert shut.state == "open" and shut.closing and paper.unpriced(shut)
+    said = _sent(shut, "close")
+    assert shut.note in said and "is working" not in said
+    assert shut.stands == "open, waiting for the price its closing order filled at" and stands(shut)[1] == shut.stands
+    account.listed["order-3"] = replace(account.listed["order-3"], fill_price=1.00)
+    state, words, remark = stands(shut)
+    assert (state, remark) == ("closed", None) and "waiting" not in words
+
+    # An order that is working, or not filled yet, is still said to be.
+    assert journal.settle(trade()).stands == "ordered, not filled yet"
+    working = held()
+    working.closing = ClosingOrder("sc-x-c1", 1, 0.95, NOW, ())
+    assert journal.settle(working).stands == "open, closing order working"
+
+    # The page words all of it from the same remark, and tells the remark by how Python begins it.
+    page = client.get("/").text
+    assert client.get("/api/status").json()["paper"]["no_price"] == paper.NO_PRICE == journal.NO_PRICE
+    assert "const unpriced = (trade) => Boolean(trade.note && trade.note.startsWith(status.paper.no_price));" in page
+    assert 'if (unpriced(trade)) return "Sent. " + trade.note;' in page
+    # Under "Close it" it was said to be working, and to be in the list of orders, where it is not.
+    assert '? "The order that opened it has ended, and it cannot be closed from here yet. " + trade.note' in page
+    assert '? "The closing order at " + exact(trade.closing.limit) + " has ended. " + trade.note' in page
+
+
+def test_cancelling_an_order_clears_what_was_said_about_the_last_one(client):
+    # "Sent. The closing order is working." stayed above the lists after that very order was cancelled.
+    page = client.get("/").text
+    start = page.index("function renderOrders()")
+    cancelling = page[start : page.index("\nfunction ", start + 1)]
+    assert re.search(r'"DELETE"\);\s*(//[^\n]*\s*)?say\(""\);\s*await loadPaper\(\);', cancelling)
+    # A cancel the account turns down means the order has filled or ended, so the list it was pressed in is
+    # out of date. The reason was put beside the button and nothing was read afresh.
+    turned_down = cancelling[cancelling.index("} catch (err) {") :]
+    assert re.search(r"if \(err\.status === 404 \|\| err\.status === 422\) \{\s*(//[^\n]*\s*)*say\(err\.message, true\);\s*await loadPaper\(\);\s*return;", turned_down)
+    assert "cancel.disabled = false;" in turned_down  # with no answer to go by, the button can be tried again

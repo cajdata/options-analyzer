@@ -134,6 +134,8 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
                 "ended": journal.HOW,
                 "max_contracts": paper.MAX_CONTRACTS,
                 "ticket_minutes": paper.TICKET_MINUTES,
+                # How the remark on an order that filled with no price begins, so the page can tell it from one still working.
+                "no_price": paper.NO_PRICE,
             },
             "news_sources": scanner.news.sources if scanner and scanner.news else [],
             "events": {

@@ -331,7 +331,9 @@ class DemoBroker:
     An order fills at once when its limit reaches the demo's quote: a buy at the
     ask, a sale at the bid. Otherwise it waits, and since the demo's prices never
     move it waits until it is cancelled. Like the real account, it holds no
-    shares, so it turns away a call sold to open.
+    shares, so it turns away a call sold to open. And it holds a contract one
+    way or the other, so it turns away an order to open the other side of one
+    it holds.
     """
 
     mode = "demo"
@@ -366,6 +368,13 @@ class DemoBroker:
         held = "long" if (side == "buy") == (intent == "open") else "short"
         if intent == "close" and self._held.get((symbol, held), (0, 0.0))[0] < quantity:
             raise BrokerError("Alpaca turned the order down: the account does not hold that many contracts to close", status=403, refused=True)
+        if intent == "open" and self._held.get((symbol, "short" if held == "long" else "long"), (0, 0.0))[0]:
+            # What Alpaca says to this has not been seen, so the words are the demo's own and are not passed off as Alpaca's.
+            raise BrokerError(
+                "The demo's account holds this contract the other way, and an account holds a contract one way or the other.",
+                status=403,
+                refused=True,
+            )
         if intent == "open" and side == "sell" and kind == "call":
             raise BrokerError(
                 f"Alpaca turned the order down: insufficient underlying qty available for covered call (required: {quantity * 100}, available: 0)",
