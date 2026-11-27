@@ -491,6 +491,10 @@ def _close_ticket(args, desk: paper.PaperDesk) -> Ticket:
 
 def _sent(t: Trade, action: str) -> str:
     """What became of an order just sent."""
+    if paper.unpriced(t):
+        # It ended with contracts filled and no price for them: neither waiting to fill nor working. The journal's
+        # remark says so, and the next look at the account asks again.
+        return f"Sent. {t.note} Run `python -m app paper` for that, and to see where trade {t.id} stands."
     if action == "open":
         if t.state == "open":
             return f"Sent, and filled: {t.quantity} at {_figure(t.entry_price)}. Trade {t.id} is open."

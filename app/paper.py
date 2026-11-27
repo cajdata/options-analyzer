@@ -65,7 +65,7 @@ CUT_SHORT = (
     "orders still working may be short, and contracts that have left the account are left as they are in the journal. "
     "Orders sent from here are still found by name."
 )
-NO_PRICE = "The account says"  # how the remark on an order that filled with no price begins
+NO_PRICE = journals.NO_PRICE  # how the remark on an order that filled with no price begins
 EXPIRED = (
     "That contract has expired, so no order can close it. Alpaca takes it off the account once it has settled, "
     "and the journal then records how it ended."
@@ -88,6 +88,9 @@ def name(t) -> str:
 
 def open_id(trade: Trade) -> str:
     return f"{PREFIX}-{trade.id}-o"
+
+
+unpriced = journals.unpriced  # whether a trade is waiting on an order that filled with no price
 
 
 def held_id(symbol: str, side: str) -> str:
@@ -160,7 +163,7 @@ def reconcile(
 
     def priced(t: Trade) -> None:
         """The price has come, so the remark that it was missing goes."""
-        if t.note and t.note.startswith(NO_PRICE):
+        if unpriced(t):
             t.note = None
 
     for t in trades:
@@ -225,9 +228,13 @@ def reconcile(
 
 
 def _fill(order: Order) -> float | None:
-    """The price an order's contracts filled at. None when the account gives none that can be a price."""
+    """The price an order's contracts filled at. None when the account gives none that can be a price.
+
+    The bounds are a position's, at both ends, which are the journal's too (`journals._price`). A price the
+    journal would not read back must never be written to it.
+    """
     price = order.fill_price
-    return round(price, 4) if price is not None and price >= positions.MIN_PRICE else None
+    return round(price, 4) if price is not None and positions.MIN_PRICE <= price <= positions.MAX_PRICE else None
 
 
 def _when(order: Order, now: datetime) -> datetime:
@@ -383,6 +390,23 @@ class PaperDesk:
             notes.append("It goes to Alpaca's paper account: pretend money, and never an exchange.")
         return notes
 
+    def _one_side(self, symbol: str, side: str, sending: bool = False) -> None:
+        """Turn away an order to open one side of a contract while the journal has a trade on the other in play.
+
+        An account holds a contract one way or the other, never both. An order to open the other side would be
+        set against the trade that is there, and the journal could not tell which had ended. This is asked when
+        an order is written out and again when it is sent: another order can open the other side in between.
+        """
+        other = "short" if side == "long" else "long"
+        if any(t.symbol == symbol and t.side == other and t.state in ("ordered", "open") for t in self.journal.load()[0]):
+            raise PaperError(
+                f"The journal has a trade {'sold' if other == 'short' else 'bought'} to open on this contract that has not ended. "
+                "An account holds a contract one way or the other, so this order would not open a second position. "
+                + ("It was not sent. " if sending else "")
+                + "Close that trade instead.",
+                409 if sending else 422,
+            )
+
     def write_open(self, result: ScanResult, contract: str, quantity: int, limit: float) -> Ticket:
         """An order to open one of a scan's contracts, written out and not sent."""
         with self._lock:
@@ -394,14 +418,7 @@ class PaperDesk:
                 raise PaperError("That contract has expired.")
             quantity, limit = self.sized(quantity, limit)
             buying = result.lens == "buy"
-            # An account holds a contract one way or the other, never both. An order to open the other side
-            # would be set against the trade that is there, and the journal could not tell which had ended.
-            other = "short" if buying else "long"
-            if any(t.symbol == c.symbol and t.side == other and t.state in ("ordered", "open") for t in self.journal.load()[0]):
-                raise PaperError(
-                    f"The journal has a trade {'sold' if buying else 'bought'} to open on this contract that has not ended. "
-                    "An account holds a contract one way or the other, so this order would not open a second position. Close that trade instead."
-                )
+            self._one_side(c.symbol, "long" if buying else "short")
             premium = limit * SHARES * quantity
             text = f"{'Buy' if buying else 'Sell'} to open {quantity} {name(c)} at {holdings.dollars(limit)} a share or {'less' if buying else 'more'}, good for today."
             if buying:
@@ -500,6 +517,9 @@ class PaperDesk:
             return self._open(broker, ticket, now) if ticket.action == "open" else self._close(broker, ticket, now)
 
     def _open(self, broker: Broker, ticket: Ticket, now: datetime) -> Trade:
+        # Two orders for the two sides of one contract can both be written out before either is sent. So the
+        # journal is asked again here, as a closing order asks whether its trade has changed.
+        self._one_side(ticket.symbol, ticket.side, sending=True)
         try:
             t = journals.new(
                 ticket.underlying, ticket.kind, ticket.strike, ticket.expiry, ticket.side, ticket.quantity, ticket.limit, now, ticket.signals
@@ -722,14 +742,24 @@ def _demo_start(desk: PaperDesk) -> None:
             desk.journal.add(t)
 
 
+def _demo_clock(day: date) -> Callable[[], datetime]:
+    """A clock for the demo. It starts on the demo's day, at the time it is now in New York, and runs on from there.
+
+    The demo's day is its market's day, which a test holds still, so an order is never dated after the demo's
+    own contracts have expired. The clock is set once and then only moves forward, by the time that has really
+    passed. Read afresh as "the demo's day at the time on the wall", it went back a day at midnight: an order
+    written out at 11:55 p.m. was still taken twenty minutes later, and a trade closed after midnight was
+    closed before it opened. It also went back an hour when the clocks did.
+    """
+    started = datetime.now(timezone.utc)
+    start = datetime.combine(day, started.astimezone(ET).time(), ET).astimezone(timezone.utc)
+    return lambda: start + (datetime.now(timezone.utc) - started)
+
+
 def build_desk(settings, scanner=None, demo: bool = False, setup_error: str | None = None) -> PaperDesk:
     """The paper desk for these settings. There is always one, so the journal can be read whatever else is missing."""
     if scanner is not None and demo:
-        # The demo's day is its market's day, which a test holds still. Its clock is that day at the time it is
-        # now in New York, so an order is never dated after the demo's own contracts have expired.
-        def now() -> datetime:
-            return datetime.combine(scanner.today, datetime.now(ET).time(), ET)
-
+        now = _demo_clock(scanner.today)
         return PaperDesk(journals.open_journal(settings, demo=True), scanner, DemoBroker(scanner.market, now), clock=now, seed=_demo_start)
     journal = journals.open_journal(settings)
     if scanner is None:

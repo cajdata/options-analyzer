@@ -28,7 +28,7 @@ from app import positions
 from app.models import ClosingOrder, Exit, Trade
 from app.store import ListFile, StoreError
 
-__all__ = ["ENDED_BY", "HOW", "Journal", "StoreError", "ended", "new", "open_journal", "settle", "unread_note"]
+__all__ = ["ENDED_BY", "HOW", "NO_PRICE", "Journal", "StoreError", "ended", "new", "open_journal", "settle", "unpriced", "unread_note"]
 
 ET = ZoneInfo("America/New_York")
 SHARES = 100
@@ -43,6 +43,17 @@ HOW: dict[str, str] = {
 # The exit rules a closed trade is sorted by, first match first, and how each is said. A closing order
 # whose reading of one of these could not be made has no rules on record at all (`PaperDesk._rules_now`).
 ENDED_BY: dict[str, str] = {"profit_target": "at the profit target", "time_stop": "inside the time stop"}
+# How the remark on an order that filled with no price begins. `paper.reconcile` writes the remark and takes
+# it away again, and it is the only record that a trade is waiting on such an order.
+NO_PRICE = "The account says"
+
+
+def unpriced(trade: Trade) -> bool:
+    """Whether a trade is waiting on an order that ended with contracts filled and no price for them.
+
+    Such an order is neither waiting to fill nor working, and whatever is said about it has to say so.
+    """
+    return bool(trade.note and trade.note.startswith(NO_PRICE))
 
 
 def new(
@@ -95,12 +106,16 @@ def ended(t: Trade) -> str | None:
 
 def _stands(t: Trade) -> str:
     """Where a trade is, or how it ended, in a few words. Worded here once, for the page and the command line."""
+    # An order that ended with contracts filled and no price for them is neither waiting to fill nor working,
+    # so the words beside the remark that says so must not say it is.
     if t.state == "ordered":
-        return "ordered, not filled yet"
+        return "ordered, waiting for the price it filled at" if unpriced(t) else "ordered, not filled yet"
     if t.state == "unfilled":
         return "not filled"
     if t.state == "open":
-        return "open, closing order working" if t.closing else "open"
+        if not t.closing:
+            return "open"
+        return "open, waiting for the price its closing order filled at" if unpriced(t) else "open, closing order working"
     last = max(t.exits, key=lambda e: e.when, default=None)
     if last is not None and last.how in ("outside", "unknown"):
         return HOW[last.how]

@@ -875,8 +875,9 @@ function cents(v, up) {
 // zone an expiry at the 4 p.m. close, or an order sent in the evening, could land on another day.
 const stamp = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "America/New_York" }) : "–";
 
-// What became of the last order sent from the paper view. It has a line of its own above the lists, because
-// reading the account afresh redraws everything under it, the place the order was sent from included.
+// What became of the last order sent from the paper view, or of a cancel the account turned down. It has a
+// line of its own above the lists, because reading the account afresh redraws everything under it, the place
+// the order was sent or cancelled from included.
 function say(text, failed) {
   $("paper-said").textContent = text;
   $("paper-said").classList.toggle("error", Boolean(failed));
@@ -929,8 +930,14 @@ function orderBox(fields, body, sent, failed) {
   return box;
 }
 
+// Whether a trade is waiting on an order that ended with contracts filled and no price for them. Such an
+// order is neither waiting to fill nor working. The journal's remark says so, in the words Python gave it,
+// and is told by how Python begins it.
+const unpriced = (trade) => Boolean(trade.note && trade.note.startsWith(status.paper.no_price));
+
 // What became of an order just sent.
 function sentText(trade, opening) {
+  if (unpriced(trade)) return "Sent. " + trade.note;
   if (opening) {
     if (trade.state === "open") return "Sent, and filled: " + trade.quantity + " at " + exact(trade.entry_price) + ". It is in the journal as open.";
     if (trade.state === "unfilled") return "Sent, and it ended at once with nothing filled. " + (trade.note || "");
@@ -1014,9 +1021,14 @@ function closeBlock(holding) {
   return mine.map((trade) => {
     const parts = [el("h3", {}, "Close it" + whichTrade(trade, mine))];
     if (trade.state !== "open") {
-      parts.push(el("p", { class: "sub" }, "The order that opened it is still working, so it cannot be closed yet."));
+      // An order that filled with no price has ended: it is not working, and is not in the list of orders.
+      parts.push(el("p", { class: "sub" }, unpriced(trade)
+        ? "The order that opened it has ended, and it cannot be closed from here yet. " + trade.note
+        : "The order that opened it is still working, so it cannot be closed yet."));
     } else if (trade.closing) {
-      parts.push(el("p", { class: "sub" }, "A closing order at " + exact(trade.closing.limit) + " is working. It is in the list of orders, where it can be cancelled."));
+      parts.push(el("p", { class: "sub" }, unpriced(trade)
+        ? "The closing order at " + exact(trade.closing.limit) + " has ended. " + trade.note
+        : "A closing order at " + exact(trade.closing.limit) + " is working. It is in the list of orders, where it can be cancelled."));
     } else if (holding.dte < 0) {
       // The account still lists an expired contract until it has settled. No order can close it by then.
       parts.push(el("p", { class: "sub" }, "This contract has expired, so no order can close it. Alpaca takes it off the account once it has settled, and the journal then records how it ended."));
@@ -1057,8 +1069,19 @@ function renderOrders() {
       problem.textContent = "";
       try {
         await api("/api/paper/orders/" + encodeURIComponent(o.id), undefined, "DELETE");
+        // The line above the lists may be about this very order ("the closing order is working"), and it no longer is.
+        say("");
         await loadPaper();
       } catch (err) {
+        if (err.status === 404 || err.status === 422) {
+          // The account answered: the order has filled or ended, or it has none by that id. So this list is
+          // out of date, and so is anything said above it. The reason goes above the lists, because reading
+          // the account afresh redraws this row.
+          say(err.message, true);
+          await loadPaper();
+          return;
+        }
+        // Anything else, and nobody can tell: the reason stays beside the button, which can be tried again.
         cancel.disabled = false;
         problem.textContent = " " + err.message;
       }
