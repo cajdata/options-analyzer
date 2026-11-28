@@ -135,6 +135,30 @@ def test_history_vol_is_unknown_without_the_inputs_it_needs():
     assert risk.assess(unrated, SPOT, RATE, "buy") is None
 
 
+def test_a_contract_on_its_last_day_is_not_rated():
+    # With hours left, a rating depends on how many, and nothing here knows the time. Taken as half a day
+    # whatever the hour, the same fairly priced option read "unfavorable" at the open (an edge of -42%) and
+    # "favorable" by 3:30 p.m. (+108%). Seen live on 2026-11-27: a call rated favorable at +212% an hour and
+    # a half before it stopped trading.
+    def scanned_with(hours_left: float):
+        fair = pricing.price("call", SPOT, 100.0, hours_left / 6.5 / 252, RATE, 0.30)
+        quote = OptionQuote("X", "XYZ", "call", 100.0, TODAY, bid=fair - 0.005, ask=fair + 0.005)
+        return metrics.analyze_contract(quote, SPOT, TODAY, RATE)
+
+    for hours in (6.48, 0.5):
+        c = scanned_with(hours)
+        assert c.dte == 0 and risk.last_day(c)
+        assert risk.history_vol(c, 0.30, None, None) is None
+        c.history_vol = 0.30  # and handed one all the same, it still gives no rating
+        assert risk.assess(c, SPOT, RATE, "buy") is None and risk.assess(c, SPOT, RATE, "sell") is None
+        assert 0 < c.pop_long < 1 and c.iv > 0  # what the option's own price fixes is still worked out
+
+    # The day before, it is rated like any other.
+    tomorrow = contract(days=1)
+    assert not risk.last_day(tomorrow) and risk.history_vol(tomorrow, 0.30, None, None) == pytest.approx(0.30)
+    assert risk.assess(tomorrow, SPOT, RATE, "buy") is not None
+
+
 # -- Payoff statistics ----------------------------------------------------------
 
 

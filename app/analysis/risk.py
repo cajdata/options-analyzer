@@ -40,6 +40,21 @@ BAD_CASE_SIGMAS = 2.0
 # time; its mirror image for a seller wins often and occasionally loses big.
 LOPSIDED = 0.20
 SHARES = 100
+# A contract on its last day has hours left, and how many depends on the time of day and on when the
+# session ends, which nothing here knows. A history measured in whole days cannot be set beside its
+# price: with the half day the pricing formulas are given, the same fairly priced option read
+# "unfavorable" at the open and "favorable" by mid-afternoon. So on that day there is no volatility
+# from history, and with it no rating and no comparison of volatility in the score. Said once, here.
+LAST_DAY = (
+    "A contract that expires today is not rated, and the score does not compare its price with the stock's "
+    "history. With hours left, both would depend on how much of the day remains, which the scan does not "
+    "measure. The implied volatility and the decay shown for it assume half a day is left."
+)
+
+
+def last_day(c: ContractAnalysis) -> bool:
+    """Whether a contract expires today, when its price cannot be set beside a history in whole days."""
+    return c.dte < 1
 
 
 def event_variance(moves: list[Reaction], ordinary_vol: float | None) -> float | None:
@@ -62,11 +77,12 @@ def history_vol(
 
     Ordinary days use recent realized volatility with earnings days removed. Each
     earnings report inside the contract's life replaces one ordinary trading day
-    with the variance of past report-day moves. None when a needed input is missing.
+    with the variance of past report-day moves. None when a needed input is missing,
+    and on the contract's last day (`LAST_DAY`).
     """
-    if not ordinary_vol:
+    if not ordinary_vol or last_day(c):
         return None
-    t = max(c.dte, 0.5) / 365.0
+    t = c.dte / 365.0
     reports = 0
     if upcoming and spans(c.expiry, upcoming):
         if event_var is None:
@@ -77,11 +93,14 @@ def history_vol(
 
 
 def assess(c: ContractAnalysis, spot: float, rate: float, lens: str) -> RiskReward | None:
-    """Payoff statistics for the buyer ("buy") or the seller ("sell") of `c`, in today's dollars."""
+    """Payoff statistics for the buyer ("buy") or the seller ("sell") of `c`, in today's dollars.
+
+    None when there is no volatility from history to go by, and on the contract's last day (`LAST_DAY`).
+    """
     vol = c.history_vol
-    if not vol:
+    if not vol or last_day(c):
         return None
-    t = max(c.dte, 0.5) / 365.0
+    t = c.dte / 365.0
     growth = math.exp(rate * t)
     is_call = c.kind == "call"
     premium = c.ask if lens == "buy" else c.bid

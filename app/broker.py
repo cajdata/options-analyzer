@@ -234,7 +234,9 @@ class AlpacaPaper:
                 "status": "all",
                 "limit": ORDER_PAGE,
                 "direction": "asc",
-                "after": after.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                # To the microsecond, as the account stamps an order. Cut to the second, a page began again with
+                # every order of its last one's second, and 500 orders in one second could not be got past.
+                "after": after.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             }
             rows = keep(self._read("/v2/orders", params))
             if len(rows) < ORDER_PAGE:

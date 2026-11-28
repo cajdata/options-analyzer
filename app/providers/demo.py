@@ -157,6 +157,10 @@ class DemoMarket:
     def daily_bars(self, symbols: list[str], start: date) -> dict[str, list[Bar]]:
         return {s: [b for b in self._bars(s) if b.day >= start] for s in symbols if s in SPECS}
 
+    def close_on(self, symbol: str, day: date) -> float | None:
+        # The demo's stocks pay no dividend and never split, so its history is its closes as they printed.
+        return next((b.close for b in self._bars(symbol) if b.day == day), None) if symbol in SPECS else None
+
     def _bars(self, symbol: str) -> list[Bar]:
         if symbol in self._bar_cache:
             return self._bar_cache[symbol]

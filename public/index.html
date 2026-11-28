@@ -394,8 +394,10 @@ function facts(pairs) {
 function riskBlock(idea, ctx) {
   const rr = idea.risk_reward;
   if (!rr) {
+    // On its last day a contract is not rated whatever history there is, and Python words why.
     return [el("h3", {}, "Risk and reward"),
-      el("p", { class: "sub" }, "Not rated: there is not enough price or earnings history for this stock.")];
+      el("p", { class: "sub" }, idea.dte < 1 ? status.rating.last_day
+        : "Not rated: there is not enough price or earnings history for this stock.")];
   }
   const shape = rr.shape === "long shot"
     ? " This is a long shot: the market puts its chance of profit below one in five, so the odds matter far more than the rating."
@@ -1064,6 +1066,8 @@ function renderOrders() {
     const t = paper.trades.find((trade) => trade.symbol === o.symbol);
     const cancel = el("button", { type: "button" }, "Cancel");
     const problem = el("span", { class: "error" });
+    // The account's own word for where the order is. One it is already cancelling needs no second request.
+    cancel.disabled = o.status === "pending_cancel";
     cancel.addEventListener("click", async () => {
       cancel.disabled = true;
       problem.textContent = "";
@@ -1089,10 +1093,11 @@ function renderOrders() {
     return el("tr", {}, el("td", {}, String(i + 1)),
       el("td", {}, t ? tradeName(t).slice(0, 3) : o.symbol, el("div", { class: "sub" }, o.side + " to " + (o.intent || "?") + " × " + o.quantity)),
       el("td", {}, exact(o.limit)), el("td", {}, o.filled + " of " + o.quantity),
+      el("td", {}, String(o.status || "–").replace(/_/g, " ")),
       el("td", {}, o.submitted ? newsTime(o.submitted) : "–"), el("td", {}, cancel, problem));
   });
   $("paper-orders").replaceChildren(el("h3", {}, "Orders still working"),
-    el("table", { class: "plain" }, el("thead", {}, el("tr", {}, ["#", "Order", "Limit", "Filled", "Sent (New York)", ""].map((h) => el("th", {}, h)))),
+    el("table", { class: "plain" }, el("thead", {}, el("tr", {}, ["#", "Order", "Limit", "Filled", "Status", "Sent (New York)", ""].map((h) => el("th", {}, h)))),
       el("tbody", {}, rows)));
 }
 

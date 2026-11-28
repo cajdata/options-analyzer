@@ -151,6 +151,38 @@ def test_daily_bars_fall_back_to_iex_and_drop_todays_unfinished_bar():
     assert [b.close for b in closed] == [100.5, 101.25, 999.0]
 
 
+def test_one_days_close_is_asked_for_as_it_printed_and_for_that_day_alone():
+    # The price history is adjusted for every dividend and split since. COST's close of 1,097.91 on 2026-11-23
+    # read 1,067.91 there a day later, after its special dividend (both seen live on 2026-11-27). A paper trade
+    # held to expiry is settled against its strike, which is not adjusted, so its close must not be either.
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        raw = request.url.params["adjustment"] == "raw"
+        bars = [
+            {"t": "2026-11-23T05:00:00Z", "c": 1097.91 if raw else 1067.91, "v": 3187368},
+            {"t": "2026-11-24T05:00:00Z", "c": 1091.71, "v": 2000000},
+        ]
+        return httpx.Response(200, json={"bars": {"COST": bars}, "next_page_token": None})
+
+    market = alpaca(handler)  # 5 p.m. on the 24th
+    assert market.close_on("COST", date(2026, 11, 23)) == 1097.91
+    assert market.daily_bars(["COST"], date(2026, 11, 20))["COST"][0].close == 1067.91  # the history stays adjusted
+    asked = seen[0]
+    assert (asked["adjustment"], asked["start"], asked["end"], asked["symbols"]) == ("raw", "2026-11-23", "2026-11-24T04:59:59Z", "COST")
+    assert seen[1]["adjustment"] == "all"
+
+    # Today's close once its bar is final, and not before. The last 15 minutes cannot be asked for at all.
+    assert market.close_on("COST", date(2026, 11, 24)) == 1091.71 and seen[2]["end"] == "2026-11-24T21:44:00Z"
+    midday = alpaca(handler, now=lambda: datetime(2026, 11, 24, 12, 0, tzinfo=ET))
+    assert midday.close_on("COST", date(2026, 11, 24)) is None
+    # A day with no bar has no close, and a day that has not come is not asked about.
+    assert market.close_on("COST", date(2026, 11, 22)) is None
+    asked_so_far = len(seen)
+    assert market.close_on("COST", date(2026, 11, 25)) is None and len(seen) == asked_so_far
+
+
 def test_rate_limits_are_retried_and_other_errors_raise():
     calls = []
 
