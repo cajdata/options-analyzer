@@ -344,6 +344,44 @@ def test_risk_reward_reaches_the_api_the_brief_and_the_command_line(client, disc
     assert re.search(r"\bfavorable\b", out) and "unfavorable" not in out
 
 
+def test_a_contract_that_expires_today_is_shown_unrated_and_every_surface_says_why(client, capsys):
+    from app.__main__ import print_scan
+    from app.analysis import risk
+
+    # Decided 2026-11-27, after the first live orders: three of four were contracts on their last day, two
+    # of them rated "favorable" on the strength of half a day that was not there.
+    friday = date(2026, 11, 27)
+    market = DemoMarket(friday)
+    earnings = EarningsService(NullCache(), history_sources=[market], calendar_source=market, today=friday)
+    scanner = Scanner(market, earnings, Settings(), universe=list(SPECS), today=friday)
+    result = scanner.scan(ScanRequest(symbols=["CRUX"], dte_min=0, dte_max=1))  # that Friday's expiry alone
+    today = result.ideas
+    assert today and all(c.dte == 0 for c in today)
+    for c in today:
+        # No rating, and no comparison with history in the score: "nothing to compare against".
+        assert c.risk_reward is None and c.history_vol is None and c.components["vol_value"] == 0.5
+        assert c.score > 0 and 0 < c.pop < 1  # it is still ranked, on what its own price fixes
+
+    (note,) = [warning for warning in result.warnings if risk.LAST_DAY in warning]
+    assert note.startswith(f"{len(today)} of the contracts shown expire today.")
+    # A week out everything is rated as before, and nothing is said.
+    quiet = scanner.scan(ScanRequest(symbols=["CRUX"], dte_min=1, dte_max=8))
+    assert quiet.ideas and all(c.dte == 7 and c.risk_reward and c.history_vol for c in quiet.ideas)
+    assert not any(risk.LAST_DAY in warning for warning in quiet.warnings)
+
+    # The command line and the brief carry the scan's notes, and the brief is given no rating for them.
+    print_scan(result)
+    assert risk.LAST_DAY in capsys.readouterr().out
+    payload = ai.scan_payload(result)
+    assert note in payload["warnings"]
+    by_days = {block["days_to_expiry"]: block for block in payload["ranked_contracts"]}
+    assert "risk_reward_if_history_repeats" not in by_days[0]
+    # The page shows the same words where the rating would be, and holds no copy of them.
+    assert client.get("/api/status").json()["rating"]["last_day"] == risk.LAST_DAY
+    page = client.get("/").text
+    assert "idea.dte < 1 ? status.rating.last_day" in page and "expires today" not in page
+
+
 # -- Budget -----------------------------------------------------------------------
 
 

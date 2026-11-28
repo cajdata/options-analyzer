@@ -222,6 +222,10 @@ class Scanner:
             warnings.append(self.earnings.calendar_note)
 
         ideas = scoring.rank(scored, req.per_side or (5 if req.symbols else 1), req.top_n)
+        expiring = sum(1 for c in ideas if risk.last_day(c))
+        if expiring:
+            # They are shown, with no rating. The reason is said here, so every surface carries it.
+            warnings.append(f"{expiring} of the contracts shown expire{'s' if expiring == 1 else ''} today. {risk.LAST_DAY}")
         # News comes last and only for the stocks that made the list, so a stock
         # nobody will look at costs no request. It runs before the provider's notes
         # are collected, because loading headlines can add one.
@@ -455,17 +459,18 @@ class Scanner:
             return self._review(positions, news)
 
     def close_on(self, symbol: str, day: date) -> float | None:
-        """A stock's close on one day, from its price history. None when that day has no final bar.
+        """A stock's close on one day, as it printed that day. None when that day has no final bar.
 
-        The paper desk settles a trade held to expiry with it. It waits its turn with
-        scans and reviews like any other use of the provider, whose notes are shared.
+        The paper desk settles a trade held to expiry with it, so it is not the adjusted
+        close of the price history: a dividend or a split since would lower it, and the
+        strike it is set beside would stay where it was. It waits its turn with scans and
+        reviews like any other use of the provider, whose notes are shared.
         """
         with self._lock:
             try:
-                bars = self.market.daily_bars([symbol], day - timedelta(days=7)).get(symbol, [])
+                return self.market.close_on(symbol, day)
             finally:
                 self.market.notes.clear()  # nobody is shown a scan here, so its notes have no reader
-        return next((bar.close for bar in bars if bar.day == day), None)
 
     def _review(self, positions: list[Position], news: bool = True) -> PositionsReview:
         today = self.today

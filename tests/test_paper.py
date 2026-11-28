@@ -198,7 +198,7 @@ def test_reading_is_retried_and_reads_what_the_account_sends():
     account, seen = account_on(lambda request: next(answers))
     (found,), whole = account.orders(NOW - timedelta(hours=1))
     assert len(seen) == 2 and found.id == ROW["id"] and whole  # the stock order and the stray line are passed over
-    assert seen[1].url.params["status"] == "all" and seen[1].url.params["after"] == "2026-11-24T14:00:00Z"
+    assert seen[1].url.params["status"] == "all" and seen[1].url.params["after"] == "2026-11-24T14:00:00.000000Z"
 
     rows = [
         {"symbol": "XYZ270108P00095000", "asset_class": "us_option", "qty": "2", "side": "short", "avg_entry_price": "2.05"},
@@ -1360,14 +1360,14 @@ def test_no_order_is_written_or_sent_for_a_contract_that_has_expired(desk, scan)
 
 def test_the_stocks_close_is_read_in_turn_with_scans(desk, monkeypatch):
     # The provider and its notes are shared, and this one read went round the lock that keeps scans apart.
-    friday, real, locked = TODAY - timedelta(days=4), desk.scanner.market.daily_bars, []
+    friday, real, locked = TODAY - timedelta(days=4), desk.scanner.market.close_on, []
 
-    def bars(symbols, start):
+    def close(symbol, day):
         locked.append(desk.scanner._lock.locked())
         desk.scanner.market.notes.append("a note with no reader")
-        return real(symbols, start)
+        return real(symbol, day)
 
-    monkeypatch.setattr(desk.scanner.market, "daily_bars", bars)
+    monkeypatch.setattr(desk.scanner.market, "close_on", close)
     assert desk._close_on("CRUX", friday) is not None
     assert locked == [True] and desk.scanner.market.notes == [] and not desk.scanner._lock.locked()
 
@@ -1605,3 +1605,123 @@ def test_cancelling_an_order_clears_what_was_said_about_the_last_one(client):
     turned_down = cancelling[cancelling.index("} catch (err) {") :]
     assert re.search(r"if \(err\.status === 404 \|\| err\.status === 422\) \{\s*(//[^\n]*\s*)*say\(err\.message, true\);\s*await loadPaper\(\);\s*return;", turned_down)
     assert "cancel.disabled = false;" in turned_down  # with no answer to go by, the button can be tried again
+
+
+# -- The outside review after the first live orders (2026-11-27). Each test below failed before its fix. ----------
+
+
+def test_a_trade_is_settled_at_the_close_as_it_printed_not_the_adjusted_one(desk, monkeypatch):
+    # The price history is adjusted for every dividend and split since, and a strike is not. Read the day
+    # after COST's special dividend, its close of 1,097.91 came back from that history as 1,067.91.
+    friday = TODAY - timedelta(days=4)
+    printed = desk.scanner.market.close_on("CRUX", friday)
+    adjusted = lambda symbols, start: pytest.fail("the adjusted history was read for a close to set beside a strike")  # noqa: E731
+    monkeypatch.setattr(desk.scanner.market, "daily_bars", adjusted)
+    assert printed is not None and desk._close_on("CRUX", friday) == printed
+
+
+def test_a_working_order_from_outside_is_waited_for_like_one_of_the_apps_own():
+    # Sold at Alpaca's own site, and filled in part so far. The contract that had gone was written off on the
+    # spot as having left with no order on record, and the trade could never have a result again.
+    t = held(quantity=2)
+    part = order(t, "close", status="partially_filled", quantity=2, filled=1, fill_price=1.25, id="typed-in", filled_at=None)
+    one_left = [PaperHolding(t.symbol, "short", 1, 2.0)]
+    assert reconcile([t], [part], one_left, TODAY, NOW) == [] and (t.state, t.exits, t.note) == ("open", [], None)
+    # Done for the day, it is still an order that has not ended.
+    assert reconcile([t], [replace(part, status="done_for_day")], one_left, TODAY, NOW) == [] and t.exits == []
+    ended = replace(part, status="filled", working=False, filled=2, filled_at=NOW + timedelta(minutes=5))
+    reconcile([t], [ended], [], TODAY, NOW + timedelta(minutes=6))
+    assert t.exits == [Exit(2, 1.25, ended.filled_at, "outside", None, "typed-in")]
+    assert (t.state, t.pnl) == ("closed", 150.0) and signals.counted(t)
+
+    # Nor is such a trade settled at expiry while the order works, though that day's close is on hand.
+    gone = held(quantity=2, expiry=TODAY - timedelta(days=1), ordered=NOW - timedelta(days=30))
+    part = order(gone, "close", status="partially_filled", quantity=2, filled=1, fill_price=1.25, id="typed-in", filled_at=None)
+    close_on = lambda underlying, day: 93.5  # noqa: E731
+    assert reconcile([gone], [part], [PaperHolding(gone.symbol, "short", 1, 2.0)], TODAY, NOW, close_on=close_on) == [] and gone.exits == []
+
+    # An order from outside that opens a position closes nothing, so it is nothing to wait for.
+    other = held()
+    opening = replace(order(other, "close", status="new", filled=0, fill_price=None, id="opening"), intent="open")
+    reconcile([other], [opening], [], TODAY, NOW)
+    assert [e.how for e in other.exits] == ["unknown"]
+
+
+def test_an_order_from_outside_that_filled_with_no_price_is_waited_for():
+    # As one of the app's own is. It was passed over, and the contracts written off with no price for good.
+    t = held()
+    bare = order(t, "close", fill_price=None, id="typed-in")
+    reconcile([t], [bare], [], TODAY, NOW)
+    assert (t.state, t.exits) == ("open", []) and t.note.startswith(paper.OUTSIDE_NO_PRICE) and "1 of these contracts" in t.note
+    # The remark is not the one for an order of the trade's own, which the page words a closing order around.
+    assert not paper.unpriced(t) and t.stands == "open"
+    assert reconcile([t], [bare], [], TODAY, NOW) == []  # and it is said once
+    reconcile([t], [replace(bare, fill_price=1.25)], [], TODAY, NOW)
+    assert t.exits == [Exit(1, 1.25, bare.filled_at, "outside", None, "typed-in")] and (t.state, t.note, t.pnl) == ("closed", None, 75.0)
+
+    # One from before the trade opened closed none of its contracts, with a price or without.
+    old = held()
+    before = order(old, "close", fill_price=None, id="older", filled_at=old.opened - timedelta(days=1))
+    reconcile([old], [before], [], TODAY, NOW)
+    assert [(e.how, e.price) for e in old.exits] == [("unknown", None)]
+
+
+def test_an_option_in_the_money_by_less_than_a_cent_expires_worthless():
+    gone = TODAY - timedelta(days=4)
+
+    def settled(close: float, **contract) -> Trade:
+        t = held(expiry=gone, ordered=NOW - timedelta(days=40), side="long", limit=3.0, **contract)
+        reconcile([t], [], [], TODAY, NOW, close_on=lambda underlying, day: close)
+        return t
+
+    # An option is exercised from a cent in the money. A hair above the strike was written down as worth
+    # nothing, beside a note that said "Exercising it paid $0.00 a share".
+    hair = settled(100.00001, kind="call", strike=100.0)
+    assert hair.exit_price == 0.0 and "worthless" in hair.note and "Exercising" not in hair.note
+    under = settled(100.004, kind="call", strike=100.0)
+    assert (under.exit_price, under.pnl) == (0.0, -300.0) and "less than a cent" in under.note
+    out = settled(99.0, kind="call", strike=100.0)
+    assert out.note.endswith("It expired worthless.")
+    # A cent is a cent, whatever a float makes of the subtraction: 36.01 less 36 is 0.00999999999999801.
+    cent = settled(36.01, kind="call", strike=36.0)
+    assert cent.exit_price == 0.01 and "Exercising it paid $0.01 a share" in cent.note
+    assert settled(79.99, kind="put", strike=80.0).exit_price == 0.01
+
+
+def test_the_list_of_orders_is_paged_to_the_microsecond():
+    # The time a page went on from was cut to the second. A page then began again with every order of its last
+    # one's second, and a page of orders all sent in one second could not be got past at all.
+    def crowded(total: int, gap_ms: int, includes_the_last: bool) -> tuple[int, bool, list[str]]:
+        start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        times = [start + timedelta(milliseconds=gap_ms * (n + 1)) for n in range(total)]
+        rows = [{**ROW, "id": f"id-{n}", "client_order_id": f"x-{n}", "status": "filled",
+                 "submitted_at": when.strftime("%Y-%m-%dT%H:%M:%S.%fZ")} for n, when in enumerate(times)]  # fmt: skip
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            after = datetime.fromisoformat(request.url.params["after"].replace("Z", "+00:00"))
+            later = [row for row, when in zip(rows, times) if when > after or (includes_the_last and when == after)]
+            return httpx.Response(200, json=later[:500])
+
+        account, seen = account_on(handler)
+        found, whole = account.orders(start)
+        return len(found), whole, [request.url.params["after"] for request in seen]
+
+    read, whole, asked = crowded(1900, 3, includes_the_last=False)
+    assert (read, whole) == (1900, True) and asked[1] == "2026-11-01T00:00:01.500000Z"
+    assert crowded(700, 1, includes_the_last=False)[:2] == (700, True)
+    # Asked on 2026-11-27 with the very time an order was submitted, Alpaca's list gave that order again.
+    assert crowded(1900, 3, includes_the_last=True)[:2] == (1900, True)
+
+
+def test_a_working_order_is_listed_with_the_accounts_word_for_it(client, capsys):
+    from app.__main__ import print_paper
+
+    # New, filled in part, being cancelled and done for the day all looked alike, each with a Cancel button.
+    page = client.get("/").text
+    start = page.index("function renderOrders()")
+    listing = page[start : page.index("\nfunction ", start + 1)]
+    assert 'String(o.status || "–").replace(/_/g, " ")' in listing and '"Status"' in listing
+    assert 'cancel.disabled = o.status === "pending_cancel";' in listing
+    going = order(held(), "close", status="pending_cancel", filled=0, fill_price=None)
+    print_paper(PaperReview(NOW, "paper", True, PaperAccount(3, 1000.0), None, {}, [going], [], {}, []))
+    assert "0 filled, pending cancel" in capsys.readouterr().out

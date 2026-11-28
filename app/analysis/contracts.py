@@ -22,7 +22,10 @@ PRICE_TOLERANCE = 1e-6
 
 
 def years_to_expiry(expiry: date, today: date) -> float:
-    # Half a day on expiry day itself keeps the formulas finite.
+    # Half a day on expiry day itself keeps the formulas finite. It is not a measure of the time left, which
+    # depends on the hour. What an option's own price fixes survives that (the chance of profit, delta, the
+    # breakeven against the expected move: each goes by volatility times the root of time). What sets the
+    # price beside a history in whole days does not, and is left out on that day (`risk.LAST_DAY`).
     return max((expiry - today).days, 0.5) / 365.0
 
 

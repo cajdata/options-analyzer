@@ -253,8 +253,9 @@ sends it, and it sends that one order once.
 
 **The Paper view**, and `python -m app paper`, show what the paper account holds,
 checked against the same exit rules as the positions page, with a way to close each
-trade. They also list any order still working, with a way to cancel it. Paper and real
-are never mixed: `data/positions.json` is not touched.
+trade. They also list any order still working, with the account's word for where it
+stands and a way to cancel it. Paper and real are never mixed: `data/positions.json` is
+not touched.
 
 **The journal** keeps each paper trade from its order to its end:
 
@@ -268,7 +269,9 @@ are never mixed: `data/positions.json` is not touched.
   you sent it. When the rules could not be read at that moment (no quote to set beside
   the profit target, say), the journal says they are not on record. It never says that
   none was reached. Or held to expiry, settled at what exercising it paid at that day's
-  close. Or closed by an order placed at Alpaca itself, at that order's price.
+  close, as the close printed that day. In the money by less than a cent it is not
+  exercised, and is settled at nothing. Or closed by an order placed at Alpaca itself,
+  or by Alpaca, at that order's price.
 - **The result**, in dollars and as a share of the premium paid or collected.
 
 **Which signals worked** sorts the closed trades by each of those readings and counts
@@ -295,6 +298,16 @@ in memory, so you can try the whole flow with no keys.
   what exercising it paid at that day's close. If it expired in the money, Alpaca
   exercises or assigns it, which leaves shares in the paper account. The app does not
   show or close those.
+- **Alpaca may sell a position for you on its last day.** When a bought option is in the
+  money and the paper account could not carry its exercise (a put with no shares behind
+  it, say), Alpaca sells it shortly before the contract stops trading, with a market
+  order. The journal records the trade as closed by an order the app did not send, at
+  that order's price.
+- **A fund's options trade for fifteen minutes after its close.** The journal settles at
+  the close. If the fund crosses the strike in those minutes, the journal's result and
+  what Alpaca does with the option can differ.
+- **Results leave out fees.** Alpaca takes a few cents a contract from the paper
+  account's cash, and the journal counts prices only.
 - **Paper trading is one contract at a time.** No spreads, no shares, no market orders
   and no orders that last past the day. A trade opened at Alpaca's own site shows in
   the Paper view and has no journal entry.
@@ -344,6 +357,10 @@ in memory, so you can try the whole flow with no keys.
   dividend are approximate.
 - **Risk and reward assumes history repeats** and takes no view on direction. It is a
   comparison of price with past behavior, and past volatility is a rough guide at best.
+- **A contract that expires today is not rated.** With hours left, a rating would depend
+  on how much of the day remains, which the scan does not measure. The contract is still
+  listed, the score leaves the comparison with history out, and the scan says so. The
+  implied volatility and the decay shown for it assume half a day is left.
 - **A rating cannot see a report it has no date for.** When no earnings date is known for
   a stock, the scan says so, because options look expensive right before a report for good
   reason. That covers no source being set, a failed lookup, and a foreign company that
@@ -394,5 +411,7 @@ in memory, so you can try the whole flow with no keys.
 3. **Done:** a positions page that checks what you hold against the exit rules.
 4. **Started:** paper trading on Alpaca, with a journal that records which signals
    worked. Orders you write out and send yourself, the journal and the summary are in.
-   It has run on the demo account only: no order has been sent to Alpaca yet.
+   It has run against Alpaca's paper account since 2026-11-27: orders that open a
+   trade, their fills, and cancels. A closing order sent from the app, a sale to open
+   and a trade settled at expiry have not been seen there yet.
 5. Live trading with a human approval on every order.

@@ -17,6 +17,15 @@ class MarketData(Protocol):
 
     def daily_bars(self, symbols: list[str], start: date) -> dict[str, list[Bar]]: ...
 
+    def close_on(self, symbol: str, day: date) -> float | None:
+        """A stock's close on one day, as it printed that day. None when that day has no final bar.
+
+        `daily_bars` is adjusted for every dividend and split since, which is right
+        for measuring how a stock moves and wrong for setting a close beside a
+        strike: the strike is not lowered with it. This one is not adjusted.
+        """
+        ...
+
     def option_chain(
         self, symbol: str, *, expiry_from: date, expiry_to: date, strike_from: float, strike_to: float
     ) -> list[OptionQuote]: ...

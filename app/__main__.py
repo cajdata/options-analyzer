@@ -398,7 +398,8 @@ def print_paper(review: PaperReview, kept: object = None, every: bool = False) -
         for o in review.orders:
             when = f", sent {o.submitted.astimezone(ET):%b %d %H:%M} New York time" if o.submitted else ""
             limit = f" at {_figure(o.limit)}" if o.limit else ""
-            print(f"  {o.id}  {o.side} to {o.intent or '?'} {o.quantity} {o.symbol}{limit}{when}, {o.filled} filled")
+            # The account's own word for where the order is: new, partially_filled, pending_cancel, done_for_day.
+            print(f"  {o.id}  {o.side} to {o.intent or '?'} {o.quantity} {o.symbol}{limit}{when}, {o.filled} filled, {o.status.replace('_', ' ')}")
 
     counts = {state: sum(1 for t in review.trades if t.state == state) for state in journal.STATES}
     said = ", ".join(f"{counts[state]} {state}" for state in ("closed", "open", "ordered", "unfilled") if counts[state])

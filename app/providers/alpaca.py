@@ -164,14 +164,31 @@ class AlpacaData:
         if not symbols:
             return {}
         # Accounts without a real-time subscription cannot query the latest 15 minutes.
-        end = datetime.now(timezone.utc) - timedelta(minutes=16)
+        return self._daily(symbols, start, datetime.now(timezone.utc) - timedelta(minutes=16), "all")
+
+    def close_on(self, symbol: str, day: date) -> float | None:
+        """A stock's close on one day, as it printed that day. None when that day has no final bar.
+
+        Not adjusted. A dividend or a split since then lowers every earlier close in the adjusted
+        history (COST's close of 1,097.91 on 2026-11-23 reads 1,067.91 there, after its special
+        dividend), and an option that expired that day had a strike that was not lowered with it.
+        """
+        now = self._now()
+        # The last 15 minutes cannot be asked for, and nothing past the day itself is wanted.
+        end = min(datetime.combine(day, clock(23, 59, 59), ET), (now - timedelta(minutes=16)).astimezone(ET))
+        if end.date() < day:
+            return None
+        return next((bar.close for bar in self._daily([symbol], day, end, "raw").get(symbol, []) if bar.day == day), None)
+
+    def _daily(self, symbols: list[str], start: date, end: datetime, adjustment: str) -> dict[str, list[Bar]]:
+        """Daily bars up to `end`, oldest first, with today's left out until it is final."""
         params = {
             "symbols": ",".join(symbols),
             "timeframe": "1Day",
             "start": start.isoformat(),
-            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": 10000,
-            "adjustment": "all",
+            "adjustment": adjustment,
             "sort": "asc",
             "feed": self._bars_feed,
         }

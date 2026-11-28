@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 from app import journal as journals
 from app import occ, positions
 from app.analysis import holdings, signals
+from app.analysis.contracts import PRICE_TOLERANCE
 from app.broker import AlpacaPaper, Broker, BrokerError, DemoBroker
 from app.models import (
     ClosingOrder,
@@ -66,6 +67,10 @@ CUT_SHORT = (
     "Orders sent from here are still found by name."
 )
 NO_PRICE = journals.NO_PRICE  # how the remark on an order that filled with no price begins
+# How the same remark begins when the order was not this app's. It must not begin as NO_PRICE does: that
+# one says an order on the trade itself (`t.closing`, or the one that opened it) is what is waited for.
+OUTSIDE_NO_PRICE = "An order this app did not send"
+EXERCISED = 0.01  # dollars a share in the money at the close, from which an option is exercised or assigned
 EXPIRED = (
     "That contract has expired, so no order can close it. Alpaca takes it off the account once it has settled, "
     "and the journal then records how it ended."
@@ -130,7 +135,10 @@ def reconcile(
     had, is taken to have never arrived. One the account confirmed is waited
     for whatever a later answer says, never written off. And an order that
     ended with contracts filled and no price for them is waited for too:
-    nothing is made up for it.
+    nothing is made up for it. Both hold for an order this app did not send
+    as well. While one that could close a trade is still working, or has
+    ended with a fill and no price, nothing is concluded about that trade's
+    contracts in the third pass.
 
     The account's positions are read before its orders (`PaperDesk.review`),
     so `held` can be older than `orders`. A trade this call has just found
@@ -265,22 +273,42 @@ def _unheld(
                 taken[e.order] = taken.get(e.order, 0) + e.quantity
     # Orders this app did not send, each with the contracts it filled that no trade has taken yet. One that
     # says it opens a position is not one that closes: the account's word for it is used when it gives one.
-    spare = {
-        o.id: o.filled - taken.get(o.id, 0)
-        for o in orders
-        if not o.working and o.filled > 0 and _fill(o) is not None and o.intent != "open" and not o.client_id.startswith(PREFIX + "-")
-    }
+    outside = [o for o in orders if o.intent != "open" and not o.client_id.startswith(PREFIX + "-")]
+    spare = {o.id: o.filled - taken.get(o.id, 0) for o in outside if not o.working and o.filled > 0 and _fill(o) is not None}
     groups: dict[tuple[str, str], list[Trade]] = {}
     for t in trades:
         if t.state == "open" and t.id not in skip:
             groups.setdefault((t.symbol, t.side), []).append(t)
 
     changed: list[Trade] = []
+
+    def remark(t: Trade, said: str | None) -> None:
+        """Say that a trade is waiting on an order from outside for its price, or take that back."""
+        if (said or (t.note or "").startswith(OUTSIDE_NO_PRICE)) and t.note != said:
+            t.note = said
+            changed.append(journals.settle(t))
+
     for (symbol, side), mine in groups.items():
         if any(t.closing for t in mine):
             continue  # a closing order is still working, and may have filled in part: wait for it to end
-        missing = sum(t.remaining for t in mine) - have.get((symbol, side), 0)
         closes = "sell" if side == "long" else "buy"
+        # An order this app did not send is waited for in the same two cases as one it did. Still working, it
+        # may have filled in part, and the contracts that have gone are taken to be its own. Ended with
+        # contracts filled and no price given for them, it is asked after again: nothing is made up for it.
+        theirs = [o for o in outside if o.symbol == symbol and o.side == closes]
+        oldest = min(mine, key=lambda t: t.opened or t.ordered)
+        unpriced_fills = sum(
+            max(o.filled - taken.get(o.id, 0), 0)
+            for o in theirs
+            # One from before the oldest trade opened closed none of these, as below.
+            if not o.working and o.fill_price is None and _when(o, now) >= (oldest.opened or oldest.ordered)
+        )
+        if any(o.working for o in theirs) or unpriced_fills > 0:
+            said = f"{OUTSIDE_NO_PRICE} filled {unpriced_fills} of these contracts, and the account gives no price for them. It is asked again at the next refresh."
+            remark(oldest, said if unpriced_fills > 0 else None)
+            continue
+        remark(oldest, None)
+        missing = sum(t.remaining for t in mine) - have.get((symbol, side), 0)
         # The oldest trade on a contract is taken to be the one that was closed first.
         for t in sorted(mine, key=lambda t: t.opened or t.ordered):
             if missing <= 0:
@@ -299,12 +327,17 @@ def _unheld(
                 close = close_on(t.underlying, t.expiry) if close_on else None
                 if close is not None:
                     worth = max(close - t.strike, 0.0) if t.kind == "call" else max(t.strike - close, 0.0)
-                    t.exits.append(Exit(count, round(worth, 4), datetime.combine(t.expiry, clock(16, 0), ET), "expiry"))
+                    # In the money by a cent or more it is exercised or assigned. By less it expires, worth nothing.
+                    exercised = worth >= EXERCISED - PRICE_TOLERANCE
+                    paid = round(worth, 4) if exercised else 0.0
+                    t.exits.append(Exit(count, paid, datetime.combine(t.expiry, clock(16, 0), ET), "expiry"))
                     t.note = f"Held to expiry, with {t.underlying} closing at ${close:,.2f}. " + (
-                        "It expired worthless."
-                        if worth <= 0
-                        else f"Exercising it paid {holdings.dollars(worth)} a share. An option that expires in the money is exercised or "
+                        f"Exercising it paid {holdings.dollars(paid)} a share. An option that expires in the money is exercised or "
                         "assigned, which leaves shares in the paper account, or a debt of them. This app does not follow those."
+                        if exercised
+                        else "It expired worthless."
+                        if worth <= PRICE_TOLERANCE
+                        else "It expired worthless: in the money by less than a cent, it is not exercised."
                     )
                     missing -= count
                 # With no close for that day yet, the trade waits as it is.

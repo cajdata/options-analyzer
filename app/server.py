@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app import ai, journal, paper, positions
-from app.analysis import events, exits, holdings, scoring, signals
+from app.analysis import events, exits, holdings, risk, scoring, signals
 from app.config import ROOT, ConfigError, Settings, load_settings
 from app.models import PaperReview, Position, PositionsReview, ScanResult, Ticket, Trade
 from app.scanner import ET, PRESETS, Scanner, ScanRequest, build_scanner
@@ -116,6 +116,8 @@ def create_app(settings: Settings | None = None, demo: bool = False) -> FastAPI:
             "lenses": {name: cfg["weights"] for name, cfg in scoring.LENSES.items()},
             "presets": PRESETS,
             "exit_rules": {"profit_target": exits.PROFIT_TARGET, "time_stop_dte": exits.TIME_STOP_DTE},
+            # Why a contract that expires today has no rating, worded once, for the page to show beside it.
+            "rating": {"last_day": risk.LAST_DAY},
             "positions": {
                 "rules": holdings.RULES,
                 "earnings_soon_days": holdings.EARNINGS_SOON,
